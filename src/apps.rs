@@ -13,6 +13,7 @@ pub struct RawAppCounter {
     pub system_usec: u64,
     pub memory_bytes: u64,
     pub pids_count: u32,
+    pub is_frozen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,8 @@ pub struct AppDeltaUsage {
     pub memory_mb: f64,
     /// Number of processes/threads in the app group
     pub pids_count: u32,
+    /// Whether this app's cgroup is currently frozen (`cgroup.freeze == 1`)
+    pub is_frozen: bool,
 }
 
 /// Converts a raw systemd unit name (e.g., `app-flatpak-net.waterfox.waterfox-3273568594.scope`)
@@ -331,6 +334,7 @@ fn scan_slice_dir(
         };
         let memory_bytes = read_cgroup_u64(&path, "memory.current");
         let pids_count = read_cgroup_u64(&path, "pids.current") as u32;
+        let frozen = read_cgroup_u64(&path, "cgroup.freeze") == 1 && pids_count > 0;
 
         let entry_counter = map.entry(app_name.clone()).or_insert_with(|| RawAppCounter {
             app_name,
@@ -341,12 +345,16 @@ fn scan_slice_dir(
             system_usec: 0,
             memory_bytes: 0,
             pids_count: 0,
+            is_frozen: false,
         });
         entry_counter.usage_usec = entry_counter.usage_usec.saturating_add(usage_usec);
         entry_counter.user_usec = entry_counter.user_usec.saturating_add(user_usec);
         entry_counter.system_usec = entry_counter.system_usec.saturating_add(system_usec);
         entry_counter.memory_bytes = entry_counter.memory_bytes.saturating_add(memory_bytes);
         entry_counter.pids_count = entry_counter.pids_count.saturating_add(pids_count);
+        if frozen {
+            entry_counter.is_frozen = true;
+        }
     }
 }
 
@@ -422,6 +430,7 @@ fn scan_proc_fallback(map: &mut HashMap<String, RawAppCounter>) {
             system_usec: 0,
             memory_bytes: 0,
             pids_count: 0,
+            is_frozen: false,
         });
         counter.usage_usec += usage;
         counter.user_usec += utime;
@@ -520,6 +529,7 @@ impl AppEnergyTracker {
                 live_cpu_pct,
                 memory_mb: (curr.memory_bytes as f64) / (1024.0 * 1024.0),
                 pids_count: curr.pids_count,
+                is_frozen: curr.is_frozen,
             });
         }
 
@@ -578,6 +588,7 @@ pub fn bootstrap_session_app_usage(
             live_cpu_pct: share * 100.0,
             memory_mb: (c.memory_bytes as f64) / (1024.0 * 1024.0),
             pids_count: c.pids_count,
+            is_frozen: c.is_frozen,
         });
     }
 

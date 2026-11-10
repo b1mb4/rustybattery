@@ -93,6 +93,8 @@ pub struct AppSummaryRow {
     pub memory_mb: f64,
     /// Active process/thread count
     pub pids_count: u32,
+    /// Whether this app is currently frozen (deep sleep)
+    pub is_frozen: bool,
 }
 
 pub struct Database {
@@ -616,20 +618,20 @@ impl Database {
                     live_cpu_pct: 0.0,
                     memory_mb,
                     pids_count,
+                    is_frozen: false,
                 });
             }
             sqlite3_finalize(stmt);
         }
 
-        // Overlay current live metrics (live_power_w, live_cpu_pct, current memory_mb & pids)
+        // Overlay current live metrics (live_power_w, live_cpu_pct, current memory_mb, pids & frozen state)
         for live in live_deltas {
             if let Some(existing) = rows.iter_mut().find(|r| r.app_name == live.app_name) {
                 existing.live_power_w = live.live_power_w;
                 existing.live_cpu_pct = live.live_cpu_pct;
-                if live.memory_mb > 0.0 {
-                    existing.memory_mb = live.memory_mb;
-                }
+                existing.memory_mb = live.memory_mb;
                 existing.pids_count = live.pids_count;
+                existing.is_frozen = live.is_frozen;
                 if live.live_power_w > existing.peak_power_w {
                     existing.peak_power_w = live.live_power_w;
                 }
@@ -648,6 +650,7 @@ impl Database {
                     live_cpu_pct: live.live_cpu_pct,
                     memory_mb: live.memory_mb,
                     pids_count: live.pids_count,
+                    is_frozen: live.is_frozen,
                 });
             }
         }

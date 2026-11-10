@@ -28,6 +28,9 @@ rustybattery
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` or `j` / `k` | Select application to inspect in the right-hand details panel |
+| **`o`** | **⚡ Open Battery Optimizer** (scan & turn off unused background hogs, containers & services) |
+| **`z`** | **❄ Freeze / Resume App** (0% CPU Deep Sleep via cgroup v2 `cgroup.freeze` without closing windows) |
+| **`x`** | **Stop / Kill App** (terminates selected app or background service) |
 | `Tab` or `1`–`4` | Switch time window (`1`: Since Full Charge, `2`: Last 6h, `3`: Last 24h, `4`: Last 7d) |
 | `s` | Cycle sort column (`Battery %`, `Energy Wh`, `Live Power W`, `Live CPU %`, `Memory MB`) |
 | `f` | Cycle category filter (`All Apps & Services`, `User Apps Only`, `Desktop & System`) |
@@ -36,7 +39,23 @@ rustybattery
 | `r` | Force immediate live sample refresh |
 | `q` / `Esc` | Quit |
 
-### 2. CLI Summary Report
+### 2. Battery Optimizer & App Controls (CLI)
+```bash
+# Preview unused background services, containers, and power savings
+battery optimize --dry-run
+
+# Automatically stop unused background hogs & switch CPU profile to powersave
+battery optimize
+
+# Freeze an app to 0% CPU (Deep Sleep) without losing open windows/tabs
+battery freeze Waterfox
+battery resume Waterfox
+
+# Stop/kill a specific application or service
+battery stop Obsidian
+```
+
+### 3. CLI Summary Report
 ```bash
 rustybattery summary
 rustybattery summary --hours 24 --top 20

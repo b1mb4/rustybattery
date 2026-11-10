@@ -1,6 +1,10 @@
 use crate::apps::{AppDeltaUsage, AppEnergyTracker};
 use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
 use crate::db::{AppSummaryRow, BatteryHistoryPoint, Database};
+use crate::optimize::{
+    execute_optimizations, scan_optimization_targets, set_app_frozen, stop_or_kill_app,
+    OptimizationTarget,
+};
 use crate::service::{install_systemd_service, is_daemon_active, is_service_file_installed};
 use anyhow::Result;
 use chrono::{Local, TimeZone};
@@ -16,8 +20,8 @@ use ratatui::{
     symbols,
     text::{Line, Span},
     widgets::{
-        Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, List, ListItem, Paragraph,
-        Row, Sparkline, Table, TableState, Tabs, Wrap,
+        Axis, Block, Borders, Cell, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem,
+        Paragraph, Row, Sparkline, Table, TableState, Tabs, Wrap,
     },
     Frame, Terminal,
 };
@@ -163,6 +167,7 @@ pub struct AppUi {
     pub service_installed: bool,
     pub status_message: Option<(String, Instant)>,
     pub since_ts: i64,
+    pub optimizer_modal: Option<(Vec<OptimizationTarget>, usize)>,
 }
 
 impl AppUi {
@@ -189,6 +194,7 @@ impl AppUi {
             service_installed: is_service_file_installed(),
             status_message: None,
             since_ts: 0,
+            optimizer_modal: None,
         };
         ui.table_state.select(Some(0));
         ui.refresh_data(false)?;
@@ -330,6 +336,60 @@ fn run_tui_loop(
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    if let Some((targets, sel_idx)) = &mut app.optimizer_modal {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.optimizer_modal = None;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if !targets.is_empty() {
+                                    *sel_idx = (*sel_idx + 1).min(targets.len() - 1);
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                *sel_idx = sel_idx.saturating_sub(1);
+                            }
+                            KeyCode::Char(' ') => {
+                                if let Some(t) = targets.get_mut(*sel_idx) {
+                                    t.selected = !t.selected;
+                                }
+                            }
+                            KeyCode::Char('a') => {
+                                let all_selected = targets.iter().all(|t| t.selected);
+                                for t in targets.iter_mut() {
+                                    t.selected = !all_selected;
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Char('o') => {
+                                let chosen = targets.clone();
+                                app.optimizer_modal = None;
+                                let report = execute_optimizations(&chosen);
+                                app.refresh_data(true)?;
+                                if !report.actions_taken.is_empty() {
+                                    app.status_message = Some((
+                                        format!(
+                                            "⚡ Optimized {} target(s): freed {:.0} MB RAM, stopped {} threads (~{:.1} W saved)",
+                                            report.actions_taken.len(),
+                                            report.freed_memory_mb,
+                                            report.stopped_pids,
+                                            report.estimated_watts_saved
+                                        ),
+                                        Instant::now(),
+                                    ));
+                                } else if let Some(err) = report.failed_actions.first() {
+                                    app.status_message = Some((err.clone(), Instant::now()));
+                                } else {
+                                    app.status_message = Some((
+                                        "No optimization targets were selected.".to_string(),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
@@ -370,6 +430,43 @@ fn run_tui_loop(
                         }
                         KeyCode::Char('c') => {
                             app.show_charts = !app.show_charts;
+                        }
+                        KeyCode::Char('o') => {
+                            let targets = scan_optimization_targets(app.battery.power_w);
+                            app.optimizer_modal = Some((targets, 0));
+                        }
+                        KeyCode::Char('z') => {
+                            if let Some(idx) = app.table_state.selected() {
+                                if let Some(sel) = app.apps.get(idx).cloned() {
+                                    let next_freeze = !sel.is_frozen;
+                                    match set_app_frozen(&sel.app_name, next_freeze) {
+                                        Ok(msg) => {
+                                            app.refresh_data(true)?;
+                                            app.status_message = Some((msg, Instant::now()));
+                                        }
+                                        Err(e) => {
+                                            app.status_message =
+                                                Some((format!("Freeze error: {e}"), Instant::now()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('x') => {
+                            if let Some(idx) = app.table_state.selected() {
+                                if let Some(sel) = app.apps.get(idx).cloned() {
+                                    match stop_or_kill_app(&sel.app_name) {
+                                        Ok(msg) => {
+                                            app.refresh_data(true)?;
+                                            app.status_message = Some((msg, Instant::now()));
+                                        }
+                                        Err(e) => {
+                                            app.status_message =
+                                                Some((format!("Stop error: {e}"), Instant::now()));
+                                        }
+                                    }
+                                }
+                            }
                         }
                         KeyCode::Char('r') => {
                             app.refresh_data(true)?;
@@ -436,6 +533,10 @@ fn draw_ui(f: &mut Frame, app: &mut AppUi) {
     } else {
         draw_apps_section(f, app, chunks[2]);
         draw_footer(f, app, chunks[3]);
+    }
+
+    if app.optimizer_modal.is_some() {
+        draw_optimizer_modal(f, app, size);
     }
 }
 
@@ -932,10 +1033,27 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
                 Color::LightGreen
             };
 
+            let name_display = if row.is_frozen {
+                format!("❄ {} [FROZEN]", row.app_name)
+            } else {
+                format!("{} {}", icon, row.app_name)
+            };
+
+            let name_style = if row.is_frozen {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if row.pids_count == 0 {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            };
+
             Row::new(vec![
                 Cell::from(format!("{:>2}", i + 1)).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(format!("{} {}", icon, row.app_name))
-                    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Cell::from(name_display).style(name_style),
                 Cell::from(row.category.clone()).style(Style::default().fg(cat_color)),
                 Cell::from(format!("{} {:>4.0}%", bar, row.share_of_drain_pct))
                     .style(Style::default().fg(pct_color)),
@@ -1108,6 +1226,21 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ),
         ])),
+        ListItem::new(Line::from(vec![
+            Span::styled(" App Controls:   ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                if sel.is_frozen {
+                    "[z] Resume App  "
+                } else {
+                    "[z] Freeze (0% CPU)  "
+                },
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "[x] Stop App",
+                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+            ),
+        ])),
     ];
 
     f.render_widget(List::new(items), sections[0]);
@@ -1157,18 +1290,35 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect) {
     }
 
     let keys = Line::from(vec![
-        Span::styled(" ↑/↓ j/k", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Select App  ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            " o",
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": ⚡ Optimize Battery  ", Style::default().fg(Color::White)),
+        Span::styled(
+            "z",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Freeze/Sleep App  ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            "x",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Stop App  ", Style::default().fg(Color::Gray)),
         Span::styled("Tab/1-4", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Time Window  ", Style::default().fg(Color::Gray)),
+        Span::styled(": Time  ", Style::default().fg(Color::Gray)),
         Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(": Sort  ", Style::default().fg(Color::Gray)),
         Span::styled("f", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(": Filter  ", Style::default().fg(Color::Gray)),
         Span::styled("c", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(": Charts  ", Style::default().fg(Color::Gray)),
-        Span::styled("i", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Install 24/7 Service  ", Style::default().fg(Color::Gray)),
         Span::styled("q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(": Quit", Style::default().fg(Color::Gray)),
     ]);
@@ -1177,4 +1327,160 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect) {
         Paragraph::new(keys).wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn draw_optimizer_modal(f: &mut Frame, app: &AppUi, area: Rect) {
+    let Some((targets, sel_idx)) = &app.optimizer_modal else {
+        return;
+    };
+
+    let popup_width = area.width.saturating_sub(8).min(96);
+    let popup_height = area.height.saturating_sub(4).min(24);
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(Color::Rgb(18, 22, 30)))
+        .title(Span::styled(
+            " ⚡ Battery Optimizer — Turn Off Unused Services & Background Hogs ",
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(6),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let total_sel_watts: f64 = targets
+        .iter()
+        .filter(|t| t.selected)
+        .map(|t| t.estimated_watts)
+        .sum();
+    let total_sel_ram: f64 = targets
+        .iter()
+        .filter(|t| t.selected)
+        .map(|t| t.memory_mb)
+        .sum();
+    let total_sel_count = targets.iter().filter(|t| t.selected).count();
+
+    let header_line = Line::from(vec![
+        Span::styled(
+            format!(" Selected: {} item(s)", total_sel_count),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   •   Estimated Savings: ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("~{:.1} W", total_sel_watts),
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   •   RAM to Free: ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{:.0} MB", total_sel_ram),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(header_line), chunks[0]);
+
+    if targets.is_empty() {
+        f.render_widget(
+            Paragraph::new(" ✨ Your system is already clean! No unused background hogs detected.")
+                .style(Style::default().fg(Color::LightGreen)),
+            chunks[1],
+        );
+    } else {
+        let items: Vec<ListItem> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let check = if t.selected { "[✓]" } else { "[ ]" };
+                let is_curr = i == *sel_idx;
+                let bg = if is_curr {
+                    Color::Rgb(42, 54, 72)
+                } else {
+                    Color::Rgb(18, 22, 30)
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", check),
+                        Style::default()
+                            .fg(if t.selected {
+                                Color::LightGreen
+                            } else {
+                                Color::DarkGray
+                            })
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<36}", t.display_name),
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" ~{:>4.2} W ", t.estimated_watts),
+                        Style::default().fg(Color::LightYellow).bg(bg),
+                    ),
+                    Span::styled(
+                        if t.memory_mb > 0.0 {
+                            format!(" {:>5.0} MB  ({:>3} procs) ", t.memory_mb, t.pids_count)
+                        } else {
+                            " System Power Tunable ".to_string()
+                        },
+                        Style::default().fg(Color::Cyan).bg(bg),
+                    ),
+                    Span::styled(
+                        format!("— {}", t.reason),
+                        Style::default().fg(Color::Gray).bg(bg),
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+
+        f.render_widget(List::new(items), chunks[1]);
+    }
+
+    let help_line = Line::from(vec![
+        Span::styled(
+            " Enter / o",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Optimize Selected Now   ", Style::default().fg(Color::White)),
+        Span::styled("Space", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(": Toggle Item   ", Style::default().fg(Color::Gray)),
+        Span::styled("a", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(": Select/Deselect All   ", Style::default().fg(Color::Gray)),
+        Span::styled("Esc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(": Cancel", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(Paragraph::new(help_line), chunks[2]);
 }

@@ -1,12 +1,16 @@
 pub mod apps;
 pub mod battery;
 pub mod db;
+pub mod optimize;
 pub mod service;
 pub mod tui;
 
 use crate::apps::AppEnergyTracker;
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
+use crate::optimize::{
+    execute_optimizations, scan_optimization_targets, set_app_frozen, stop_or_kill_app,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::thread;
@@ -15,8 +19,8 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "rustybattery",
-    version = "0.1.0",
-    about = "Phone-style laptop battery usage tracker & per-app energy analyzer for Fedora Linux"
+    version = "0.2.0",
+    about = "Phone-style laptop battery usage tracker, per-app energy analyzer & optimizer for Fedora Linux"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,6 +49,31 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Scan and turn off unused/underused background services, containers, and power hogs
+    Optimize {
+        /// Preview detected optimization targets without stopping them
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Freeze (0% CPU Deep Sleep) a running user application without closing its windows
+    Freeze {
+        /// Application name (e.g., "Waterfox", "Obsidian")
+        app: String,
+    },
+
+    /// Unfreeze / resume a frozen application
+    Resume {
+        /// Application name (e.g., "Waterfox", "Obsidian")
+        app: String,
+    },
+
+    /// Stop or kill all processes/units belonging to an application
+    Stop {
+        /// Application name (e.g., "Docker", "Obsidian", "GNOME Software")
+        app: String,
     },
 
     /// Run the background collector daemon (used by the systemd user service)
@@ -88,6 +117,22 @@ fn main() -> Result<()> {
             tui::run_tui(db)
         }
         Commands::Summary { hours, top, json } => print_summary(hours, top, json),
+        Commands::Optimize { dry_run } => run_cli_optimize(dry_run),
+        Commands::Freeze { app } => {
+            let msg = set_app_frozen(&app, true)?;
+            println!("{msg}");
+            Ok(())
+        }
+        Commands::Resume { app } => {
+            let msg = set_app_frozen(&app, false)?;
+            println!("{msg}");
+            Ok(())
+        }
+        Commands::Stop { app } => {
+            let msg = stop_or_kill_app(&app)?;
+            println!("{msg}");
+            Ok(())
+        }
         Commands::Daemon { interval } => service::run_daemon(interval),
         Commands::Service { action } => match action {
             ServiceAction::Install { interval } => {
@@ -220,7 +265,100 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
         );
     }
     println!();
-    println!("  Tip: Run `rustybattery` to launch the interactive TUI, or `rustybattery service install` for 24/7 tracking.");
+    println!("  Tip: Run `battery` for the interactive TUI, or `battery optimize` to stop unused background hogs.");
+
+    Ok(())
+}
+
+fn run_cli_optimize(dry_run: bool) -> Result<()> {
+    let bat = read_battery_snapshot()?;
+    let targets = scan_optimization_targets(bat.power_w);
+
+    println!("╭──────────────────────────────────────────────────────────────────────────────╮");
+    println!(
+        "│ ⚡ RustyBattery Optimizer — Background Hogs & Power-Saving Scanner            │"
+    );
+    println!("├──────────────────────────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Current Battery: {:>5.1}% ({})   Live Power Draw: {:>5.2} W              │",
+        bat.capacity_pct,
+        bat.status.as_str(),
+        bat.power_w
+    );
+    println!("╰──────────────────────────────────────────────────────────────────────────────╯");
+    println!();
+
+    if targets.is_empty() {
+        println!("  ✨ Your system is already optimized! No unused background battery hogs found.");
+        return Ok(());
+    }
+
+    let total_watts: f64 = targets.iter().map(|t| t.estimated_watts).sum();
+    let total_ram: f64 = targets.iter().map(|t| t.memory_mb).sum();
+    let total_pids: u32 = targets.iter().map(|t| t.pids_count).sum();
+
+    println!("  Detected {} background battery hog(s):", targets.len());
+    println!("  ──────────────────────────────────────────────────────────────────────────────");
+    for (i, t) in targets.iter().enumerate() {
+        if t.memory_mb > 0.0 {
+            println!(
+                "  {:>2}. {:<36} ~{:>4.2} W   {:>5.0} MB RAM   ({:>3} threads)",
+                i + 1,
+                t.display_name,
+                t.estimated_watts,
+                t.memory_mb,
+                t.pids_count
+            );
+        } else {
+            println!(
+                "  {:>2}. {:<36} ~{:>4.2} W   (System Power Profile)",
+                i + 1,
+                t.display_name,
+                t.estimated_watts
+            );
+        }
+        println!("      └─ {}", t.reason);
+    }
+    println!();
+    println!(
+        "  Potential Savings: ~{:.2} W power reduction  •  {:.0} MB RAM  •  {} background threads",
+        total_watts, total_ram, total_pids
+    );
+
+    if dry_run {
+        println!("\n  (Dry-run mode: no services were stopped. Run `battery optimize` to apply.)");
+        return Ok(());
+    }
+
+    println!("\n  Applying optimizations...");
+    let report = execute_optimizations(&targets);
+
+    for action in &report.actions_taken {
+        println!("   ✔ {action}");
+    }
+    for warn in &report.failed_actions {
+        println!("   ℹ {warn}");
+    }
+
+    println!();
+    if !report.actions_taken.is_empty() {
+        let new_power = (bat.power_w - report.estimated_watts_saved).max(4.5);
+        let old_mins = if bat.power_w > 0.5 {
+            (bat.energy_now_wh / bat.power_w) * 60.0
+        } else {
+            0.0
+        };
+        let new_mins = (bat.energy_now_wh / new_power) * 60.0;
+        let gained_mins = (new_mins - old_mins).max(0.0).round() as u32;
+
+        println!(
+            "  🎉 Done! Freed {:.0} MB RAM, stopped {} threads, saved ~{:.1} W (est. +{}m extra battery time).",
+            report.freed_memory_mb,
+            report.stopped_pids,
+            report.estimated_watts_saved,
+            gained_mins
+        );
+    }
 
     Ok(())
 }
