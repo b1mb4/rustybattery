@@ -563,7 +563,7 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            " 🦀 RustyBattery — Fedora Laptop Battery & App Power Analyzer ",
+            " 🦀 RustyBattery — Per-App Power Tracker for Linux ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),

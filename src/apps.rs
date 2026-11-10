@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -37,12 +37,13 @@ pub struct AppDeltaUsage {
     pub memory_mb: f64,
     /// Number of processes/threads in the app group
     pub pids_count: u32,
-    /// Whether this app's cgroup is currently frozen (`cgroup.freeze == 1`)
+    /// Whether this app's cgroup or process group is currently frozen
     pub is_frozen: bool,
 }
 
-/// Converts a raw systemd unit name (e.g., `app-flatpak-net.waterfox.waterfox-3273568594.scope`)
-/// into a human-friendly `(AppName, Category)` pair.
+/// Converts a raw systemd unit name, Snap scope, Flatpak scope, or process command across any Linux
+/// distribution (Ubuntu, Fedora, Arch, Debian, openSUSE, NixOS, Alpine, Void, etc.) into a
+/// human-friendly `(AppName, Category)` pair.
 pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String, String)> {
     let unit = unit_raw.trim();
     if unit.is_empty()
@@ -66,12 +67,30 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
 
     let lower = unescaped.to_lowercase();
 
-    // Known desktop/user applications & services on Fedora
+    // 1. Web Browsers
     if lower.contains("waterfox") {
         return Some(("Waterfox".to_string(), "Browser".to_string()));
     }
+    if lower.contains("librewolf") {
+        return Some(("LibreWolf".to_string(), "Browser".to_string()));
+    }
+    if lower.contains("floorp") {
+        return Some(("Floorp Browser".to_string(), "Browser".to_string()));
+    }
+    if lower.contains("zen_browser") || lower.contains("zen-browser") || lower.contains("app.zen_browser") {
+        return Some(("Zen Browser".to_string(), "Browser".to_string()));
+    }
     if lower.contains("firefox") {
         return Some(("Firefox".to_string(), "Browser".to_string()));
+    }
+    if lower.contains("vivaldi") {
+        return Some(("Vivaldi".to_string(), "Browser".to_string()));
+    }
+    if lower.contains("opera") {
+        return Some(("Opera".to_string(), "Browser".to_string()));
+    }
+    if lower.contains("thorium") {
+        return Some(("Thorium Browser".to_string(), "Browser".to_string()));
     }
     if lower.contains("chromium") {
         return Some(("Chromium".to_string(), "Browser".to_string()));
@@ -82,15 +101,48 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     if lower.contains("brave") {
         return Some(("Brave Browser".to_string(), "Browser".to_string()));
     }
-    if lower.contains("zen_browser") || lower.contains("zen-browser") {
-        return Some(("Zen Browser".to_string(), "Browser".to_string()));
+    if lower.contains("epiphany") || lower.contains("org.gnome.epiphany") {
+        return Some(("GNOME Web".to_string(), "Browser".to_string()));
     }
+
+    // 2. IDEs, Editors & Development Tools
     if lower.contains("antigravity") {
         return Some(("Antigravity".to_string(), "Development".to_string()));
     }
-    if lower.contains("obsidian") {
-        return Some(("Obsidian".to_string(), "Productivity".to_string()));
+    if lower.contains("cursor") && !lower.contains("xcursor") && !lower.contains("wayland-cursor") {
+        return Some(("Cursor IDE".to_string(), "Development".to_string()));
     }
+    if (lower.contains("code") && (lower.contains("visual") || lower.contains("vscode") || lower.contains("app-gnome-code") || lower.contains("snap.code") || lower == "code"))
+        || lower.contains("vscodium")
+    {
+        return Some(("VS Code".to_string(), "Development".to_string()));
+    }
+    if lower.contains("zed") && (lower.starts_with("app-") || lower.contains("dev.zed")) {
+        return Some(("Zed Editor".to_string(), "Development".to_string()));
+    }
+    if lower.contains("jetbrains") || lower.contains("intellij") || lower.contains("pycharm") || lower.contains("clion") || lower.contains("webstorm") || lower.contains("goland") || lower.contains("rustrover") {
+        return Some(("JetBrains IDE".to_string(), "Development".to_string()));
+    }
+    if lower.contains("nvim") || lower.contains("neovim") {
+        return Some(("Neovim".to_string(), "Development".to_string()));
+    }
+    if lower.contains("emacs") {
+        return Some(("Emacs".to_string(), "Development".to_string()));
+    }
+    if lower.contains("docker") || lower.contains("containerd") || lower.contains("podman") || lower.contains("buildkit") {
+        return Some(("Docker / Containers".to_string(), "Development".to_string()));
+    }
+    if lower.contains("ollama") {
+        return Some(("Ollama AI Server".to_string(), "Development".to_string()));
+    }
+    if lower.contains("prometheus") || lower.contains("alertmanager") || lower.contains("grafana") {
+        return Some(("Prometheus / Metrics".to_string(), "Development".to_string()));
+    }
+    if lower.contains("mysqld") || lower.contains("mariadb") || lower.contains("postgres") || lower.contains("redis-server") || lower.contains("mongod") {
+        return Some(("Database Server (SQL/NoSQL)".to_string(), "Development".to_string()));
+    }
+
+    // 3. Terminals
     if lower.contains("ghostty") {
         return Some(("Ghostty".to_string(), "Terminal".to_string()));
     }
@@ -103,23 +155,68 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     if lower.contains("wezterm") {
         return Some(("WezTerm".to_string(), "Terminal".to_string()));
     }
-    if lower.contains("gnome-terminal") || lower.contains("org.gnome.terminal") || lower.contains("ptyxis") {
+    if lower.contains("konsole") {
+        return Some(("KDE Konsole".to_string(), "Terminal".to_string()));
+    }
+    if lower.contains("foot") && (lower.starts_with("app-") || lower == "foot" || lower == "footclient") {
+        return Some(("Foot Terminal".to_string(), "Terminal".to_string()));
+    }
+    if lower.contains("tilix") || lower.contains("terminator") || lower.contains("xfce4-terminal") || lower.contains("cosmic-term") {
+        return Some(("Terminal Emulator".to_string(), "Terminal".to_string()));
+    }
+    if lower.contains("gnome-terminal") || lower.contains("org.gnome.terminal") || lower.contains("ptyxis") || lower.contains("kgx") {
         return Some(("GNOME Terminal".to_string(), "Terminal".to_string()));
     }
-    if lower.contains("code") && (lower.contains("visual") || lower.contains("app-gnome-code") || lower.contains("vscode")) {
-        return Some(("VS Code".to_string(), "Development".to_string()));
+
+    // 4. Productivity, Notes & Office
+    if lower.contains("obsidian") {
+        return Some(("Obsidian".to_string(), "Productivity".to_string()));
     }
-    if lower.contains("zed") && lower.starts_with("app-") {
-        return Some(("Zed Editor".to_string(), "Development".to_string()));
+    if lower.contains("notion") || lower.contains("logseq") || lower.contains("joplin") || lower.contains("anytype") {
+        return Some(("Notes & Knowledge".to_string(), "Productivity".to_string()));
     }
-    if lower.contains("docker") || lower.contains("containerd") || lower.contains("podman") {
-        return Some(("Docker / Containers".to_string(), "Development".to_string()));
+    if lower.contains("libreoffice") || lower.contains("soffice.bin") || lower.contains("onlyoffice") {
+        return Some(("Office Suite".to_string(), "Productivity".to_string()));
     }
-    if lower.contains("org.gnome.shell") && !lower.contains("calendar") && !lower.contains("notifications") {
+    if lower.contains("thunderbird") || lower.contains("geary") || lower.contains("mailspring") {
+        return Some(("Mail Client".to_string(), "Productivity".to_string()));
+    }
+
+    // 5. Desktop Environments & Window Managers (GNOME, KDE Plasma, COSMIC, Hyprland, Sway, X11, XFCE)
+    if lower.contains("org.gnome.shell") && !lower.contains("calendar") && !lower.contains("notifications") || lower == "gnome-shell" {
         return Some(("GNOME Shell".to_string(), "Desktop UI".to_string()));
     }
+    if lower.contains("plasmashell") || lower.contains("kwin_wayland") || lower.contains("kwin_x11") || lower.contains("plasma-") || lower.contains("kded") {
+        return Some(("KDE Plasma Desktop".to_string(), "Desktop UI".to_string()));
+    }
+    if lower.contains("hyprland") {
+        return Some(("Hyprland Compositor".to_string(), "Desktop UI".to_string()));
+    }
+    if lower == "sway" || lower.contains("swaybg") || lower.contains("swaync") {
+        return Some(("Sway Compositor".to_string(), "Desktop UI".to_string()));
+    }
+    if lower.contains("cosmic-comp") || lower.contains("cosmic-panel") || lower.contains("cosmic-applets") {
+        return Some(("COSMIC Desktop".to_string(), "Desktop UI".to_string()));
+    }
+    if lower.contains("waybar") || lower.contains("polybar") || lower.contains("eww") || lower.contains("ags") {
+        return Some(("Status Bar (Waybar/Polybar)".to_string(), "Desktop UI".to_string()));
+    }
+    if lower == "xorg" || lower == "xwayland" || lower.contains("picom") || lower.contains("i3") || lower.contains("bspwm") || lower.contains("awesome") || lower.contains("xfwm4") || lower.contains("xfce4-") || lower.contains("cinnamon") || lower.contains("marco") {
+        return Some(("Window Manager / XServer".to_string(), "Desktop UI".to_string()));
+    }
+    if lower.contains("org.gnome.settingsdaemon") || lower.contains("gnome-session") {
+        return Some(("GNOME Settings & Session".to_string(), "Desktop UI".to_string()));
+    }
+    if lower.contains("xdg-desktop-portal") || lower.contains("xdg-document-portal") || lower.contains("flatpak-portal") || lower.contains("flatpak-session") {
+        return Some(("XDG Desktop Portals".to_string(), "Desktop UI".to_string()));
+    }
+    if lower.contains("ibus") || lower.contains("fcitx") {
+        return Some(("Input Method (IBus/Fcitx)".to_string(), "Desktop UI".to_string()));
+    }
+
+    // 6. Audio, Video & Media
     if lower.contains("pipewire") || lower.contains("wireplumber") || lower.contains("pulseaudio") {
-        return Some(("PipeWire Audio".to_string(), "Audio & Media".to_string()));
+        return Some(("PipeWire / PulseAudio".to_string(), "Audio & Media".to_string()));
     }
     if lower.contains("spotify") {
         return Some(("Spotify".to_string(), "Audio & Media".to_string()));
@@ -127,75 +224,89 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     if lower.contains("vlc") {
         return Some(("VLC Media Player".to_string(), "Audio & Media".to_string()));
     }
-    if lower.contains("mpv") {
-        return Some(("mpv Player".to_string(), "Audio & Media".to_string()));
+    if lower.contains("mpv") || lower.contains("celluloid") || lower.contains("haruna") {
+        return Some(("mpv Video Player".to_string(), "Audio & Media".to_string()));
     }
+    if lower.contains("obs") && (lower.contains("studio") || lower == "obs") {
+        return Some(("OBS Studio".to_string(), "Audio & Media".to_string()));
+    }
+
+    // 7. Chat & Social
     if lower.contains("telegram") {
         return Some(("Telegram".to_string(), "Social & Chat".to_string()));
     }
-    if lower.contains("discord") || lower.contains("vesktop") {
+    if lower.contains("discord") || lower.contains("vesktop") || lower.contains("armcord") || lower.contains("webcord") {
         return Some(("Discord".to_string(), "Social & Chat".to_string()));
     }
     if lower.contains("slack") {
         return Some(("Slack".to_string(), "Social & Chat".to_string()));
     }
-    if lower.contains("steam") {
-        return Some(("Steam".to_string(), "Gaming".to_string()));
+    if lower.contains("signal") {
+        return Some(("Signal Desktop".to_string(), "Social & Chat".to_string()));
     }
+    if lower.contains("zoom") || lower.contains("teams") {
+        return Some(("Video Conferencing".to_string(), "Social & Chat".to_string()));
+    }
+
+    // 8. Gaming
+    if lower.contains("steam") || lower.contains("gamescope") || lower.contains("lutris") || lower.contains("heroic") || lower.contains("mangohud") {
+        return Some(("Steam / Gaming".to_string(), "Gaming".to_string()));
+    }
+
+    // 9. Connectivity & Background Daemons across all Linux distros
     if lower.contains("kdeconnect") {
         return Some(("KDE Connect".to_string(), "Connectivity".to_string()));
     }
-    if lower.contains("blueman") || lower.contains("bluetooth") {
+    if lower.contains("blueman") || lower.contains("bluetooth") || lower.contains("obex") {
         return Some(("Bluetooth".to_string(), "Connectivity".to_string()));
     }
-    if lower.contains("networkmanager") || lower.contains("wpa_supplicant") || lower.contains("iwd") || lower.contains("systemd-resolved") {
+    if lower.contains("networkmanager") || lower.contains("wpa_supplicant") || lower.contains("iwd") || lower.contains("systemd-resolved") || lower.contains("systemd-networkd") || lower.contains("tailscaled") || lower.contains("wireguard") || lower.contains("openvpn") {
         return Some(("Network & Wi-Fi".to_string(), "System".to_string()));
     }
-    if lower.contains("gnome-software") || lower.contains("packagekit") || lower.contains("fwupd") {
-        return Some(("GNOME Software".to_string(), "System".to_string()));
+    if lower.contains("gnome-software") || lower.contains("plasma-discover") || lower.contains("packagekit") || lower.contains("fwupd") || lower.contains("snapd") || lower.contains("dnf") || lower.contains("apt") || lower.contains("unattended-upgrade") || lower.contains("pacman") {
+        return Some(("Package & Store Manager".to_string(), "System".to_string()));
     }
-    if lower.contains("localsearch") || lower.contains("tracker-miner") {
-        return Some(("File Indexer (LocalSearch)".to_string(), "Background".to_string()));
+    if lower.contains("localsearch") || lower.contains("tracker-miner") || lower.contains("baloo_file") || lower.contains("kde-baloo") {
+        return Some(("Desktop File Indexer".to_string(), "Background".to_string()));
     }
-    if lower.contains("org.gnome.settingsdaemon") || lower.contains("gnome-session") {
-        return Some(("GNOME Settings & Session".to_string(), "Desktop UI".to_string()));
+    if lower.contains("evolution-") || lower.contains("calendarserver") || lower.contains("akonadi") {
+        return Some(("Calendar & Contacts Sync".to_string(), "Background".to_string()));
     }
-    if lower.contains("evolution-") || lower.contains("calendarserver") {
-        return Some(("GNOME Calendar & Contacts".to_string(), "Background".to_string()));
-    }
-    if lower.contains("gvfs") {
-        return Some(("GVFS Storage Daemon".to_string(), "Background".to_string()));
-    }
-    if lower.contains("xdg-desktop-portal") || lower.contains("xdg-document-portal") || lower.contains("flatpak-portal") || lower.contains("flatpak-session") {
-        return Some(("XDG Desktop Portals".to_string(), "Desktop UI".to_string()));
+    if lower.contains("gvfs") || lower.contains("udisks") || lower.contains("kio") {
+        return Some(("Storage & Virtual FS".to_string(), "Background".to_string()));
     }
     if lower.contains("dbus") {
-        return Some(("D-Bus Broker".to_string(), "System".to_string()));
+        return Some(("D-Bus Message Broker".to_string(), "System".to_string()));
     }
-    if lower.contains("ibus") {
-        return Some(("IBus Input Method".to_string(), "Desktop UI".to_string()));
-    }
-    if lower.contains("upower") || lower.contains("power-profiles-daemon") || lower.contains("thermald") || lower.contains("tuned") {
+    if lower.contains("upower") || lower.contains("power-profiles-daemon") || lower.contains("thermald") || lower.contains("tuned") || lower.contains("tlp") || lower.contains("auto-cpufreq") {
         return Some(("Power Management".to_string(), "System".to_string()));
     }
-    if lower.contains("systemd-journald") || lower.contains("systemd-udevd") || lower.contains(" systemd-logind") || lower.contains("auditd") {
-        return Some(("Systemd Core Services".to_string(), "System".to_string()));
+    if lower.contains("systemd-journald") || lower.contains("systemd-udevd") || lower.contains("systemd-logind") || lower.contains("systemd-oomd") || lower.contains("auditd") || lower.contains("rsyslog") {
+        return Some(("System Core & Logging".to_string(), "System".to_string()));
     }
-    if lower.contains("polkit") || lower.contains("accounts-daemon") || lower.contains("sssd") || lower.contains("uresourced") || lower.contains("rtkit") {
-        return Some(("System Security & Auth".to_string(), "System".to_string()));
+    if lower.contains("polkit") || lower.contains("accounts-daemon") || lower.contains("sssd") || lower.contains("uresourced") || lower.contains("rtkit") || lower.contains("gnome-keyring") || lower.contains("kwalletd") {
+        return Some(("Security, Auth & Keyring".to_string(), "System".to_string()));
     }
 
-    // Generic parsing for `app-flatpak-<reverse.dns>-<pid>.scope` or `app-gnome-<name>-<pid>.scope` or `app-<name>-<pid>.scope`
+    // 10. Generic parsing for Snap (`snap.<pkg>.<app>.scope`), Flatpak (`app-flatpak-<id>-<pid>.scope`),
+    // systemd desktop scopes (`app-<de>-<name>-<pid>.scope`), and Nix store binaries
     let mut base = unescaped
         .trim_end_matches(".scope")
         .trim_end_matches(".service")
         .trim_end_matches(".slice")
         .to_string();
 
+    if let Some(rest) = base.strip_prefix("snap.") {
+        let segs: Vec<&str> = rest.split('.').collect();
+        if let Some(&first) = segs.first() {
+            base = first.to_string();
+        }
+    }
+
     // Strip trailing `-<digits>` (PID or instance ID)
     if let Some(idx) = base.rfind('-') {
         let tail = &base[idx + 1..];
-        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c.is_ascii_hexdigit()) && tail.len() >= 3 {
             base.truncate(idx);
         }
     }
@@ -207,6 +318,8 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     for prefix in [
         "app-flatpak-",
         "app-gnome-",
+        "app-kde-",
+        "app-plasma-",
         "app-systemd-",
         "app-",
         "dbus-:1.",
@@ -217,7 +330,7 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
         }
     }
 
-    // If reverse-DNS (like `org.mozilla.Thunderbird` or `com.obsproject.Studio`), take the most meaningful segment
+    // Reverse-DNS cleanup (e.g. `org.mozilla.Thunderbird` or `com.obsproject.Studio`)
     if base.contains('.') {
         let parts: Vec<&str> = base
             .split('.')
@@ -229,11 +342,13 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
                     && l != "net"
                     && l != "io"
                     && l != "md"
+                    && l != "dev"
                     && l != "app"
                     && l != "client"
                     && l != "desktop"
                     && l != "freedesktop"
                     && l != "gnome"
+                    && l != "kde"
                     && !l.chars().all(|c| c.is_ascii_digit() || c == '-')
             })
             .collect();
@@ -247,7 +362,6 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
         return None;
     }
 
-    // Title-case words
     let pretty = cleaned
         .split_whitespace()
         .map(|w| {
@@ -306,10 +420,21 @@ fn read_cgroup_u64(dir: &Path, filename: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn collect_cgroup_pids(dir: &Path, out_pids: &mut HashSet<u32>) {
+    if let Ok(content) = fs::read_to_string(dir.join("cgroup.procs")) {
+        for line in content.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                out_pids.insert(pid);
+            }
+        }
+    }
+}
+
 fn scan_slice_dir(
     slice_dir: &Path,
     slice_type: &str,
     map: &mut HashMap<String, RawAppCounter>,
+    accounted_pids: &mut HashSet<u32>,
 ) {
     let Ok(entries) = fs::read_dir(slice_dir) else {
         return;
@@ -322,10 +447,16 @@ fn scan_slice_dir(
         }
         let unit_name = entry.file_name().to_string_lossy().to_string();
         if unit_name.ends_with(".slice") {
-            // Recurse into nested slices (like app-gnome-session-manager.slice)
-            scan_slice_dir(&path, slice_type, map);
+            scan_slice_dir(&path, slice_type, map, accounted_pids);
             continue;
         }
+        // Generic login session scopes (`session-1.scope`, `session-c1.scope`) on non-systemd-desktop
+        // WMs (Sway, Hyprland, i3, XFCE) hold many distinct user apps inside one scope;
+        // let `/proc` per-process scanner split those into individual applications.
+        if unit_name.starts_with("session-") && unit_name.ends_with(".scope") {
+            continue;
+        }
+
         let Some((app_name, category)) = normalize_cgroup_unit(&unit_name, slice_type) else {
             continue;
         };
@@ -335,6 +466,8 @@ fn scan_slice_dir(
         let memory_bytes = read_cgroup_u64(&path, "memory.current");
         let pids_count = read_cgroup_u64(&path, "pids.current") as u32;
         let frozen = read_cgroup_u64(&path, "cgroup.freeze") == 1 && pids_count > 0;
+
+        collect_cgroup_pids(&path, accounted_pids);
 
         let entry_counter = map.entry(app_name.clone()).or_insert_with(|| RawAppCounter {
             app_name,
@@ -359,36 +492,82 @@ fn scan_slice_dir(
 }
 
 /// Reads cumulative CPU microseconds, memory, and PID counts for all running apps and services
-/// via Fedora's cgroup v2 hierarchy (with `/proc` fallback).
+/// across all Linux distributions:
+/// - Uses systemd cgroup v2 (`app.slice`, `session.slice`, `background.slice`, `system.slice`) when present
+/// - Also scans `/proc/[pid]` for processes running in standalone window managers (Hyprland, Sway, i3, XFCE),
+///   generic login scopes (`session-*.scope`), or non-systemd distros (Void, Alpine, Gentoo OpenRC, Artix).
 pub fn read_all_app_counters() -> HashMap<String, RawAppCounter> {
     let mut map = HashMap::new();
+    let mut accounted_pids = HashSet::new();
 
     let uid = unsafe { libc::getuid() };
-    let user_service_dir = format!(
-        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
-    );
+    let user_slice_dir = format!("/sys/fs/cgroup/user.slice/user-{uid}.slice");
+    let user_service_dir = format!("{user_slice_dir}/user@{uid}.service");
     let user_base = Path::new(&user_service_dir);
 
+    let mut had_user_app_slice = false;
     if user_base.exists() {
-        scan_slice_dir(&user_base.join("app.slice"), "app", &mut map);
-        scan_slice_dir(&user_base.join("session.slice"), "session", &mut map);
-        scan_slice_dir(&user_base.join("background.slice"), "background", &mut map);
+        let app_slice = user_base.join("app.slice");
+        if app_slice.exists() {
+            scan_slice_dir(&app_slice, "app", &mut map, &mut accounted_pids);
+            had_user_app_slice = !map.is_empty();
+        }
+        scan_slice_dir(&user_base.join("session.slice"), "session", &mut map, &mut accounted_pids);
+        scan_slice_dir(&user_base.join("background.slice"), "background", &mut map, &mut accounted_pids);
     }
 
     let system_slice = Path::new("/sys/fs/cgroup/system.slice");
     if system_slice.exists() {
-        scan_slice_dir(system_slice, "system", &mut map);
+        scan_slice_dir(system_slice, "system", &mut map, &mut accounted_pids);
     }
 
-    // Fallback to /proc/[pid]/stat if cgroup v2 wasn't populated
-    if map.is_empty() {
-        scan_proc_fallback(&mut map);
+    // If user apps aren't organized in systemd `app.slice` (e.g. non-systemd distros, X11/Wayland
+    // standalone WMs like Sway/Hyprland/i3/XFCE, or container/sandbox environments), scan `/proc`
+    // for any unaccounted processes.
+    if !had_user_app_slice || map.is_empty() {
+        scan_proc_processes(&mut map, &accounted_pids);
     }
 
     map
 }
 
-fn scan_proc_fallback(map: &mut HashMap<String, RawAppCounter>) {
+fn resolve_proc_app_name(pid_dir: &Path, comm: &str) -> (String, String) {
+    // Check /proc/[pid]/cmdline for browser/Electron/Flatpak/Snap/Nix executable names
+    let cmdline = fs::read_to_string(pid_dir.join("cmdline"))
+        .unwrap_or_default()
+        .replace('\0', " ");
+
+    // Handle Firefox / Waterfox / Zen / LibreWolf content subprocesses (`Isolated Web Co`, `WebExtensions`, `RDD Process`, `Socket Process`)
+    if matches!(
+        comm,
+        "Isolated Web Co" | "Web Content" | "WebExtensions" | "Privileged Cont" | "RDD Process" | "Socket Process" | "Utility Process"
+    ) {
+        let lower_cmd = cmdline.to_lowercase();
+        if lower_cmd.contains("waterfox") {
+            return ("Waterfox".to_string(), "Browser".to_string());
+        } else if lower_cmd.contains("librewolf") {
+            return ("LibreWolf".to_string(), "Browser".to_string());
+        } else if lower_cmd.contains("zen") {
+            return ("Zen Browser".to_string(), "Browser".to_string());
+        } else {
+            return ("Firefox".to_string(), "Browser".to_string());
+        }
+    }
+
+    if let Some(first_arg) = cmdline.split_whitespace().next() {
+        let bin_name = Path::new(first_arg)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| comm.to_string());
+        if let Some(pair) = normalize_cgroup_unit(&bin_name, "app") {
+            return pair;
+        }
+    }
+
+    normalize_cgroup_unit(comm, "app").unwrap_or_else(|| (comm.to_string(), "App".to_string()))
+}
+
+fn scan_proc_processes(map: &mut HashMap<String, RawAppCounter>, accounted_pids: &HashSet<u32>) {
     let Ok(entries) = fs::read_dir("/proc") else {
         return;
     };
@@ -398,10 +577,27 @@ fn scan_proc_fallback(map: &mut HashMap<String, RawAppCounter>) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let pid_str = name.to_string_lossy();
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if accounted_pids.contains(&pid) {
             continue;
         }
+
         let pid_dir = entry.path();
+        // Skip processes already inside a systemd app.slice/session.slice/system.slice if cgroup v2 is active
+        if !accounted_pids.is_empty() {
+            if let Ok(cg) = fs::read_to_string(pid_dir.join("cgroup")) {
+                if cg.contains("/app.slice/")
+                    || cg.contains("/session.slice/")
+                    || cg.contains("/background.slice/")
+                    || cg.contains("/system.slice/")
+                {
+                    continue;
+                }
+            }
+        }
+
         let Ok(stat_str) = fs::read_to_string(pid_dir.join("stat")) else {
             continue;
         };
@@ -412,6 +608,7 @@ fn scan_proc_fallback(map: &mut HashMap<String, RawAppCounter>) {
         if after.len() < 22 {
             continue;
         }
+        let state_char = after[0];
         let utime = after[11].parse::<u64>().unwrap_or(0) * usec_per_tick;
         let stime = after[12].parse::<u64>().unwrap_or(0) * usec_per_tick;
         let rss_pages = after[21].parse::<u64>().unwrap_or(0);
@@ -419,12 +616,11 @@ fn scan_proc_fallback(map: &mut HashMap<String, RawAppCounter>) {
         if usage == 0 {
             continue;
         }
-        let (app_name, category) =
-            normalize_cgroup_unit(comm, "app").unwrap_or_else(|| (comm.to_string(), "App".to_string()));
+        let (app_name, category) = resolve_proc_app_name(&pid_dir, comm);
         let counter = map.entry(app_name.clone()).or_insert_with(|| RawAppCounter {
             app_name,
             category,
-            unit_hint: comm.to_string(),
+            unit_hint: format!("proc:{comm}"),
             usage_usec: 0,
             user_usec: 0,
             system_usec: 0,
@@ -437,6 +633,9 @@ fn scan_proc_fallback(map: &mut HashMap<String, RawAppCounter>) {
         counter.system_usec += stime;
         counter.memory_bytes += rss_pages * 4096;
         counter.pids_count += 1;
+        if state_char == "T" {
+            counter.is_frozen = true;
+        }
     }
 }
 
@@ -478,11 +677,9 @@ impl AppEnergyTracker {
                 if curr.usage_usec >= prev.usage_usec {
                     curr.usage_usec - prev.usage_usec
                 } else {
-                    // Counter reset (app restarted)
                     curr.usage_usec
                 }
             } else {
-                // Newly launched app: cap initial delta to dt_secs * 2 cores so a pre-existing unit doesn't spike
                 curr.usage_usec.min((dt_secs * 2_000_000.0) as u64)
             };
 
@@ -492,9 +689,6 @@ impl AppEnergyTracker {
 
         self.prev_counters = current;
 
-        // Interval energy in Wh & battery percentage points
-        // Even if plugged in, we still compute `live_power_w` and `live_cpu_pct` for live monitoring,
-        // while `battery_pct` and `energy_wh` accumulate actual battery discharge (or all power if discharging).
         let effective_power_w = if power_w > 0.1 { power_w } else { 8.5 };
         let interval_wh = if is_discharging {
             effective_power_w * (dt_secs / 3600.0)
@@ -544,8 +738,7 @@ impl AppEnergyTracker {
 }
 
 /// Bootstraps initial session per-app battery attribution from cumulative cgroup v2 `cpu.stat`
-/// since system boot so that the very first time the user launches `battstat`, they immediately
-/// see their real session's per-app battery usage breakdown!
+/// or `/proc` counters since system boot.
 pub fn bootstrap_session_app_usage(
     session_discharged_pct: f64,
     energy_full_wh: f64,
@@ -568,12 +761,10 @@ pub fn bootstrap_session_app_usage(
     let mut list = Vec::with_capacity(counters.len());
     for c in counters.into_values() {
         if c.usage_usec < 10_000 {
-            // Skip units with <10ms total CPU time
             continue;
         }
         let share = (c.usage_usec as f64) / (total_usec as f64);
         let cpu_secs = (c.usage_usec as f64) / 1_000_000.0;
-        // Estimate active wall-clock time based on CPU activity profile
         let active_secs = (cpu_secs * 8.5).max(cpu_secs);
 
         list.push(AppDeltaUsage {
