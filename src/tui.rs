@@ -6,6 +6,7 @@ use crate::optimize::{
     OptimizationTarget,
 };
 use crate::service::{install_systemd_service, is_daemon_active, is_service_file_installed};
+use crate::statusbar::send_status_notification;
 use anyhow::Result;
 use chrono::{Local, TimeZone};
 use crossterm::{
@@ -472,6 +473,13 @@ fn run_tui_loop(
                             app.refresh_data(true)?;
                             app.status_message =
                                 Some(("Refreshed live battery & app stats".to_string(), Instant::now()));
+                        }
+                        KeyCode::Char('n') => {
+                            let _ = send_status_notification(&app.battery, &app.apps);
+                            app.status_message = Some((
+                                "🔔 Sent desktop notification with battery & top apps summary".to_string(),
+                                Instant::now(),
+                            ));
                         }
                         KeyCode::Char('i') => {
                             match install_systemd_service(5) {

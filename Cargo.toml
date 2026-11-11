@@ -1,11 +1,16 @@
 [package]
 name = "rustybattery"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+default-run = "rustybattery"
 description = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 authors = ["b1mb4 <artemkluenkov41@gmail.com>"]
 repository = "https://github.com/b1mb4/rustybattery"
+homepage = "https://github.com/b1mb4/rustybattery"
+readme = "README.md"
 license = "MIT"
+keywords = ["battery", "linux", "power", "tui", "monitoring"]
+categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]
 anyhow = "1.0.97"

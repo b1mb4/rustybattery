@@ -1,0 +1,25 @@
+# Maintainer: b1mb4 <artemkluenkov41@gmail.com>
+pkgname=rustybattery
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/b1mb4/rustybattery"
+license=('MIT')
+depends=('sqlite' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+source=("git+https://github.com/b1mb4/rustybattery.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 "target/release/rustybattery" "$pkgdir/usr/bin/rustybattery"
+  ln -s /usr/bin/rustybattery "$pkgdir/usr/bin/battery"
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

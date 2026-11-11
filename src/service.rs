@@ -1,6 +1,7 @@
 use crate::apps::AppEnergyTracker;
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
+use crate::statusbar::NotificationMonitor;
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
@@ -49,6 +50,7 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
     }
 
     let mut tracker = AppEnergyTracker::new();
+    let mut notif_monitor = NotificationMonitor::new(22.0);
     let sleep_dur = Duration::from_secs(interval_secs.max(1));
 
     println!(
@@ -71,6 +73,7 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
                 snap.status.is_discharging(),
             );
             let _ = db.record_app_deltas(&deltas);
+            notif_monitor.evaluate(&snap, &deltas);
         }
     }
 }

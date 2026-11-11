@@ -26,23 +26,27 @@
 
 ## 📦 Installation
 
-### System Requirements
-- Linux with `/sys/class/power_supply/`
-- Rust toolchain (`cargo`) and `sqlite3` (`libsqlite3-dev` on Ubuntu/Debian, `sqlite-devel` on Fedora, `sqlite` on Arch)
+### Option 1: Install via Cargo (Recommended)
+```bash
+cargo install rustybattery
+```
+*(Installs both `rustybattery` and the `battery` command directly into `~/.cargo/bin`. Before publishing to crates.io, you can also run `cargo install --git https://github.com/b1mb4/rustybattery`.)*
 
-### Build & Install from Source
+### Option 2: One-Command Shell Installer (Pre-Built Binary)
+```bash
+curl -fsSL https://raw.githubusercontent.com/b1mb4/rustybattery/main/install.sh | bash
+```
+
+### Option 3: Build from Source
 ```bash
 git clone https://github.com/b1mb4/rustybattery.git
 cd rustybattery
-cargo build --release
-
-# Install binary, `battery` shortcut, and optional 24/7 systemd user service:
-./target/release/rustybattery service install
+cargo install --path .
 ```
 
-Make sure `~/.local/bin` is in your `PATH`, then launch with:
+### Option 4: Arch Linux (`PKGBUILD`)
 ```bash
-battery
+cd packaging && makepkg -si
 ```
 
 ---
@@ -68,12 +72,33 @@ rustybattery
 | `f` | Cycle category filter (`All Apps & Services`, `User Apps Only`, `Desktop & System`) |
 | `c` | Toggle Battery `%` & Power (`W`) charts |
 | `i` | Install & enable the 24/7 systemd user background service |
+| `n` | Send a desktop notification with current battery stats & top draining apps |
 | `r` | Force immediate live sample refresh |
 | `q` / `Esc` | Quit |
 
 ---
 
-### 2. Battery Optimizer & App Controls (CLI)
+### 2. Desktop Status Bar (Waybar / Polybar / Tmux) & Notifications
+```bash
+# Output Waybar JSON (with hover tooltip showing live top 5 battery-draining apps)
+battery statusbar
+
+# Output compact one-liner for Polybar or Tmux
+battery statusbar --format polybar
+battery statusbar --format tmux
+
+# Print ready-to-paste config snippets for Waybar, Polybar, or Tmux
+battery statusbar --print-config waybar
+battery statusbar --print-config polybar
+
+# Trigger a desktop notification with current battery status & top consumers
+battery notify
+```
+When the background daemon (`rustybattery daemon`) is running, it also automatically sends native desktop notifications (`notify-send`) on **low battery (`<= 20%` and `<= 10%`)** and **sustained high battery drain (`>= 22 W`)** with the name of the top draining application.
+
+---
+
+### 3. Battery Optimizer & App Controls (CLI)
 ```bash
 # Preview unused background services, containers, and estimated Watt/RAM savings
 battery optimize --dry-run
