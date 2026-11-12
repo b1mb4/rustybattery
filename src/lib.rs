@@ -1,4 +1,5 @@
 pub mod apps;
+pub mod autopilot;
 pub mod battery;
 pub mod db;
 pub mod optimize;
@@ -7,6 +8,7 @@ pub mod statusbar;
 pub mod tui;
 
 use crate::apps::AppEnergyTracker;
+use crate::autopilot::{get_last_autopilot_action, is_autopilot_enabled, set_autopilot_enabled};
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
 use crate::optimize::{
@@ -20,7 +22,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "rustybattery",
-    version = "0.3.0",
+    version = "0.4.0",
     about = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 )]
 struct Cli {
@@ -106,6 +108,13 @@ enum Commands {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+
+    /// Configure Automatic "Smart Battery Saver" Rules (Daemon Mode Autopilot)
+    Autopilot {
+        /// Action: "status" (default), "on", or "off"
+        #[arg(default_value = "status")]
+        mode: String,
     },
 }
 
@@ -206,9 +215,53 @@ pub fn run() -> Result<()> {
                     "Daemon Active:   {}",
                     if active { "YES (running)" } else { "NO (idle)" }
                 );
+                println!(
+                    "Smart Saver:     {}",
+                    if is_autopilot_enabled(&db) {
+                        "ENABLED (Automatic Smart Battery Saver Rules)"
+                    } else {
+                        "DISABLED"
+                    }
+                );
                 Ok(())
             }
         },
+        Commands::Autopilot { mode } => {
+            let db = Database::open(&default_db_path())?;
+            match mode.to_lowercase().as_str() {
+                "on" | "enable" | "true" | "1" => {
+                    let msg = set_autopilot_enabled(&db, true)?;
+                    println!("✔ {msg}");
+                }
+                "off" | "disable" | "false" | "0" => {
+                    let msg = set_autopilot_enabled(&db, false)?;
+                    println!("✔ {msg}");
+                }
+                _ => {
+                    let enabled = is_autopilot_enabled(&db);
+                    let last_action = get_last_autopilot_action(&db);
+                    println!("🤖 RustyBattery — Automatic \"Smart Battery Saver\" Rules");
+                    println!("──────────────────────────────────────────────────────────────────────");
+                    println!(
+                        "Autopilot Status: {}",
+                        if enabled { "● ENABLED" } else { "○ DISABLED" }
+                    );
+                    println!("Last Action:      {}", last_action);
+                    println!();
+                    println!("Active Smart Battery Saver Rules (Daemon & Live Mode):");
+                    println!("  1. AC ↔ Battery Power Profile: Automatically switches to `power-saver`");
+                    println!("     when unplugged on battery, and restores `balanced` when plugged into AC.");
+                    println!("  2. Idle Heavy App Auto-Freeze: Freezes unfocused windowed apps (`cgroup.freeze = 1`)");
+                    println!("     if idle in background >= 10 mins on battery while drawing >= 0.85W, and");
+                    println!("     instantly resumes them the moment their window is focused again.");
+                    println!("  3. Low-Battery Triggers: At <= 20% dims keyboard backlight & enforces powersave;");
+                    println!("     at <= 10% auto-stops background indexers & store updaters.");
+                    println!();
+                    println!("Toggle anytime with: `battery autopilot on` | `battery autopilot off` (or press `a` in TUI)");
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -243,10 +296,14 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
         let out = serde_json::json!({
             "battery": bat,
             "since_timestamp": since_ts,
+            "autopilot_enabled": is_autopilot_enabled(&db),
             "apps": apps.into_iter().take(top).map(|a| serde_json::json!({
                 "app_name": a.app_name,
                 "category": a.category,
                 "battery_pct": a.battery_pct,
+                "focused_battery_pct": a.focused_battery_pct,
+                "focused_secs": a.focused_secs,
+                "is_focused": a.is_focused,
                 "share_of_drain_pct": a.share_of_drain_pct,
                 "energy_wh": a.energy_wh,
                 "live_power_w": a.live_power_w,
@@ -265,33 +322,33 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
         None => "N/A".to_string(),
     };
 
-    println!("╭──────────────────────────────────────────────────────────────────────────────╮");
+    println!("╭────────────────────────────────────────────────────────────────────────────────────────╮");
     println!(
-        "│ 🦀 RustyBattery — Per-App Power Tracker for Linux                            │"
+        "│ 🦀 RustyBattery v0.4.0 — Per-App Power Tracker for Linux                               │"
     );
-    println!("├──────────────────────────────────────────────────────────────────────────────┤");
+    println!("├────────────────────────────────────────────────────────────────────────────────────────┤");
     println!(
-        "│ Battery: {:>5.1}% ({})   Power: {:>5.2} W   Remaining: {:<10}       │",
+        "│ Battery: {:>5.1}% ({})   Power: {:>5.2} W   Remaining: {:<10}                 │",
         bat.capacity_pct,
         bat.status.as_str(),
         bat.power_w,
         time_rem
     );
     println!(
-        "│ Energy:  {:>5.1} / {:>5.1} Wh (Design: {:>5.1} Wh)   Health: {:>5.1}% ({} cycles) │",
+        "│ Energy:  {:>5.1} / {:>5.1} Wh (Design: {:>5.1} Wh)   Health: {:>5.1}% ({} cycles)           │",
         bat.energy_now_wh,
         bat.energy_full_wh,
         bat.energy_design_wh,
         bat.health_pct,
         bat.cycle_count
     );
-    println!("╰──────────────────────────────────────────────────────────────────────────────╯");
+    println!("╰────────────────────────────────────────────────────────────────────────────────────────╯");
     println!();
     println!(
-        "  {:<3} {:<24} {:<13} {:<16} {:>7} {:>8} {:>7} {:>8}",
-        "#", "Application", "Category", "Share of Drain", "Batt %", "Energy", "Live W", "Memory"
+        "  {:<3} {:<22} {:<13} {:<16} {:>7} {:>9} {:>8} {:>7} {:>8}",
+        "#", "Application", "Category", "Share of Drain", "Batt %", "Focused %", "Energy", "Live W", "Memory"
     );
-    println!("  ──────────────────────────────────────────────────────────────────────────────────────────");
+    println!("  ──────────────────────────────────────────────────────────────────────────────────────────────────");
 
     for (i, app) in apps.into_iter().take(top).enumerate() {
         let filled = ((app.share_of_drain_pct / 100.0) * 10.0).round() as usize;
@@ -300,21 +357,27 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
             "█".repeat(filled.min(10)),
             "░".repeat(10usize.saturating_sub(filled.min(10)))
         );
+        let name_label = if app.is_focused {
+            format!("🎯 {}", app.app_name)
+        } else {
+            app.app_name.clone()
+        };
         println!(
-            "  {:>2}. {:<24} {:<13} {} {:>4.0}% {:>6.2}% {:>5.2} Wh {:>5.2} W {:>6.0} MB",
+            "  {:>2}. {:<22} {:<13} {} {:>4.0}% {:>6.2}% {:>8.2}% {:>5.2} Wh {:>5.2} W {:>5.0} MB",
             i + 1,
-            app.app_name.chars().take(24).collect::<String>(),
+            name_label.chars().take(22).collect::<String>(),
             app.category.chars().take(13).collect::<String>(),
             bar,
             app.share_of_drain_pct,
             app.battery_pct,
+            app.focused_battery_pct,
             app.energy_wh,
             app.live_power_w,
             app.memory_mb
         );
     }
     println!();
-    println!("  Tip: Run `battery` for the interactive TUI, or `battery optimize` to stop unused background hogs.");
+    println!("  Tip: Run `battery` for the interactive TUI, `battery autopilot` for Smart Saver rules, or `battery optimize`.");
 
     Ok(())
 }

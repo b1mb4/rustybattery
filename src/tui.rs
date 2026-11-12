@@ -1,4 +1,5 @@
 use crate::apps::{AppDeltaUsage, AppEnergyTracker};
+use crate::autopilot::{is_autopilot_enabled, set_autopilot_enabled, SmartAutopilot};
 use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
 use crate::db::{AppSummaryRow, BatteryHistoryPoint, Database};
 use crate::optimize::{
@@ -78,6 +79,7 @@ impl TimeWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
     BatteryPct,
+    FocusedPct,
     EnergyWh,
     LivePowerW,
     LiveCpuPct,
@@ -87,7 +89,8 @@ pub enum SortColumn {
 impl SortColumn {
     pub fn next(&self) -> Self {
         match self {
-            SortColumn::BatteryPct => SortColumn::EnergyWh,
+            SortColumn::BatteryPct => SortColumn::FocusedPct,
+            SortColumn::FocusedPct => SortColumn::EnergyWh,
             SortColumn::EnergyWh => SortColumn::LivePowerW,
             SortColumn::LivePowerW => SortColumn::LiveCpuPct,
             SortColumn::LiveCpuPct => SortColumn::MemoryMb,
@@ -98,6 +101,7 @@ impl SortColumn {
     pub fn label(&self) -> &'static str {
         match self {
             SortColumn::BatteryPct => "Battery %",
+            SortColumn::FocusedPct => "Focused %",
             SortColumn::EnergyWh => "Energy (Wh)",
             SortColumn::LivePowerW => "Live Power (W)",
             SortColumn::LiveCpuPct => "Live CPU %",
@@ -154,6 +158,7 @@ impl CategoryFilter {
 pub struct AppUi {
     pub db: Database,
     pub tracker: AppEnergyTracker,
+    pub autopilot: SmartAutopilot,
     pub battery: BatterySnapshot,
     pub history: Vec<BatteryHistoryPoint>,
     pub apps: Vec<AppSummaryRow>,
@@ -166,6 +171,7 @@ pub struct AppUi {
     pub table_state: TableState,
     pub daemon_running: bool,
     pub service_installed: bool,
+    pub autopilot_enabled: bool,
     pub status_message: Option<(String, Instant)>,
     pub since_ts: i64,
     pub optimizer_modal: Option<(Vec<OptimizationTarget>, usize)>,
@@ -177,10 +183,12 @@ impl AppUi {
         db.ensure_initial_seed(&battery)?;
         db.record_battery_snapshot(&battery)?;
 
+        let autopilot_enabled = is_autopilot_enabled(&db);
         let tracker = AppEnergyTracker::new();
         let mut ui = Self {
             db,
             tracker,
+            autopilot: SmartAutopilot::new(),
             battery,
             history: Vec::new(),
             apps: Vec::new(),
@@ -193,6 +201,7 @@ impl AppUi {
             table_state: TableState::default(),
             daemon_running: false,
             service_installed: is_service_file_installed(),
+            autopilot_enabled,
             status_message: None,
             since_ts: 0,
             optimizer_modal: None,
@@ -219,6 +228,7 @@ impl AppUi {
 
         self.daemon_running = is_daemon_active(&self.db);
         self.service_installed = is_service_file_installed();
+        self.autopilot_enabled = is_autopilot_enabled(&self.db);
 
         if sample_live_tick {
             let (deltas, _) = self.tracker.sample_delta(
@@ -226,10 +236,11 @@ impl AppUi {
                 self.battery.energy_full_wh,
                 self.battery.status.is_discharging(),
             );
-            // If the background daemon is NOT currently active, the TUI itself persists samples to SQLite!
+            // If the background daemon is NOT currently active, the TUI itself persists samples & evaluates Autopilot!
             if !self.daemon_running {
                 let _ = self.db.record_battery_snapshot(&self.battery);
                 let _ = self.db.record_app_deltas(&deltas);
+                self.autopilot.evaluate(&self.db, &self.battery, &deltas);
             }
             self.live_deltas = deltas;
         }
@@ -255,6 +266,7 @@ impl AppUi {
         all_apps.sort_by(|a, b| {
             let cmp = match self.sort_by {
                 SortColumn::BatteryPct => b.battery_pct.partial_cmp(&a.battery_pct),
+                SortColumn::FocusedPct => b.focused_battery_pct.partial_cmp(&a.focused_battery_pct),
                 SortColumn::EnergyWh => b.energy_wh.partial_cmp(&a.energy_wh),
                 SortColumn::LivePowerW => b.live_power_w.partial_cmp(&a.live_power_w),
                 SortColumn::LiveCpuPct => b.live_cpu_pct.partial_cmp(&a.live_cpu_pct),
@@ -467,6 +479,13 @@ fn run_tui_loop(
                                         }
                                     }
                                 }
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            let next_state = !app.autopilot_enabled;
+                            if let Ok(msg) = set_autopilot_enabled(&app.db, next_state) {
+                                app.autopilot_enabled = next_state;
+                                app.status_message = Some((format!("🤖 {msg}"), Instant::now()));
                             }
                         }
                         KeyCode::Char('r') => {
@@ -708,20 +727,33 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
         )
     };
 
+    let autopilot_span = if app.autopilot_enabled {
+        Span::styled(
+            "● ON [a]",
+            Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "○ OFF [a]",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
     let right_lines = vec![
         Line::from(vec![
-            Span::styled("Collector: ", Style::default().fg(Color::Gray)),
+            Span::styled("Collector:   ", Style::default().fg(Color::Gray)),
             daemon_span,
         ]),
         Line::from(vec![
-            Span::styled("Last Full: ", Style::default().fg(Color::Gray)),
+            Span::styled("Smart Saver: ", Style::default().fg(Color::Gray)),
+            autopilot_span,
             Span::styled(
-                format!("{:.1}h ago", hours_ago),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                format!(" · Full {:.1}h ago", hours_ago),
+                Style::default().fg(Color::DarkGray),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Sort By:   ", Style::default().fg(Color::Gray)),
+            Span::styled("Sort By:     ", Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{} [s]", app.sort_by.label()),
                 Style::default().fg(Color::LightCyan),
@@ -998,16 +1030,17 @@ fn make_usage_bar(share_pct: f64, width: usize) -> String {
 fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
         .split(area);
 
-    // 1. Left: Phone-Style Per-App Battery Usage Table
+    // 1. Left: Phone-Style Per-App Battery Usage Table (with Focused % column)
     let header_cells = [
         "#",
         "Application",
         "Category",
         "Battery Share",
         "Batt %",
+        "Focused %",
         "Energy",
         "Live W",
         "CPU Time",
@@ -1031,7 +1064,7 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
         .enumerate()
         .map(|(i, row)| {
             let (icon, cat_color) = category_icon_and_color(&row.category);
-            let bar = make_usage_bar(row.share_of_drain_pct, 10);
+            let bar = make_usage_bar(row.share_of_drain_pct, 9);
 
             let pct_color = if row.share_of_drain_pct >= 25.0 {
                 Color::LightRed
@@ -1043,6 +1076,8 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
 
             let name_display = if row.is_frozen {
                 format!("❄ {} [FROZEN]", row.app_name)
+            } else if row.is_focused {
+                format!("🎯 {} {}", icon, row.app_name)
             } else {
                 format!("{} {}", icon, row.app_name)
             };
@@ -1051,12 +1086,24 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
                 Style::default()
                     .fg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD)
+            } else if row.is_focused {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
             } else if row.pids_count == 0 {
                 Style::default().fg(Color::DarkGray)
             } else {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
+            };
+
+            let focused_style = if row.focused_battery_pct > 0.005 {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
             };
 
             Row::new(vec![
@@ -1067,6 +1114,7 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
                     .style(Style::default().fg(pct_color)),
                 Cell::from(format!("{:>5.2}%", row.battery_pct))
                     .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("{:>6.2}%", row.focused_battery_pct)).style(focused_style),
                 Cell::from(format!("{:>5.2} Wh", row.energy_wh))
                     .style(Style::default().fg(Color::Gray)),
                 Cell::from(format!("{:>4.2} W", row.live_power_w)).style(
@@ -1092,11 +1140,12 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
         rows,
         [
             Constraint::Length(3),
-            Constraint::Min(18),
-            Constraint::Length(13),
-            Constraint::Length(16),
+            Constraint::Min(17),
+            Constraint::Length(12),
+            Constraint::Length(15),
             Constraint::Length(7),
             Constraint::Length(9),
+            Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(8),
         ],
@@ -1159,6 +1208,7 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect) {
 
     let mwh = sel.energy_wh * 1000.0;
     let bar = make_usage_bar(sel.share_of_drain_pct, 16);
+    let bg_pct = (sel.battery_pct - sel.focused_battery_pct).max(0.0);
 
     let items = vec![
         ListItem::new(Line::from(vec![
@@ -1172,6 +1222,16 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect) {
                 format!("[{}]", sel.category),
                 Style::default().fg(cat_color),
             ),
+            if sel.is_focused {
+                Span::styled(
+                    " 🎯 FOCUSED",
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
         ])),
         ListItem::new(Line::from("")),
         ListItem::new(Line::from(vec![
@@ -1184,8 +1244,20 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled(" Battery Used:   ", Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:.2}% of battery capacity", sel.battery_pct),
+                format!("{:.2}% total", sel.battery_pct),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled(" Focused Drain:  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(
+                    "{:.2}% ({}) · Bg {:.2}%",
+                    sel.focused_battery_pct,
+                    format_duration_short(sel.focused_secs),
+                    bg_pct
+                ),
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
             ),
         ])),
         ListItem::new(Line::from(vec![
@@ -1304,21 +1376,28 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect) {
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(": ⚡ Optimize Battery  ", Style::default().fg(Color::White)),
+        Span::styled(": ⚡ Optimize  ", Style::default().fg(Color::White)),
+        Span::styled(
+            "a",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Smart Saver  ", Style::default().fg(Color::Gray)),
         Span::styled(
             "z",
             Style::default()
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(": Freeze/Sleep App  ", Style::default().fg(Color::Gray)),
+        Span::styled(": Freeze  ", Style::default().fg(Color::Gray)),
         Span::styled(
             "x",
             Style::default()
                 .fg(Color::LightRed)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(": Stop App  ", Style::default().fg(Color::Gray)),
+        Span::styled(": Stop  ", Style::default().fg(Color::Gray)),
         Span::styled("Tab/1-4", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(": Time  ", Style::default().fg(Color::Gray)),
         Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),

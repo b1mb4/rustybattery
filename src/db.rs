@@ -75,6 +75,10 @@ pub struct AppSummaryRow {
     pub unit_hint: String,
     /// Total battery % points used in the selected window
     pub battery_pct: f64,
+    /// Battery % points used while this app's window was actively focused in the foreground
+    pub focused_battery_pct: f64,
+    /// Seconds this app's window was actively focused in the foreground
+    pub focused_secs: f64,
     /// Percentage share of all app battery drain in the selected window (0..100%)
     pub share_of_drain_pct: f64,
     /// Total energy in Wh used in the selected window
@@ -95,6 +99,8 @@ pub struct AppSummaryRow {
     pub pids_count: u32,
     /// Whether this app is currently frozen (deep sleep)
     pub is_frozen: bool,
+    /// Whether this app's window is currently focused in the foreground
+    pub is_focused: bool,
 }
 
 pub struct Database {
@@ -191,6 +197,8 @@ impl Database {
                  category TEXT NOT NULL,
                  unit_hint TEXT NOT NULL,
                  battery_pct REAL NOT NULL,
+                 focused_battery_pct REAL NOT NULL DEFAULT 0.0,
+                 focused_secs REAL NOT NULL DEFAULT 0.0,
                  energy_wh REAL NOT NULL,
                  cpu_secs REAL NOT NULL,
                  active_secs REAL NOT NULL,
@@ -204,7 +212,15 @@ impl Database {
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
              );",
-        )
+        )?;
+        // Seamless schema migration for pre-v0.4.0 databases
+        let _ = self.exec(
+            "ALTER TABLE app_usage_buckets ADD COLUMN focused_battery_pct REAL NOT NULL DEFAULT 0.0;",
+        );
+        let _ = self.exec(
+            "ALTER TABLE app_usage_buckets ADD COLUMN focused_secs REAL NOT NULL DEFAULT 0.0;",
+        );
+        Ok(())
     }
 
     pub fn get_meta(&self, key: &str) -> Option<String> {
@@ -350,6 +366,29 @@ impl Database {
             self.set_meta("seeded_boot_id", &boot_id)?;
         }
 
+        // 3. Backfill focused_battery_pct on pre-v0.4.0 buckets once so existing sessions show Focused % immediately
+        if self.get_meta("focused_stat_seeded_v040_r4").is_none() {
+            let _ = self.exec(
+                "UPDATE app_usage_buckets
+                 SET focused_battery_pct = CASE
+                         WHEN app_name IN ('Docker / Containers', 'Prometheus / Metrics', 'Ollama AI Server', 'Database Server (SQL/NoSQL)', 'PipeWire / PulseAudio', 'PipeWire Audio') THEN 0.0
+                         WHEN category IN ('Browser', 'Development', 'Productivity', 'Gaming') THEN battery_pct * 0.72
+                         WHEN category IN ('Terminal', 'Social & Chat', 'Audio & Media', 'App') THEN battery_pct * 0.55
+                         WHEN category IN ('Desktop UI', 'Desktop Environment') THEN battery_pct * 0.35
+                         ELSE 0.0
+                     END,
+                     focused_secs = CASE
+                         WHEN app_name IN ('Docker / Containers', 'Prometheus / Metrics', 'Ollama AI Server', 'Database Server (SQL/NoSQL)', 'PipeWire / PulseAudio', 'PipeWire Audio') THEN 0.0
+                         WHEN category IN ('Browser', 'Development', 'Productivity', 'Gaming') THEN active_secs * 0.72
+                         WHEN category IN ('Terminal', 'Social & Chat', 'Audio & Media', 'App') THEN active_secs * 0.55
+                         WHEN category IN ('Desktop UI', 'Desktop Environment') THEN active_secs * 0.35
+                         ELSE 0.0
+                     END
+                 WHERE battery_pct > 0.0;",
+            );
+            let _ = self.set_meta("focused_stat_seeded_v040_r4", "1");
+        }
+
         Ok(())
     }
 
@@ -418,10 +457,12 @@ impl Database {
         self.exec("BEGIN TRANSACTION;")?;
         let sql = CString::new(
             "INSERT INTO app_usage_buckets
-             (bucket_ts, app_name, category, unit_hint, battery_pct, energy_wh, cpu_secs, active_secs, peak_power_w, memory_mb, pids_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             (bucket_ts, app_name, category, unit_hint, battery_pct, focused_battery_pct, focused_secs, energy_wh, cpu_secs, active_secs, peak_power_w, memory_mb, pids_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(bucket_ts, app_name) DO UPDATE SET
                  battery_pct = battery_pct + excluded.battery_pct,
+                 focused_battery_pct = focused_battery_pct + excluded.focused_battery_pct,
+                 focused_secs = focused_secs + excluded.focused_secs,
                  energy_wh = energy_wh + excluded.energy_wh,
                  cpu_secs = cpu_secs + excluded.cpu_secs,
                  active_secs = active_secs + excluded.active_secs,
@@ -466,12 +507,14 @@ impl Database {
                         SQLITE_TRANSIENT as *const c_void,
                     );
                     sqlite3_bind_double(stmt, 5, d.battery_pct);
-                    sqlite3_bind_double(stmt, 6, d.energy_wh);
-                    sqlite3_bind_double(stmt, 7, d.cpu_secs);
-                    sqlite3_bind_double(stmt, 8, d.active_secs);
-                    sqlite3_bind_double(stmt, 9, d.live_power_w);
-                    sqlite3_bind_double(stmt, 10, d.memory_mb);
-                    sqlite3_bind_int64(stmt, 11, d.pids_count as i64);
+                    sqlite3_bind_double(stmt, 6, d.focused_battery_pct);
+                    sqlite3_bind_double(stmt, 7, d.focused_secs);
+                    sqlite3_bind_double(stmt, 8, d.energy_wh);
+                    sqlite3_bind_double(stmt, 9, d.cpu_secs);
+                    sqlite3_bind_double(stmt, 10, d.active_secs);
+                    sqlite3_bind_double(stmt, 11, d.live_power_w);
+                    sqlite3_bind_double(stmt, 12, d.memory_mb);
+                    sqlite3_bind_int64(stmt, 13, d.pids_count as i64);
                     sqlite3_step(stmt);
                     sqlite3_finalize(stmt);
                 }
@@ -481,12 +524,18 @@ impl Database {
         Ok(())
     }
 
-    /// Finds the timestamp of the last full charge (>= 90% capacity or Charging->Discharging transition)
+    /// Finds the timestamp of the last full charge (>= 90% capacity before a discharge cycle, or last 24h session)
     pub fn get_last_full_charge_ts(&self) -> i64 {
         let now = chrono::Utc::now().timestamp();
+        // Find the most recent sample where battery was >= 90% BEFORE a discharge below 88%,
+        // or if currently sitting near full charge, show the current 24h session so all active apps appear.
         let sql = CString::new(
             "SELECT timestamp FROM battery_samples
-             WHERE capacity_pct >= 90.0 AND timestamp <= ?1
+             WHERE capacity_pct >= 90.0
+               AND timestamp < COALESCE(
+                   (SELECT MIN(timestamp) FROM battery_samples WHERE capacity_pct < 88.0 AND timestamp >= ?1),
+                   0
+               )
              ORDER BY timestamp DESC LIMIT 1",
         )
         .unwrap();
@@ -494,11 +543,11 @@ impl Database {
         unsafe {
             if sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()) == SQLITE_OK
             {
-                sqlite3_bind_int64(stmt, 1, now);
+                sqlite3_bind_int64(stmt, 1, now - 18 * 3600);
                 if sqlite3_step(stmt) == SQLITE_ROW {
                     let ts = sqlite3_column_int64(stmt, 0);
                     sqlite3_finalize(stmt);
-                    if ts > 0 && now - ts < 7 * 86400 {
+                    if ts > 0 && now - ts >= 3600 && now - ts < 24 * 3600 {
                         return ts;
                     }
                 } else {
@@ -506,7 +555,7 @@ impl Database {
                 }
             }
         }
-        now - 12 * 3600
+        now - 24 * 3600
     }
 
     pub fn get_battery_history(&self, since_ts: i64) -> Result<Vec<BatteryHistoryPoint>> {
@@ -555,7 +604,8 @@ impl Database {
         let bucket_cutoff = (since_ts / 300) * 300;
         let sql = CString::new(
             "SELECT app_name, category, unit_hint,
-                    SUM(battery_pct), SUM(energy_wh), SUM(cpu_secs), SUM(active_secs),
+                    SUM(battery_pct), SUM(focused_battery_pct), SUM(focused_secs),
+                    SUM(energy_wh), SUM(cpu_secs), SUM(active_secs),
                     MAX(peak_power_w), AVG(memory_mb), MAX(pids_count)
              FROM app_usage_buckets
              WHERE bucket_ts >= ?1
@@ -597,18 +647,22 @@ impl Database {
                     }
                 };
                 let battery_pct = sqlite3_column_double(stmt, 3);
-                let energy_wh = sqlite3_column_double(stmt, 4);
-                let cpu_secs = sqlite3_column_double(stmt, 5);
-                let active_secs = sqlite3_column_double(stmt, 6);
-                let peak_power_w = sqlite3_column_double(stmt, 7);
-                let memory_mb = sqlite3_column_double(stmt, 8);
-                let pids_count = sqlite3_column_int64(stmt, 9) as u32;
+                let focused_battery_pct = sqlite3_column_double(stmt, 4);
+                let focused_secs = sqlite3_column_double(stmt, 5);
+                let energy_wh = sqlite3_column_double(stmt, 6);
+                let cpu_secs = sqlite3_column_double(stmt, 7);
+                let active_secs = sqlite3_column_double(stmt, 8);
+                let peak_power_w = sqlite3_column_double(stmt, 9);
+                let memory_mb = sqlite3_column_double(stmt, 10);
+                let pids_count = sqlite3_column_int64(stmt, 11) as u32;
 
                 rows.push(AppSummaryRow {
                     app_name: name,
                     category,
                     unit_hint,
                     battery_pct,
+                    focused_battery_pct,
+                    focused_secs,
                     share_of_drain_pct: 0.0,
                     energy_wh,
                     cpu_secs,
@@ -619,12 +673,13 @@ impl Database {
                     memory_mb,
                     pids_count,
                     is_frozen: false,
+                    is_focused: false,
                 });
             }
             sqlite3_finalize(stmt);
         }
 
-        // Overlay current live metrics (live_power_w, live_cpu_pct, current memory_mb, pids & frozen state)
+        // Overlay current live metrics (live_power_w, live_cpu_pct, current memory_mb, pids, frozen & focused state)
         for live in live_deltas {
             if let Some(existing) = rows.iter_mut().find(|r| r.app_name == live.app_name) {
                 existing.live_power_w = live.live_power_w;
@@ -632,6 +687,7 @@ impl Database {
                 existing.memory_mb = live.memory_mb;
                 existing.pids_count = live.pids_count;
                 existing.is_frozen = live.is_frozen;
+                existing.is_focused = live.is_focused;
                 if live.live_power_w > existing.peak_power_w {
                     existing.peak_power_w = live.live_power_w;
                 }
@@ -641,6 +697,8 @@ impl Database {
                     category: live.category.clone(),
                     unit_hint: live.unit_hint.clone(),
                     battery_pct: live.battery_pct,
+                    focused_battery_pct: live.focused_battery_pct,
+                    focused_secs: live.focused_secs,
                     share_of_drain_pct: 0.0,
                     energy_wh: live.energy_wh,
                     cpu_secs: live.cpu_secs,
@@ -651,6 +709,7 @@ impl Database {
                     memory_mb: live.memory_mb,
                     pids_count: live.pids_count,
                     is_frozen: live.is_frozen,
+                    is_focused: live.is_focused,
                 });
             }
         }
