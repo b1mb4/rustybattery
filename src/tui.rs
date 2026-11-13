@@ -57,6 +57,15 @@ impl TimeWindow {
         }
     }
 
+    pub fn short_title(&self) -> &'static str {
+        match self {
+            TimeWindow::SinceCharge => "1:Charge",
+            TimeWindow::Last6Hours => "2:6h",
+            TimeWindow::Last24Hours => "3:24h",
+            TimeWindow::Last7Days => "4:7d",
+        }
+    }
+
     pub fn next(&self) -> Self {
         match self {
             TimeWindow::SinceCharge => TimeWindow::Last6Hours,
@@ -155,6 +164,23 @@ impl CategoryFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelVisibility {
+    Auto,
+    ForceShow,
+    ForceHide,
+}
+
+impl PanelVisibility {
+    pub fn toggle(&self, currently_visible: bool) -> Self {
+        if currently_visible {
+            PanelVisibility::ForceHide
+        } else {
+            PanelVisibility::ForceShow
+        }
+    }
+}
+
 pub struct AppUi {
     pub db: Database,
     pub tracker: AppEnergyTracker,
@@ -167,7 +193,9 @@ pub struct AppUi {
     pub window: TimeWindow,
     pub sort_by: SortColumn,
     pub filter: CategoryFilter,
-    pub show_charts: bool,
+    pub charts_mode: PanelVisibility,
+    pub details_mode: PanelVisibility,
+    pub details_modal_open: bool,
     pub table_state: TableState,
     pub daemon_running: bool,
     pub service_installed: bool,
@@ -197,7 +225,9 @@ impl AppUi {
             window: TimeWindow::SinceCharge,
             sort_by: SortColumn::BatteryPct,
             filter: CategoryFilter::All,
-            show_charts: true,
+            charts_mode: PanelVisibility::Auto,
+            details_mode: PanelVisibility::Auto,
+            details_modal_open: false,
             table_state: TableState::default(),
             daemon_running: false,
             service_installed: is_service_file_installed(),
@@ -403,6 +433,46 @@ fn run_tui_loop(
                         continue;
                     }
 
+                    if app.details_modal_open {
+                        match key.code {
+                            KeyCode::Esc
+                            | KeyCode::Enter
+                            | KeyCode::Char('d')
+                            | KeyCode::Char('q') => {
+                                app.details_modal_open = false;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+                            KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+                            KeyCode::Char('z') => {
+                                if let Some(idx) = app.table_state.selected() {
+                                    if let Some(sel) = app.apps.get(idx).cloned() {
+                                        let next_freeze = !sel.is_frozen;
+                                        if let Ok(msg) = set_app_frozen(&sel.app_name, next_freeze)
+                                        {
+                                            app.refresh_data(true)?;
+                                            app.status_message = Some((msg, Instant::now()));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('x') => {
+                                if let Some(idx) = app.table_state.selected() {
+                                    if let Some(sel) = app.apps.get(idx).cloned() {
+                                        if let Ok(msg) = stop_or_kill_app(&sel.app_name) {
+                                            app.refresh_data(true)?;
+                                            app.status_message = Some((msg, Instant::now()));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    let term_size = terminal.size().unwrap_or_default();
+                    let term_rect = Rect::new(0, 0, term_size.width, term_size.height);
+
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
@@ -442,7 +512,21 @@ fn run_tui_loop(
                             app.refresh_data(false)?;
                         }
                         KeyCode::Char('c') => {
-                            app.show_charts = !app.show_charts;
+                            let currently_shown = should_show_charts(&app, term_rect);
+                            app.charts_mode = app.charts_mode.toggle(currently_shown);
+                        }
+                        KeyCode::Enter => {
+                            if !should_show_details_panel(&app, term_rect) {
+                                app.details_modal_open = !app.details_modal_open;
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if term_rect.width < 120 {
+                                app.details_modal_open = !app.details_modal_open;
+                            } else {
+                                let currently_shown = should_show_details_panel(&app, term_rect);
+                                app.details_mode = app.details_mode.toggle(currently_shown);
+                            }
                         }
                         KeyCode::Char('o') => {
                             let targets = scan_optimization_targets(app.battery.power_w);
@@ -525,23 +609,47 @@ fn run_tui_loop(
     }
 }
 
+fn should_show_charts(app: &AppUi, size: Rect) -> bool {
+    match app.charts_mode {
+        PanelVisibility::Auto => size.width >= 120 && size.height >= 28,
+        PanelVisibility::ForceShow => size.height >= 19,
+        PanelVisibility::ForceHide => false,
+    }
+}
+
+fn should_show_details_panel(app: &AppUi, size: Rect) -> bool {
+    match app.details_mode {
+        PanelVisibility::Auto => size.width >= 120,
+        PanelVisibility::ForceShow => size.width >= 96,
+        PanelVisibility::ForceHide => false,
+    }
+}
+
 fn draw_ui(f: &mut Frame, app: &mut AppUi) {
     let size = f.area();
+    let show_charts = should_show_charts(app, size);
+    let header_height = if size.height < 18 || size.width < 72 {
+        3
+    } else {
+        5
+    };
+    let footer_height = if size.height < 16 { 1 } else { 2 };
 
-    let constraints = if app.show_charts && size.height >= 26 {
+    let constraints = if show_charts {
+        let chart_h = if size.height >= 30 { 10 } else { 8 };
         vec![
-            Constraint::Length(5),  // Top phone battery header card
-            Constraint::Length(3),  // Time window tabs + KPI strip
-            Constraint::Length(10), // Battery % & Wattage charts
-            Constraint::Min(8),     // Per-app table + App inspector
-            Constraint::Length(2),  // Footer keybindings
+            Constraint::Length(header_height), // Top phone battery header card
+            Constraint::Length(3),             // Time window tabs + KPI strip
+            Constraint::Length(chart_h),       // Battery % & Wattage charts
+            Constraint::Min(7),                // Per-app table (+ optional App inspector)
+            Constraint::Length(footer_height), // Footer keybindings
         ]
     } else {
         vec![
-            Constraint::Length(5), // Top phone battery header card
-            Constraint::Length(3), // Time window tabs + KPI strip
-            Constraint::Min(8),    // Per-app table + App inspector
-            Constraint::Length(2), // Footer keybindings
+            Constraint::Length(header_height), // Top phone battery header card
+            Constraint::Length(3),             // Time window tabs + KPI strip
+            Constraint::Min(7),                // Per-app table (+ optional App inspector)
+            Constraint::Length(footer_height), // Footer keybindings
         ]
     };
 
@@ -553,13 +661,17 @@ fn draw_ui(f: &mut Frame, app: &mut AppUi) {
     draw_battery_header(f, app, chunks[0]);
     draw_tabs_and_kpis(f, app, chunks[1]);
 
-    if app.show_charts && size.height >= 26 {
+    if show_charts {
         draw_charts(f, app, chunks[2]);
-        draw_apps_section(f, app, chunks[3]);
-        draw_footer(f, app, chunks[4]);
+        draw_apps_section(f, app, chunks[3], size);
+        draw_footer(f, app, chunks[4], size);
     } else {
-        draw_apps_section(f, app, chunks[2]);
-        draw_footer(f, app, chunks[3]);
+        draw_apps_section(f, app, chunks[2], size);
+        draw_footer(f, app, chunks[3], size);
+    }
+
+    if app.details_modal_open {
+        draw_app_details_modal(f, app, size);
     }
 
     if app.optimizer_modal.is_some() {
@@ -586,11 +698,17 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
         BatteryStatus::Unknown => (Color::Gray, "• UNKNOWN"),
     };
 
+    let title_text = if area.width < 75 {
+        " 🦀 RustyBattery "
+    } else {
+        " 🦀 RustyBattery — Per-App Power Tracker for Linux "
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            " 🦀 RustyBattery — Per-App Power Tracker for Linux ",
+            title_text,
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -599,16 +717,6 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(36),
-            Constraint::Percentage(30),
-        ])
-        .split(inner);
-
-    // Left: Big Battery Gauge
     let time_str = match b.time_remaining_mins {
         Some(mins) => {
             let h = mins / 60;
@@ -619,9 +727,62 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
                 format!("~{h}h {m:02}m left")
             }
         }
-        None => " Calculating...".to_string(),
+        None => "N/A".to_string(),
     };
 
+    let power_color = if b.power_w > 18.0 {
+        Color::LightRed
+    } else if b.power_w > 11.0 {
+        Color::Yellow
+    } else {
+        Color::LightGreen
+    };
+
+    // Ultra-compact 1-line header for short or narrow tiled windows
+    if inner.height <= 1 || area.width < 72 {
+        let compact_line = Line::from(vec![
+            Span::styled(
+                format!(" {:.1}% {} ", b.capacity_pct, status_badge),
+                Style::default().fg(bat_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("({time_str})  •  "), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.2} W", b.power_w),
+                Style::default().fg(power_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  •  Smart Saver: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.autopilot_enabled { "ON [a]" } else { "OFF [a]" },
+                Style::default().fg(if app.autopilot_enabled {
+                    Color::LightGreen
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(compact_line), inner);
+        return;
+    }
+
+    // 2-column layout for medium/half-screen tiling (72..108 cols), 3-column for wide (>= 108 cols)
+    let is_wide_header = area.width >= 108;
+    let cols = if is_wide_header {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(36),
+                Constraint::Percentage(30),
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .split(inner)
+    };
+
+    // Left: Big Battery Gauge
     let gauge_label = format!(
         "{:.1}%  {}  ({})",
         b.capacity_pct, status_badge, time_str
@@ -651,78 +812,33 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
     let sub_info = Line::from(vec![
         Span::styled(" Energy: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{:.1} / {:.1} Wh", b.energy_now_wh, b.energy_full_wh),
+            format!("{:.1}/{:.1} Wh", b.energy_now_wh, b.energy_full_wh),
             Style::default().fg(Color::Gray),
         ),
-        Span::styled("  •  Voltage: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.2} V", b.voltage_v), Style::default().fg(Color::Gray)),
+        Span::styled(" • Health: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:.0}% ({}c)", b.health_pct, b.cycle_count),
+            Style::default().fg(Color::Cyan),
+        ),
     ]);
     f.render_widget(Paragraph::new(sub_info), left_rows[1]);
 
-    // Center: Live Power & Battery Health
-    let power_color = if b.power_w > 18.0 {
-        Color::LightRed
-    } else if b.power_w > 11.0 {
-        Color::Yellow
-    } else {
-        Color::LightGreen
-    };
-
-    let center_lines = vec![
-        Line::from(vec![
-            Span::styled("   Live Power: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:.2} W", b.power_w),
-                Style::default()
-                    .fg(power_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if b.ac_online { " (AC Connected)" } else { " (Battery Drain)" },
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("   Health:     ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:.1}%", b.health_pct),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    " ({} cycles · {:.1} Wh design)",
-                    b.cycle_count, b.energy_design_wh
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("   Hardware:   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{} {} ({})", b.manufacturer, b.model_name, b.technology),
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(center_lines), cols[1]);
-
-    // Right: Daemon / Collector Status & Last Full Charge
     let last_charge_ts = app.db.get_last_full_charge_ts();
     let hours_ago = ((chrono::Utc::now().timestamp() - last_charge_ts).max(0) as f64) / 3600.0;
 
     let daemon_span = if app.daemon_running {
         Span::styled(
-            "● 24/7 Service Active",
+            "● 24/7 Service",
             Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
         )
     } else if app.service_installed {
         Span::styled(
-            "◐ Service Installed (Live TUI)",
+            "◐ Svc Installed",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
-            "◉ Live Collector ('i' install svc)",
+            "◉ Live [i:svc]",
             Style::default().fg(Color::Yellow),
         )
     };
@@ -739,42 +855,123 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
         )
     };
 
-    let right_lines = vec![
-        Line::from(vec![
-            Span::styled("Collector:   ", Style::default().fg(Color::Gray)),
-            daemon_span,
-        ]),
-        Line::from(vec![
-            Span::styled("Smart Saver: ", Style::default().fg(Color::Gray)),
-            autopilot_span,
-            Span::styled(
-                format!(" · Full {:.1}h ago", hours_ago),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Sort By:     ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{} [s]", app.sort_by.label()),
-                Style::default().fg(Color::LightCyan),
-            ),
-        ]),
-    ];
-    f.render_widget(
-        Paragraph::new(right_lines).alignment(Alignment::Left),
-        cols[2],
-    );
+    if is_wide_header {
+        let center_lines = vec![
+            Line::from(vec![
+                Span::styled("   Live Power: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:.2} W", b.power_w),
+                    Style::default()
+                        .fg(power_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if b.ac_online { " (AC Connected)" } else { " (Battery Drain)" },
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("   Health:     ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:.1}%", b.health_pct),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        " ({} cycles · {:.1} Wh design)",
+                        b.cycle_count, b.energy_design_wh
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("   Hardware:   ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{} {} ({})", b.manufacturer, b.model_name, b.technology),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(center_lines), cols[1]);
+
+        let right_lines = vec![
+            Line::from(vec![
+                Span::styled("Collector:   ", Style::default().fg(Color::Gray)),
+                daemon_span,
+            ]),
+            Line::from(vec![
+                Span::styled("Smart Saver: ", Style::default().fg(Color::Gray)),
+                autopilot_span,
+                Span::styled(
+                    format!(" · Full {:.1}h ago", hours_ago),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Sort By:     ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{} [s]", app.sort_by.label()),
+                    Style::default().fg(Color::LightCyan),
+                ),
+            ]),
+        ];
+        f.render_widget(
+            Paragraph::new(right_lines).alignment(Alignment::Left),
+            cols[2],
+        );
+    } else {
+        // Half-screen 2nd column: merges Live Power + Smart Saver + Sort By cleanly
+        let mid_lines = vec![
+            Line::from(vec![
+                Span::styled(" Power: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:.2} W", b.power_w),
+                    Style::default().fg(power_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  •  ", Style::default().fg(Color::DarkGray)),
+                daemon_span,
+            ]),
+            Line::from(vec![
+                Span::styled(" Smart Saver: ", Style::default().fg(Color::Gray)),
+                autopilot_span,
+                Span::styled(
+                    format!(" · {:.1}h", hours_ago),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" Sort: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{} [s]", app.sort_by.label()),
+                    Style::default().fg(Color::LightCyan),
+                ),
+                Span::styled(" • Details [Enter/d]", Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(mid_lines), cols[1]);
+    }
 }
 
 fn draw_tabs_and_kpis(f: &mut Frame, app: &AppUi, area: Rect) {
+    let is_compact = area.width < 115;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .constraints(if is_compact {
+            [Constraint::Percentage(46), Constraint::Percentage(54)]
+        } else {
+            [Constraint::Percentage(48), Constraint::Percentage(52)]
+        })
         .split(area);
 
     let titles: Vec<Line> = TimeWindow::all()
         .iter()
-        .map(|w| Line::from(w.title()))
+        .map(|w| {
+            Line::from(if is_compact {
+                w.short_title()
+            } else {
+                w.title()
+            })
+        })
         .collect();
 
     let selected_idx = TimeWindow::all()
@@ -787,7 +984,11 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &AppUi, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Time Range (Tab / 1-4) "),
+                .title(if is_compact {
+                    " Range (Tab/1-4) "
+                } else {
+                    " Time Range (Tab / 1-4) "
+                }),
         )
         .select(selected_idx)
         .style(Style::default().fg(Color::Gray))
@@ -818,42 +1019,74 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &AppUi, area: Rect) {
         app.battery.power_w
     };
 
-    let kpi_line = Line::from(vec![
-        Span::styled(" Drain Used: ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{:.1}%", total_app_pct),
-            Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" ({:.1} Wh)", total_app_wh),
-            Style::default().fg(Color::Gray),
-        ),
-        Span::styled("  │  Avg Power: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{:.1} W", avg_watts),
-            Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  │  View: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            app.filter.label(),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ),
-    ]);
+    let kpi_line = if is_compact {
+        Line::from(vec![
+            Span::styled(" Drain: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.1}%", total_app_pct),
+                Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" │ Avg: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.1}W", avg_watts),
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.filter.label(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Drain Used: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.1}%", total_app_pct),
+                Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({:.1} Wh)", total_app_wh),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled("  │  Avg Power: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.1} W", avg_watts),
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  │  View: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.filter.label(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
 
     let kpi_block = Paragraph::new(kpi_line).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Period Summary & Filter [f] "),
+            .title(if is_compact {
+                " Summary & Filter [f] "
+            } else {
+                " Period Summary & Filter [f] "
+            }),
     );
     f.render_widget(kpi_block, cols[1]);
 }
 
 fn draw_charts(f: &mut Frame, app: &AppUi, area: Rect) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(area);
+    let show_two_charts = area.width >= 92;
+    let cols = if show_two_charts {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100)])
+            .split(area)
+    };
 
     // 1. Left Chart: Battery Level (%) Curve
     let mut pct_points: Vec<(f64, f64)> = app
@@ -922,6 +1155,9 @@ fn draw_charts(f: &mut Frame, app: &AppUi, area: Rect) {
         );
 
     f.render_widget(bat_chart, cols[0]);
+    if !show_two_charts {
+        return;
+    }
 
     // 2. Right Chart: Power Discharge Rate (Watts) Curve
     let mut watt_points: Vec<(f64, f64)> = app
@@ -1027,36 +1263,62 @@ fn make_usage_bar(share_pct: f64, width: usize) -> String {
     s
 }
 
-fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
-        .split(area);
+fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect, total_size: Rect) {
+    let show_details = should_show_details_panel(app, total_size);
 
-    // 1. Left: Phone-Style Per-App Battery Usage Table (with Focused % column)
-    let header_cells = [
-        "#",
-        "Application",
-        "Category",
-        "Battery Share",
-        "Batt %",
-        "Focused %",
-        "Energy",
-        "Live W",
-        "CPU Time",
-    ]
-    .iter()
-    .map(|h| {
-        Cell::from(*h).style(
+    let (table_area, details_area) = if show_details {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+            .split(area);
+        (cols[0], Some(cols[1]))
+    } else {
+        (area, None)
+    };
+
+    // Adaptive column tier based on the actual width available to the table
+    let table_w = table_area.width;
+    let col_tier = if table_w >= 88 {
+        2 // Full 9 columns
+    } else if table_w >= 66 {
+        1 // Medium 7 columns (drops Category & CPU Time for clean half-screen reading)
+    } else {
+        0 // Compact 6 columns (essential stats for narrow tiles)
+    };
+
+    let header_labels: Vec<&str> = match col_tier {
+        2 => vec![
+            "#",
+            "Application",
+            "Category",
+            "Battery Share",
+            "Batt %",
+            "Focused %",
+            "Energy",
+            "Live W",
+            "CPU Time",
+        ],
+        1 => vec![
+            "#",
+            "Application",
+            "Battery Share",
+            "Batt %",
+            "Focused %",
+            "Energy",
+            "Live W",
+        ],
+        _ => vec!["#", "Application", "Share", "Batt %", "Focused %", "Live W"],
+    };
+
+    let header = Row::new(header_labels.into_iter().map(|h| {
+        Cell::from(h).style(
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
-    });
-
-    let header = Row::new(header_cells)
-        .style(Style::default().bg(Color::Rgb(24, 28, 36)))
-        .height(1);
+    }))
+    .style(Style::default().bg(Color::Rgb(24, 28, 36)))
+    .height(1);
 
     let rows: Vec<Row> = app
         .apps
@@ -1064,7 +1326,14 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
         .enumerate()
         .map(|(i, row)| {
             let (icon, cat_color) = category_icon_and_color(&row.category);
-            let bar = make_usage_bar(row.share_of_drain_pct, 9);
+            let bar_w = if col_tier == 2 {
+                9
+            } else if col_tier == 1 {
+                8
+            } else {
+                5
+            };
+            let bar = make_usage_bar(row.share_of_drain_pct, bar_w);
 
             let pct_color = if row.share_of_drain_pct >= 25.0 {
                 Color::LightRed
@@ -1106,39 +1375,72 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
                 Style::default().fg(Color::DarkGray)
             };
 
-            Row::new(vec![
-                Cell::from(format!("{:>2}", i + 1)).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(name_display).style(name_style),
-                Cell::from(row.category.clone()).style(Style::default().fg(cat_color)),
-                Cell::from(format!("{} {:>4.0}%", bar, row.share_of_drain_pct))
-                    .style(Style::default().fg(pct_color)),
-                Cell::from(format!("{:>5.2}%", row.battery_pct))
-                    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Cell::from(format!("{:>6.2}%", row.focused_battery_pct)).style(focused_style),
-                Cell::from(format!("{:>5.2} Wh", row.energy_wh))
-                    .style(Style::default().fg(Color::Gray)),
-                Cell::from(format!("{:>4.2} W", row.live_power_w)).style(
-                    if row.live_power_w >= 2.0 {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-                Cell::from(format!("{:>7}", format_duration_short(row.cpu_secs)))
-                    .style(Style::default().fg(Color::Gray)),
-            ])
+            let live_w_cell = Cell::from(format!("{:>4.2} W", row.live_power_w)).style(
+                if row.live_power_w >= 2.0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            );
+
+            match col_tier {
+                2 => Row::new(vec![
+                    Cell::from(format!("{:>2}", i + 1)).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(name_display).style(name_style),
+                    Cell::from(row.category.clone()).style(Style::default().fg(cat_color)),
+                    Cell::from(format!("{} {:>4.0}%", bar, row.share_of_drain_pct))
+                        .style(Style::default().fg(pct_color)),
+                    Cell::from(format!("{:>5.2}%", row.battery_pct))
+                        .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Cell::from(format!("{:>6.2}%", row.focused_battery_pct)).style(focused_style),
+                    Cell::from(format!("{:>5.2} Wh", row.energy_wh))
+                        .style(Style::default().fg(Color::Gray)),
+                    live_w_cell,
+                    Cell::from(format!("{:>7}", format_duration_short(row.cpu_secs)))
+                        .style(Style::default().fg(Color::Gray)),
+                ]),
+                1 => Row::new(vec![
+                    Cell::from(format!("{:>2}", i + 1)).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(name_display).style(name_style),
+                    Cell::from(format!("{} {:>4.0}%", bar, row.share_of_drain_pct))
+                        .style(Style::default().fg(pct_color)),
+                    Cell::from(format!("{:>5.2}%", row.battery_pct))
+                        .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Cell::from(format!("{:>6.2}%", row.focused_battery_pct)).style(focused_style),
+                    Cell::from(format!("{:>5.2} Wh", row.energy_wh))
+                        .style(Style::default().fg(Color::Gray)),
+                    live_w_cell,
+                ]),
+                _ => Row::new(vec![
+                    Cell::from(format!("{:>2}", i + 1)).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(name_display).style(name_style),
+                    Cell::from(format!("{:>4.0}%", row.share_of_drain_pct))
+                        .style(Style::default().fg(pct_color)),
+                    Cell::from(format!("{:>5.2}%", row.battery_pct))
+                        .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Cell::from(format!("{:>6.2}%", row.focused_battery_pct)).style(focused_style),
+                    live_w_cell,
+                ]),
+            }
         })
         .collect();
 
-    let table_title = format!(
-        " 🔋 Battery Usage by Application ({} apps) — Sorted by {} ",
-        app.apps.len(),
-        app.sort_by.label()
-    );
+    let table_title = if show_details {
+        format!(
+            " 🔋 Battery Usage by Application ({} apps) — Sorted by {} ",
+            app.apps.len(),
+            app.sort_by.label()
+        )
+    } else {
+        format!(
+            " 🔋 Battery Usage ({} apps) — Sort: {} [Enter/d: App Details · c: Charts] ",
+            app.apps.len(),
+            app.sort_by.label()
+        )
+    };
 
-    let table = Table::new(
-        rows,
-        [
+    let widths: Vec<Constraint> = match col_tier {
+        2 => vec![
             Constraint::Length(3),
             Constraint::Min(17),
             Constraint::Length(12),
@@ -1149,37 +1451,91 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect) {
             Constraint::Length(7),
             Constraint::Length(8),
         ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                table_title,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )),
-    )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::Rgb(42, 54, 72))
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("▶ ");
+        1 => vec![
+            Constraint::Length(3),
+            Constraint::Min(16),
+            Constraint::Length(14),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(7),
+        ],
+        _ => vec![
+            Constraint::Length(3),
+            Constraint::Min(14),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(7),
+        ],
+    };
 
-    f.render_stateful_widget(table, cols[0], &mut app.table_state);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    table_title,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(42, 54, 72))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
-    // 2. Right: Phone-Style Selected App Inspector Card
-    draw_app_inspector(f, app, cols[1]);
+    f.render_stateful_widget(table, table_area, &mut app.table_state);
+
+    // 2. Right: Phone-Style Selected App Inspector Card (only when wide or toggled on)
+    if let Some(insp_area) = details_area {
+        draw_app_inspector(f, app, insp_area, false);
+    }
 }
 
-fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect) {
+fn draw_app_details_modal(f: &mut Frame, app: &AppUi, area: Rect) {
+    let popup_width = area.width.saturating_sub(6).min(64);
+    let popup_height = area.height.saturating_sub(4).min(20);
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+    draw_app_inspector(f, app, popup_area, true);
+}
+
+fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect, is_modal: bool) {
+    let title = if is_modal {
+        " 🔍 App Battery Details [Esc / Enter / d: Close] "
+    } else {
+        " 🔍 App Battery Details [d: hide] "
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(
+            Style::default().fg(if is_modal {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        )
+        .style(if is_modal {
+            Style::default().bg(Color::Rgb(18, 22, 30))
+        } else {
+            Style::default()
+        })
         .title(Span::styled(
-            " 🔍 App Battery Details ",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            title,
+            Style::default()
+                .fg(if is_modal { Color::LightCyan } else { Color::White })
+                .add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -1351,7 +1707,7 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect) {
     f.render_widget(spark, sections[1]);
 }
 
-fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect, total_size: Rect) {
     if let Some((msg, ts)) = &app.status_message {
         if ts.elapsed() < Duration::from_secs(6) {
             let line = Line::from(vec![
@@ -1369,46 +1725,70 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect) {
         }
     }
 
-    let keys = Line::from(vec![
-        Span::styled(
-            " o",
-            Style::default()
-                .fg(Color::LightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": ⚡ Optimize  ", Style::default().fg(Color::White)),
-        Span::styled(
-            "a",
-            Style::default()
-                .fg(Color::LightGreen)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": Smart Saver  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "z",
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": Freeze  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "x",
-            Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": Stop  ", Style::default().fg(Color::Gray)),
-        Span::styled("Tab/1-4", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Time  ", Style::default().fg(Color::Gray)),
-        Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Sort  ", Style::default().fg(Color::Gray)),
-        Span::styled("f", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Filter  ", Style::default().fg(Color::Gray)),
-        Span::styled("c", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Charts  ", Style::default().fg(Color::Gray)),
-        Span::styled("q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(": Quit", Style::default().fg(Color::Gray)),
-    ]);
+    let keys = if total_size.width < 85 {
+        Line::from(vec![
+            Span::styled(" o", Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
+            Span::styled(":Opt ", Style::default().fg(Color::White)),
+            Span::styled("a", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(":Smart ", Style::default().fg(Color::Gray)),
+            Span::styled("Enter/d", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(":Details ", Style::default().fg(Color::Gray)),
+            Span::styled("c", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(":Chart ", Style::default().fg(Color::Gray)),
+            Span::styled("z", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+            Span::styled(":Freeze ", Style::default().fg(Color::Gray)),
+            Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(":Sort ", Style::default().fg(Color::Gray)),
+            Span::styled("q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(":Quit", Style::default().fg(Color::Gray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " o",
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": ⚡ Optimize  ", Style::default().fg(Color::White)),
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": Smart Saver  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Enter/d",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": App Details  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "z",
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": Freeze  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "x",
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": Stop  ", Style::default().fg(Color::Gray)),
+            Span::styled("Tab/1-4", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(": Time  ", Style::default().fg(Color::Gray)),
+            Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(": Sort  ", Style::default().fg(Color::Gray)),
+            Span::styled("f", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(": Filter  ", Style::default().fg(Color::Gray)),
+            Span::styled("c", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(": Charts  ", Style::default().fg(Color::Gray)),
+            Span::styled("q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(": Quit", Style::default().fg(Color::Gray)),
+        ])
+    };
 
     f.render_widget(
         Paragraph::new(keys).wrap(Wrap { trim: true }),

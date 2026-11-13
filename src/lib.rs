@@ -22,7 +22,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "rustybattery",
-    version = "0.4.0",
+    version = "0.5.0",
     about = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 )]
 struct Cli {
@@ -324,7 +324,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
 
     println!("╭────────────────────────────────────────────────────────────────────────────────────────╮");
     println!(
-        "│ 🦀 RustyBattery v0.4.0 — Per-App Power Tracker for Linux                               │"
+        "│ 🦀 RustyBattery v0.5.0 — Per-App Power Tracker for Linux                               │"
     );
     println!("├────────────────────────────────────────────────────────────────────────────────────────┤");
     println!(

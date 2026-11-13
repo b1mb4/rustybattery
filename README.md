@@ -2,17 +2,19 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.4.0** *(Latest)*
-- **🎯 Focused Window Battery Usage (`Focused %`) in Primary Stats Table:** Added a **`Focused %`** column right next to **`Batt %`** in both the interactive TUI primary table and `battery summary` CLI output, showing how much battery an application consumed while its window was actively focused in the foreground (`🎯` indicator on the active app, plus `Focused Drain` vs. `Bg Drain` in the App Inspector). Supports GNOME/Fedora `uresourced` cgroup focus boost, Hyprland (`hyprctl`), KDE Plasma (`kdotool`), and X11 (`xprop`).
-- **🤖 Automatic "Smart Battery Saver" Rules (Daemon Mode Autopilot):** Added intelligent background autopilot rules (`battery autopilot [status|on|off]` or press **`a`** in the TUI):
-  - Automatically switches Linux CPU power profile to `power-saver` when unplugged on battery and restores `balanced` when plugged into AC.
-  - Automatically freezes (`cgroup.freeze = 1`) heavy background apps that have been unfocused for `>= 10 minutes` on battery while still drawing `>= 0.85 W`, and **instantly unfreezes/resumes** them the moment you focus their window again.
-  - Low-battery threshold triggers at `<= 20%` (dims keyboard backlight & enforces powersave) and `<= 10%` (auto-stops background indexers & store updaters).
-- **📝 Patch Notes Header:** Added a versioned patch notes changelog section at the top of `README.md` for every release.
+### **Version 0.5.0** *(Latest)*
+- **📐 4-Tier Adaptive Responsive TUI Scaling (Tiling & Half-Screen Support):**
+  - **Auto-Hides `App Battery Details` & `Battery Level (%) History` on Half-Screen Windows (`< 120 cols` or `< 28 rows`):** Gives the primary Per-App Battery Table **100% of the window width** and vertical space when tiled side-by-side or resized smaller.
+  - **On-Demand App Details Popup (`Enter` or `d`):** When the side inspector is hidden in half-screen/tiled mode, pressing **`Enter`** or **`d`** opens `🔍 App Battery Details` (with sparkline & `[z] Freeze` / `[x] Stop` controls) as a centered modal popup. On wide screens (`>= 120 cols`), `d` toggles the right-hand side panel on/off.
+  - **Progressive Column & Header Adaptation:** Automatically condenses table columns (9 → 7 → 6 columns), header cards (3 → 2 → 1-line bar), and time tabs (`1:Charge`, `2:6h`, `3:24h`, `4:7d`) across Wide, Half-Screen, Medium, and Quarter-Screen tiles so text never clips.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.3.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.4.0)</b></summary>
 
+- **Version 0.4.0:**
+  - Added **`Focused %`** column to the primary stats table in TUI & `battery summary` (tracks battery drain when an app's window is focused in the foreground, with `🎯` active indicator).
+  - Added **Automatic "Smart Battery Saver" Rules** (`battery autopilot [status|on|off]` / `a` in TUI): auto-switches CPU profile on AC/battery, auto-freezes heavy background apps unfocused `>= 10m` (`>= 0.85W`) and instantly resumes on focus, plus `<= 20%` and `<= 10%` low-battery triggers.
+  - Added Patch Notes changelog header at the top of `README.md`.
 - **Version 0.3.0:**
   - Added desktop status bar integration (`battery statusbar` for Waybar, Polybar, and Tmux with live hover tooltips).
   - Added native desktop notifications (`battery notify` & automatic low-battery / high-drain alerts in daemon mode).
@@ -95,7 +97,8 @@ rustybattery
 #### TUI Keybindings
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` or `j` / `k` | Select application to inspect in the right-hand details panel |
+| `↑` / `↓` or `j` / `k` | Select application to inspect |
+| **`Enter` / `d`** | **🔍 App Battery Details** (opens centered popup modal when tiled `< 120 cols`, or toggles side panel on wide screens) |
 | **`o`** | **⚡ Open Battery Optimizer** (scan & turn off unused background hogs, containers & services) |
 | **`a`** | **🤖 Toggle Smart Battery Saver Autopilot** (automatic AC/Battery profile, 10m unfocused freeze & low-battery rules) |
 | **`z`** | **❄️ Freeze / Resume App** (0% CPU Deep Sleep via cgroup v2 `cgroup.freeze` or `SIGSTOP`) |
