@@ -2,17 +2,20 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.6.0** *(Latest)*
-- **🔍 Live TUI Search (`/`):** Press **`/`** in the interactive TUI to filter the application table in real time by app name or category (while keeping accurate system-wide `Battery Share` percentages). Press **`Enter`** to apply or **`Esc`** to clear.
-- **🖱️ Full Mouse Support in TUI:**
-  - **Left-click** any row in the per-app table to select and inspect it.
-  - **Scroll wheel** (`Up`/`Down`) to scroll through apps or modal lists.
-  - **Left-click** any of the 4 Time Range tabs (`Since Full Charge`, `6h`, `24h`, `7d`) or the **Period Summary & Filter** box to switch ranges/filters directly.
-  - **Right-click** an app row in tiled/compact mode to open `🔍 App Battery Details` popup (and right-click to close modals).
-- **📦 Updated Packaging Versions:** Synced `packaging/PKGBUILD` and `packaging/workflows/release.yml` to `0.6.0`.
+### **Version 0.7.0** *(Latest)*
+- **⚙️ Configurable Smart Saver Rules (`~/.config/rustybattery/config.toml`):** Persistent TOML config storing Smart Saver rules, thresholds (`idle_freeze_mins`, `idle_power_threshold_w`, `low_battery_pct`, `critical_battery_pct`, `auto_switch_power_profile`, `auto_freeze_enabled`, `dim_kbd_on_low_battery`), and protected app `whitelist`.
+- **🎛️ Live TUI Rules Editor (`Shift+A`) & App Whitelist (`w`):**
+  - Press **`A`** (`Shift+A`) in the TUI to edit Smart Saver rules and thresholds live, view protected apps, and inspect the recent **Smart Saver Activity Log**.
+  - Press **`w`** on any app to toggle its **Protected Whitelist** badge (`🛡`) so Smart Saver never auto-freezes it (and immediately resumes it if frozen).
+- **🖥️ Enhanced CLI (`battery autopilot`):** Added `battery autopilot whitelist <app>`, `unwhitelist <app>`, and `config` subcommands, plus full rule & log output in `battery autopilot`.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.5.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.6.0)</b></summary>
+
+- **Version 0.6.0:**
+  - Live TUI Search (`/`): filter apps in real time by name or category while preserving accurate system-wide `Battery Share` percentages.
+  - Full Mouse Support in TUI: left-click rows, scroll wheel, click Time Range tabs & filter box, and right-click to open/close `🔍 App Battery Details`.
+  - Updated packaging versions (`packaging/PKGBUILD` and `packaging/workflows/release.yml`) to `0.6.0`.
 
 - **Version 0.5.0:**
   - 4-Tier Adaptive Responsive TUI Scaling: auto-hides `App Battery Details` & `Battery Level (%) History` on half-screen/tiled windows (`< 120 cols` or `< 28 rows`), adds on-demand `🔍 App Battery Details` modal (`Enter`/`d`), and progressively adapts columns (9 → 7 → 6), headers, and tabs.
