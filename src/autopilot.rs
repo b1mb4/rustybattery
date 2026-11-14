@@ -4,31 +4,208 @@ use crate::db::Database;
 use crate::optimize::{
     execute_optimizations, scan_optimization_targets, set_app_frozen, TargetKind,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::Local;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
 const META_AUTOPILOT_ENABLED: &str = "autopilot_enabled";
 const META_LAST_AUTOPILOT_ACTION: &str = "autopilot_last_action";
-const IDLE_UNFOCUSED_FREEZE_SECS: u64 = 600; // 10 minutes unfocused
+const META_AUTOPILOT_LOG: &str = "autopilot_action_log";
+
+#[derive(Debug, Clone)]
+pub struct AutopilotConfig {
+    pub enabled: bool,
+    pub auto_switch_power_profile: bool,
+    pub auto_freeze_enabled: bool,
+    pub idle_freeze_mins: u64,
+    pub idle_power_threshold_w: f64,
+    pub low_battery_pct: f64,
+    pub critical_battery_pct: f64,
+    pub dim_kbd_on_low_battery: bool,
+    pub whitelist: Vec<String>,
+}
+
+impl Default for AutopilotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_switch_power_profile: true,
+            auto_freeze_enabled: true,
+            idle_freeze_mins: 10,
+            idle_power_threshold_w: 0.85,
+            low_battery_pct: 20.0,
+            critical_battery_pct: 10.0,
+            dim_kbd_on_low_battery: true,
+            whitelist: Vec::new(),
+        }
+    }
+}
+
+pub fn config_file_path() -> PathBuf {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".config")
+        })
+        .join("rustybattery");
+    let _ = fs::create_dir_all(&dir);
+    dir.join("config.toml")
+}
+
+pub fn load_autopilot_config() -> AutopilotConfig {
+    let path = config_file_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        let cfg = AutopilotConfig::default();
+        let _ = save_autopilot_config(&cfg);
+        return cfg;
+    };
+
+    let mut cfg = AutopilotConfig::default();
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with('[') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim();
+        match key {
+            "enabled" => cfg.enabled = val == "true" || val == "1",
+            "auto_switch_power_profile" => {
+                cfg.auto_switch_power_profile = val == "true" || val == "1"
+            }
+            "auto_freeze_enabled" => cfg.auto_freeze_enabled = val == "true" || val == "1",
+            "idle_freeze_mins" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    cfg.idle_freeze_mins = n.clamp(1, 120);
+                }
+            }
+            "idle_power_threshold_w" => {
+                if let Ok(w) = val.parse::<f64>() {
+                    cfg.idle_power_threshold_w = w.clamp(0.2, 10.0);
+                }
+            }
+            "low_battery_pct" => {
+                if let Ok(p) = val.parse::<f64>() {
+                    cfg.low_battery_pct = p.clamp(5.0, 50.0);
+                }
+            }
+            "critical_battery_pct" => {
+                if let Ok(p) = val.parse::<f64>() {
+                    cfg.critical_battery_pct = p.clamp(3.0, 30.0);
+                }
+            }
+            "dim_kbd_on_low_battery" => {
+                cfg.dim_kbd_on_low_battery = val == "true" || val == "1"
+            }
+            "whitelist" => {
+                let trimmed = val.trim_start_matches('[').trim_end_matches(']');
+                cfg.whitelist = trimmed
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+pub fn save_autopilot_config(cfg: &AutopilotConfig) -> Result<()> {
+    let path = config_file_path();
+    let wl_items: Vec<String> = cfg
+        .whitelist
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('"', "")))
+        .collect();
+    let content = format!(
+        "# RustyBattery Smart Battery Saver Configuration\n\
+         # Edit here or press Shift+A in the `battery` TUI.\n\n\
+         [smart_saver]\n\
+         enabled = {}\n\
+         auto_switch_power_profile = {}\n\
+         auto_freeze_enabled = {}\n\
+         idle_freeze_mins = {}\n\
+         idle_power_threshold_w = {:.2}\n\
+         low_battery_pct = {:.0}\n\
+         critical_battery_pct = {:.0}\n\
+         dim_kbd_on_low_battery = {}\n\
+         whitelist = [{}]\n",
+        cfg.enabled,
+        cfg.auto_switch_power_profile,
+        cfg.auto_freeze_enabled,
+        cfg.idle_freeze_mins,
+        cfg.idle_power_threshold_w,
+        cfg.low_battery_pct,
+        cfg.critical_battery_pct,
+        cfg.dim_kbd_on_low_battery,
+        wl_items.join(", ")
+    );
+    fs::write(&path, content)
+        .with_context(|| format!("Failed to write config at {}", path.display()))?;
+    Ok(())
+}
+
+pub fn is_app_whitelisted(cfg: &AutopilotConfig, app_name: &str) -> bool {
+    let lower = app_name.to_lowercase();
+    cfg.whitelist
+        .iter()
+        .any(|w| lower == w.to_lowercase() || lower.contains(&w.to_lowercase()))
+}
+
+pub fn toggle_app_whitelist(app_name: &str) -> Result<bool> {
+    let mut cfg = load_autopilot_config();
+    let lower = app_name.to_lowercase();
+    let added = if let Some(pos) = cfg
+        .whitelist
+        .iter()
+        .position(|w| w.to_lowercase() == lower)
+    {
+        cfg.whitelist.remove(pos);
+        false
+    } else {
+        cfg.whitelist.push(app_name.to_string());
+        // If app was frozen, ensure it is resumed immediately upon whitelisting
+        let _ = set_app_frozen(app_name, false);
+        true
+    };
+    save_autopilot_config(&cfg)?;
+    Ok(added)
+}
 
 pub fn is_autopilot_enabled(db: &Database) -> bool {
+    let cfg = load_autopilot_config();
+    if !cfg.enabled {
+        return false;
+    }
     match db.get_meta(META_AUTOPILOT_ENABLED).as_deref() {
         Some("0") | Some("false") | Some("off") => false,
-        _ => true, // Enabled by default
+        _ => true,
     }
 }
 
 pub fn set_autopilot_enabled(db: &Database, enabled: bool) -> Result<String> {
+    let mut cfg = load_autopilot_config();
+    cfg.enabled = enabled;
+    let _ = save_autopilot_config(&cfg);
     db.set_meta(META_AUTOPILOT_ENABLED, if enabled { "1" } else { "0" })?;
     let msg = if enabled {
-        "Smart Battery Saver Autopilot ENABLED (AC/Battery profile switch, 10m unfocused app freeze, low-battery rules)".to_string()
+        format!(
+            "Smart Battery Saver ENABLED (freeze unfocused >={}m, low-bat <={:.0}%)",
+            cfg.idle_freeze_mins, cfg.low_battery_pct
+        )
     } else {
-        "Smart Battery Saver Autopilot DISABLED".to_string()
+        "Smart Battery Saver DISABLED".to_string()
     };
-    let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, &msg);
+    record_autopilot_action(db, &msg);
     Ok(msg)
 }
 
@@ -38,13 +215,34 @@ pub fn get_last_autopilot_action(db: &Database) -> String {
     })
 }
 
+pub fn get_autopilot_log(db: &Database) -> Vec<String> {
+    db.get_meta(META_AUTOPILOT_LOG)
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn record_autopilot_action(db: &Database, action: &str) {
+    let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, action);
+    let ts = Local::now().format("%H:%M:%S");
+    let entry = format!("[{}] {}", ts, action);
+    let mut lines = get_autopilot_log(db);
+    lines.insert(0, entry);
+    lines.truncate(12);
+    let _ = db.set_meta(META_AUTOPILOT_LOG, &lines.join("\n"));
+}
+
 /// Stateful daemon engine for Automatic "Smart Battery Saver" Rules
 pub struct SmartAutopilot {
     last_ac_online: Option<bool>,
     unfocused_since: HashMap<String, Instant>,
     auto_frozen_apps: HashSet<String>,
-    low_bat_20_triggered: bool,
-    low_bat_10_triggered: bool,
+    low_bat_triggered: bool,
+    critical_bat_triggered: bool,
 }
 
 impl SmartAutopilot {
@@ -53,20 +251,20 @@ impl SmartAutopilot {
             last_ac_online: None,
             unfocused_since: HashMap::new(),
             auto_frozen_apps: HashSet::new(),
-            low_bat_20_triggered: false,
-            low_bat_10_triggered: false,
+            low_bat_triggered: false,
+            critical_bat_triggered: false,
         }
     }
 
-    /// Evaluates all Smart Battery Saver rules on each daemon tick.
+    /// Evaluates all Smart Battery Saver rules on each daemon tick using `config.toml`.
     pub fn evaluate(
         &mut self,
         db: &Database,
         snap: &BatterySnapshot,
         deltas: &[AppDeltaUsage],
     ) {
-        if !is_autopilot_enabled(db) {
-            // If disabled while apps are auto-frozen, unfreeze them cleanly
+        let cfg = load_autopilot_config();
+        if !cfg.enabled || !is_autopilot_enabled(db) {
             if !self.auto_frozen_apps.is_empty() {
                 let apps: Vec<String> = self.auto_frozen_apps.drain().collect();
                 for app in apps {
@@ -78,19 +276,21 @@ impl SmartAutopilot {
 
         let now = Instant::now();
         let on_battery = !snap.ac_online && snap.status == BatteryStatus::Discharging;
+        let idle_freeze_secs = cfg.idle_freeze_mins.saturating_mul(60);
 
         // ------------------------------------------------------------------
         // RULE 1: AC <-> Battery Power Profile & Unfreeze on AC Plug-in
         // ------------------------------------------------------------------
         if let Some(prev_ac) = self.last_ac_online {
-            if prev_ac && !snap.ac_online {
-                // Transitioned from AC -> Battery
+            if prev_ac && !snap.ac_online && cfg.auto_switch_power_profile {
                 let profile_note = set_system_power_profile(true);
-                let action = format!("Unplugged AC → switched to {}", profile_note);
-                let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, &action);
+                record_autopilot_action(db, &format!("Unplugged AC → switched to {}", profile_note));
             } else if !prev_ac && snap.ac_online {
-                // Transitioned from Battery -> AC
-                let profile_note = set_system_power_profile(false);
+                let profile_note = if cfg.auto_switch_power_profile {
+                    set_system_power_profile(false)
+                } else {
+                    "AC mode".to_string()
+                };
                 let mut unfrozen_count = 0usize;
                 let apps: Vec<String> = self.auto_frozen_apps.drain().collect();
                 for app in apps {
@@ -106,47 +306,53 @@ impl SmartAutopilot {
                 } else {
                     format!("Plugged into AC → restored {}", profile_note)
                 };
-                let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, &action);
+                record_autopilot_action(db, &action);
             }
-        } else if on_battery {
-            // Initial daemon startup on battery
+        } else if on_battery && cfg.auto_switch_power_profile {
             let _ = set_system_power_profile(true);
         }
         self.last_ac_online = Some(snap.ac_online);
 
         // Reset low-battery triggers when charging above thresholds
-        if !on_battery || snap.capacity_pct > 22.0 {
-            self.low_bat_20_triggered = false;
+        if !on_battery || snap.capacity_pct > cfg.low_battery_pct + 2.0 {
+            self.low_bat_triggered = false;
         }
-        if !on_battery || snap.capacity_pct > 12.0 {
-            self.low_bat_10_triggered = false;
+        if !on_battery || snap.capacity_pct > cfg.critical_battery_pct + 2.0 {
+            self.critical_bat_triggered = false;
         }
 
         // ------------------------------------------------------------------
-        // RULE 2: Auto-Resume Focused Apps & Auto-Freeze Idle Heavy Background Apps
+        // RULE 2: Auto-Resume Focused/Whitelisted Apps & Auto-Freeze Idle Heavy Apps
         // ------------------------------------------------------------------
         for d in deltas {
-            // Never auto-freeze desktop shells, audio servers, or terminal emulators hosting interactive sessions
+            if is_app_whitelisted(&cfg, &d.app_name) {
+                self.unfocused_since.remove(&d.app_name);
+                if self.auto_frozen_apps.remove(&d.app_name) {
+                    let _ = set_app_frozen(&d.app_name, false);
+                }
+                continue;
+            }
+
             if !is_eligible_for_autofreeze(&d.app_name, &d.category) {
                 continue;
             }
 
             if d.is_focused {
                 self.unfocused_since.remove(&d.app_name);
-                // If this app was auto-frozen (or frozen in general) and user focuses its window, resume immediately!
                 if self.auto_frozen_apps.remove(&d.app_name) || d.is_frozen {
                     if set_app_frozen(&d.app_name, false).is_ok() {
-                        let action = format!("▶ Auto-resumed {} on window focus", d.app_name);
-                        let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, &action);
+                        record_autopilot_action(
+                            db,
+                            &format!("▶ Auto-resumed {} on window focus", d.app_name),
+                        );
                     }
                 }
-            } else if on_battery && !d.is_frozen {
+            } else if cfg.auto_freeze_enabled && on_battery && !d.is_frozen {
                 let entry = self.unfocused_since.entry(d.app_name.clone()).or_insert(now);
                 let unfocused_dur = now.duration_since(*entry).as_secs();
 
-                // If unfocused for >= 10 minutes while still drawing >= 0.85W or >= 3.5% CPU on battery
-                if unfocused_dur >= IDLE_UNFOCUSED_FREEZE_SECS
-                    && (d.live_power_w >= 0.85 || d.live_cpu_pct >= 3.5)
+                if unfocused_dur >= idle_freeze_secs
+                    && (d.live_power_w >= cfg.idle_power_threshold_w || d.live_cpu_pct >= 3.5)
                 {
                     if set_app_frozen(&d.app_name, true).is_ok() {
                         self.auto_frozen_apps.insert(d.app_name.clone());
@@ -157,7 +363,7 @@ impl SmartAutopilot {
                             unfocused_dur / 60,
                             d.live_power_w
                         );
-                        let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, &action);
+                        record_autopilot_action(db, &action);
                         send_autopilot_notification(
                             "❄️ Smart Battery Saver: App Frozen",
                             &format!(
@@ -173,12 +379,18 @@ impl SmartAutopilot {
         }
 
         // ------------------------------------------------------------------
-        // RULE 3: Low-Battery Threshold Triggers (20% and 10%)
+        // RULE 3: Configurable Low-Battery & Critical-Battery Threshold Triggers
         // ------------------------------------------------------------------
-        if on_battery && snap.capacity_pct <= 20.0 && !self.low_bat_20_triggered {
-            self.low_bat_20_triggered = true;
-            let _ = set_system_power_profile(true);
-            let kbd_dimmed = dim_keyboard_backlight();
+        if on_battery && snap.capacity_pct <= cfg.low_battery_pct && !self.low_bat_triggered {
+            self.low_bat_triggered = true;
+            if cfg.auto_switch_power_profile {
+                let _ = set_system_power_profile(true);
+            }
+            let kbd_dimmed = if cfg.dim_kbd_on_low_battery {
+                dim_keyboard_backlight()
+            } else {
+                false
+            };
             let action = if kbd_dimmed {
                 format!(
                     "🔋 Low Battery ({:.0}%) → Enforced power-saver & dimmed keyboard backlight",
@@ -190,12 +402,14 @@ impl SmartAutopilot {
                     snap.capacity_pct
                 )
             };
-            let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, &action);
+            record_autopilot_action(db, &action);
         }
 
-        if on_battery && snap.capacity_pct <= 10.0 && !self.low_bat_10_triggered {
-            self.low_bat_10_triggered = true;
-            // Auto-stop safe user background services (indexers, store updaters)
+        if on_battery
+            && snap.capacity_pct <= cfg.critical_battery_pct
+            && !self.critical_bat_triggered
+        {
+            self.critical_bat_triggered = true;
             let mut targets = scan_optimization_targets(snap.power_w);
             for t in &mut targets {
                 t.selected = t.kind == TargetKind::UserUnit;
@@ -208,7 +422,7 @@ impl SmartAutopilot {
                     res.actions_taken.len(),
                     res.estimated_watts_saved
                 );
-                let _ = db.set_meta(META_LAST_AUTOPILOT_ACTION, &action);
+                record_autopilot_action(db, &action);
             }
         }
     }

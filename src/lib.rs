@@ -8,7 +8,10 @@ pub mod statusbar;
 pub mod tui;
 
 use crate::apps::AppEnergyTracker;
-use crate::autopilot::{get_last_autopilot_action, is_autopilot_enabled, set_autopilot_enabled};
+use crate::autopilot::{
+    config_file_path, get_autopilot_log, get_last_autopilot_action, is_app_whitelisted,
+    is_autopilot_enabled, load_autopilot_config, save_autopilot_config, set_autopilot_enabled,
+};
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
 use crate::optimize::{
@@ -110,11 +113,13 @@ enum Commands {
         action: ServiceAction,
     },
 
-    /// Configure Automatic "Smart Battery Saver" Rules (Daemon Mode Autopilot)
+    /// Configure Automatic "Smart Battery Saver" Rules & App Whitelist
     Autopilot {
-        /// Action: "status" (default), "on", or "off"
+        /// Action: "status" (default), "on", "off", "whitelist", "unwhitelist", or "config"
         #[arg(default_value = "status")]
         mode: String,
+        /// App name for whitelist/unwhitelist actions
+        target: Option<String>,
     },
 }
 
@@ -226,38 +231,115 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
-        Commands::Autopilot { mode } => {
+        Commands::Autopilot { mode, target } => {
             let db = Database::open(&default_db_path())?;
             match mode.to_lowercase().as_str() {
                 "on" | "enable" | "true" | "1" => {
                     let msg = set_autopilot_enabled(&db, true)?;
+                    let mut cfg = load_autopilot_config();
+                    cfg.enabled = true;
+                    let _ = save_autopilot_config(&cfg);
                     println!("✔ {msg}");
                 }
                 "off" | "disable" | "false" | "0" => {
                     let msg = set_autopilot_enabled(&db, false)?;
+                    let mut cfg = load_autopilot_config();
+                    cfg.enabled = false;
+                    let _ = save_autopilot_config(&cfg);
                     println!("✔ {msg}");
+                }
+                "whitelist" => {
+                    let Some(app_name) = target else {
+                        anyhow::bail!("Usage: battery autopilot whitelist <APP_NAME>");
+                    };
+                    let mut cfg = load_autopilot_config();
+                    if !is_app_whitelisted(&cfg, &app_name) {
+                        cfg.whitelist.push(app_name.clone());
+                        save_autopilot_config(&cfg)?;
+                        let _ = set_app_frozen(&app_name, false);
+                        println!("🛡 Added `{app_name}` to Smart Saver whitelist.");
+                    } else {
+                        println!("🛡 `{app_name}` is already in the Smart Saver whitelist.");
+                    }
+                }
+                "unwhitelist" => {
+                    let Some(app_name) = target else {
+                        anyhow::bail!("Usage: battery autopilot unwhitelist <APP_NAME>");
+                    };
+                    let mut cfg = load_autopilot_config();
+                    let lower = app_name.trim().to_lowercase();
+                    let before = cfg.whitelist.len();
+                    cfg.whitelist.retain(|w| w.trim().to_lowercase() != lower);
+                    if cfg.whitelist.len() < before {
+                        save_autopilot_config(&cfg)?;
+                        println!("✔ Removed `{app_name}` from Smart Saver whitelist.");
+                    } else {
+                        println!("`{app_name}` was not in the Smart Saver whitelist.");
+                    }
+                }
+                "config" => {
+                    let path = config_file_path();
+                    let cfg = load_autopilot_config();
+                    save_autopilot_config(&cfg)?;
+                    println!("Config Path: {}", path.display());
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        println!("\n{raw}");
+                    }
                 }
                 _ => {
                     let enabled = is_autopilot_enabled(&db);
+                    let cfg = load_autopilot_config();
                     let last_action = get_last_autopilot_action(&db);
-                    println!("🤖 RustyBattery — Automatic \"Smart Battery Saver\" Rules");
+                    let logs = get_autopilot_log(&db);
+                    println!("🤖 RustyBattery — Smart Battery Saver Rules & Whitelist");
                     println!("──────────────────────────────────────────────────────────────────────");
                     println!(
-                        "Autopilot Status: {}",
-                        if enabled { "● ENABLED" } else { "○ DISABLED" }
+                        "Autopilot Status:     {}",
+                        if enabled && cfg.enabled { "● ENABLED" } else { "○ DISABLED" }
                     );
-                    println!("Last Action:      {}", last_action);
+                    println!("Config File:          {}", config_file_path().display());
+                    println!("Last Action:          {}", last_action);
                     println!();
-                    println!("Active Smart Battery Saver Rules (Daemon & Live Mode):");
-                    println!("  1. AC ↔ Battery Power Profile: Automatically switches to `power-saver`");
-                    println!("     when unplugged on battery, and restores `balanced` when plugged into AC.");
-                    println!("  2. Idle Heavy App Auto-Freeze: Freezes unfocused windowed apps (`cgroup.freeze = 1`)");
-                    println!("     if idle in background >= 10 mins on battery while drawing >= 0.85W, and");
-                    println!("     instantly resumes them the moment their window is focused again.");
-                    println!("  3. Low-Battery Triggers: At <= 20% dims keyboard backlight & enforces powersave;");
-                    println!("     at <= 10% auto-stops background indexers & store updaters.");
+                    println!("Configured Rules:");
+                    println!(
+                        "  • Auto-Switch Power Profile:   {}",
+                        if cfg.auto_switch_power_profile { "ON" } else { "OFF" }
+                    );
+                    println!(
+                        "  • Auto-Freeze Idle Apps:       {}",
+                        if cfg.auto_freeze_enabled { "ON" } else { "OFF" }
+                    );
+                    println!("  • Idle Freeze Timeout:         {} min", cfg.idle_freeze_mins);
+                    println!("  • Idle Power Threshold:        {:.1} W", cfg.idle_power_threshold_w);
+                    println!("  • Low Battery Threshold:       {:.0}%", cfg.low_battery_pct);
+                    println!("  • Critical Battery Threshold:  {:.0}%", cfg.critical_battery_pct);
+                    println!(
+                        "  • Dim Keyboard on Low Battery: {}",
+                        if cfg.dim_kbd_on_low_battery { "ON" } else { "OFF" }
+                    );
                     println!();
-                    println!("Toggle anytime with: `battery autopilot on` | `battery autopilot off` (or press `a` in TUI)");
+                    println!(
+                        "Protected Whitelist ({}): {}",
+                        cfg.whitelist.len(),
+                        if cfg.whitelist.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            cfg.whitelist.join(", ")
+                        }
+                    );
+                    if !logs.is_empty() {
+                        println!();
+                        println!("Recent Activity Log:");
+                        for entry in logs.iter().take(5) {
+                            println!("  • {entry}");
+                        }
+                    }
+                    println!();
+                    println!("Commands:");
+                    println!("  battery autopilot on|off");
+                    println!("  battery autopilot whitelist <app> | unwhitelist <app>");
+                    println!("  battery autopilot config");
+                    println!("  TUI: press `A` to edit rules live, `w` to whitelist selected app");
                 }
             }
             Ok(())

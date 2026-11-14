@@ -1,5 +1,9 @@
 use crate::apps::{AppDeltaUsage, AppEnergyTracker};
-use crate::autopilot::{is_autopilot_enabled, set_autopilot_enabled, SmartAutopilot};
+use crate::autopilot::{
+    config_file_path, get_autopilot_log, is_app_whitelisted, is_autopilot_enabled,
+    load_autopilot_config, save_autopilot_config, set_autopilot_enabled, toggle_app_whitelist,
+    AutopilotConfig, SmartAutopilot,
+};
 use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
 use crate::db::{AppSummaryRow, BatteryHistoryPoint, Database};
 use crate::optimize::{
@@ -208,9 +212,11 @@ pub struct AppUi {
     pub daemon_running: bool,
     pub service_installed: bool,
     pub autopilot_enabled: bool,
+    pub autopilot_config: AutopilotConfig,
     pub status_message: Option<(String, Instant)>,
     pub since_ts: i64,
     pub optimizer_modal: Option<(Vec<OptimizationTarget>, usize)>,
+    pub autopilot_modal: Option<usize>,
 }
 
 impl AppUi {
@@ -220,6 +226,7 @@ impl AppUi {
         db.record_battery_snapshot(&battery)?;
 
         let autopilot_enabled = is_autopilot_enabled(&db);
+        let autopilot_config = load_autopilot_config();
         let tracker = AppEnergyTracker::new();
         let mut ui = Self {
             db,
@@ -245,9 +252,11 @@ impl AppUi {
             daemon_running: false,
             service_installed: is_service_file_installed(),
             autopilot_enabled,
+            autopilot_config,
             status_message: None,
             since_ts: 0,
             optimizer_modal: None,
+            autopilot_modal: None,
         };
         ui.table_state.select(Some(0));
         ui.refresh_data(false)?;
@@ -272,6 +281,7 @@ impl AppUi {
         self.daemon_running = is_daemon_active(&self.db);
         self.service_installed = is_service_file_installed();
         self.autopilot_enabled = is_autopilot_enabled(&self.db);
+        self.autopilot_config = load_autopilot_config();
 
         if sample_live_tick {
             let (deltas, _) = self.tracker.sample_delta(
@@ -458,6 +468,80 @@ fn run_tui_loop(
                         continue;
                     }
 
+                    if let Some(sel_idx) = &mut app.autopilot_modal {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => {
+                                app.autopilot_modal = None;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                *sel_idx = (*sel_idx + 1).min(7);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                *sel_idx = sel_idx.saturating_sub(1);
+                            }
+                            KeyCode::Left
+                            | KeyCode::Char('h')
+                            | KeyCode::Right
+                            | KeyCode::Char('l')
+                            | KeyCode::Char(' ')
+                            | KeyCode::Enter => {
+                                let inc = !matches!(key.code, KeyCode::Left | KeyCode::Char('h'));
+                                let cfg = &mut app.autopilot_config;
+                                match *sel_idx {
+                                    0 => {
+                                        cfg.enabled = !cfg.enabled;
+                                        app.autopilot_enabled = cfg.enabled;
+                                        let _ = set_autopilot_enabled(&app.db, cfg.enabled);
+                                    }
+                                    1 => cfg.auto_switch_power_profile = !cfg.auto_switch_power_profile,
+                                    2 => cfg.auto_freeze_enabled = !cfg.auto_freeze_enabled,
+                                    3 => {
+                                        if inc {
+                                            cfg.idle_freeze_mins = (cfg.idle_freeze_mins + 5).min(120);
+                                        } else {
+                                            cfg.idle_freeze_mins = cfg.idle_freeze_mins.saturating_sub(5).max(5);
+                                        }
+                                    }
+                                    4 => {
+                                        if inc {
+                                            cfg.idle_power_threshold_w =
+                                                ((cfg.idle_power_threshold_w + 0.1).min(5.0) * 10.0).round() / 10.0;
+                                        } else {
+                                            cfg.idle_power_threshold_w =
+                                                ((cfg.idle_power_threshold_w - 0.1).max(0.1) * 10.0).round() / 10.0;
+                                        }
+                                    }
+                                    5 => {
+                                        if inc {
+                                            cfg.low_battery_pct = (cfg.low_battery_pct + 5.0).min(80.0);
+                                        } else {
+                                            cfg.low_battery_pct = (cfg.low_battery_pct - 5.0)
+                                                .max(cfg.critical_battery_pct + 5.0);
+                                        }
+                                    }
+                                    6 => {
+                                        if inc {
+                                            cfg.critical_battery_pct = (cfg.critical_battery_pct + 5.0)
+                                                .min(cfg.low_battery_pct - 5.0);
+                                        } else {
+                                            cfg.critical_battery_pct =
+                                                (cfg.critical_battery_pct - 5.0).max(5.0);
+                                        }
+                                    }
+                                    7 => cfg.dim_kbd_on_low_battery = !cfg.dim_kbd_on_low_battery,
+                                    _ => {}
+                                }
+                                let _ = save_autopilot_config(cfg);
+                                app.status_message = Some((
+                                    format!("Saved Smart Saver rules to {}", config_file_path().display()),
+                                    Instant::now(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     if app.details_modal_open {
                         match key.code {
                             KeyCode::Esc
@@ -485,6 +569,24 @@ fn run_tui_loop(
                                     if let Some(sel) = app.apps.get(idx).cloned() {
                                         if let Ok(msg) = stop_or_kill_app(&sel.app_name) {
                                             app.refresh_data(true)?;
+                                            app.status_message = Some((msg, Instant::now()));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('w') => {
+                                if let Some(idx) = app.table_state.selected() {
+                                    if let Some(sel) = app.apps.get(idx).cloned() {
+                                        if let Ok(added) = toggle_app_whitelist(&sel.app_name) {
+                                            if added && sel.is_frozen {
+                                                let _ = set_app_frozen(&sel.app_name, false);
+                                            }
+                                            app.refresh_data(true)?;
+                                            let msg = if added {
+                                                format!("🛡 Whitelisted {} (protected from Smart Saver)", sel.app_name)
+                                            } else {
+                                                format!("Removed {} from Smart Saver whitelist", sel.app_name)
+                                            };
                                             app.status_message = Some((msg, Instant::now()));
                                         }
                                     }
@@ -630,7 +732,31 @@ fn run_tui_loop(
                             let next_state = !app.autopilot_enabled;
                             if let Ok(msg) = set_autopilot_enabled(&app.db, next_state) {
                                 app.autopilot_enabled = next_state;
+                                app.autopilot_config.enabled = next_state;
+                                let _ = save_autopilot_config(&app.autopilot_config);
                                 app.status_message = Some((format!("🤖 {msg}"), Instant::now()));
+                            }
+                        }
+                        KeyCode::Char('A') => {
+                            app.autopilot_config = load_autopilot_config();
+                            app.autopilot_modal = Some(0);
+                        }
+                        KeyCode::Char('w') => {
+                            if let Some(idx) = app.table_state.selected() {
+                                if let Some(sel) = app.apps.get(idx).cloned() {
+                                    if let Ok(added) = toggle_app_whitelist(&sel.app_name) {
+                                        if added && sel.is_frozen {
+                                            let _ = set_app_frozen(&sel.app_name, false);
+                                        }
+                                        app.refresh_data(true)?;
+                                        let msg = if added {
+                                            format!("🛡 Whitelisted {} (protected from Smart Saver)", sel.app_name)
+                                        } else {
+                                            format!("Removed {} from Smart Saver whitelist", sel.app_name)
+                                        };
+                                        app.status_message = Some((msg, Instant::now()));
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('r') => {
@@ -686,6 +812,13 @@ fn run_tui_loop(
                                 }
                                 _ => {}
                             }
+                        }
+                        continue;
+                    }
+
+                    if app.autopilot_modal.is_some() {
+                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                            app.autopilot_modal = None;
                         }
                         continue;
                     }
@@ -835,6 +968,10 @@ fn draw_ui(f: &mut Frame, app: &mut AppUi) {
 
     if app.optimizer_modal.is_some() {
         draw_optimizer_modal(f, app, size);
+    }
+
+    if app.autopilot_modal.is_some() {
+        draw_autopilot_modal(f, app, size);
     }
 }
 
@@ -1546,12 +1683,14 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect, total_size: Rec
                 Color::LightGreen
             };
 
+            let whitelisted = is_app_whitelisted(&app.autopilot_config, &row.app_name);
+            let shield = if whitelisted { "🛡 " } else { "" };
             let name_display = if row.is_frozen {
-                format!("❄ {} [FROZEN]", row.app_name)
+                format!("❄ {shield}{} [FROZEN]", row.app_name)
             } else if row.is_focused {
-                format!("🎯 {} {}", icon, row.app_name)
+                format!("🎯 {shield}{} {}", icon, row.app_name)
             } else {
-                format!("{} {}", icon, row.app_name)
+                format!("{shield}{} {}", icon, row.app_name)
             };
 
             let name_style = if row.is_frozen {
@@ -1876,6 +2015,14 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect, is_modal: bool) {
                 Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
+                if is_app_whitelisted(&app.autopilot_config, &sel.app_name) {
+                    "[w] Unwhitelist  "
+                } else {
+                    "[w] Whitelist (🛡)  "
+                },
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
                 "[x] Stop App",
                 Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
             ),
@@ -1934,6 +2081,10 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect, total_size: Rect) {
             Span::styled(":Opt ", Style::default().fg(Color::White)),
             Span::styled("a", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
             Span::styled(":Smart ", Style::default().fg(Color::Gray)),
+            Span::styled("A", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(":Rules ", Style::default().fg(Color::Gray)),
+            Span::styled("w", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(":Safe ", Style::default().fg(Color::Gray)),
             Span::styled("Enter/d", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(":Details ", Style::default().fg(Color::Gray)),
             Span::styled("/", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -1963,6 +2114,20 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect, total_size: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(": Smart Saver  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "A",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": Rules  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "w",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": Whitelist  ", Style::default().fg(Color::Gray)),
             Span::styled(
                 "Enter/d",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -2157,4 +2322,208 @@ fn draw_optimizer_modal(f: &mut Frame, app: &AppUi, area: Rect) {
         Span::styled(": Cancel", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(Paragraph::new(help_line), chunks[2]);
+}
+
+fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
+    let Some(sel_idx) = app.autopilot_modal else {
+        return;
+    };
+
+    let popup_width = area.width.saturating_sub(6).min(96);
+    let popup_height = area.height.saturating_sub(4).min(26);
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let cfg = &app.autopilot_config;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(Color::Rgb(16, 22, 28)))
+        .title(Span::styled(
+            " 🤖 Smart Battery Saver — Configurable Rules & App Whitelist ",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(10),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let cfg_path_line = Line::from(vec![
+        Span::styled(" Config: ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            config_file_path().display().to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(cfg_path_line), chunks[0]);
+
+    let rules = [
+        (
+            "Smart Saver Master Switch",
+            if cfg.enabled { "ENABLED".to_string() } else { "DISABLED".to_string() },
+            "Enable/disable automatic power rules in background",
+        ),
+        (
+            "Auto-Switch Power Profile",
+            if cfg.auto_switch_power_profile { "ON".to_string() } else { "OFF".to_string() },
+            "Switch to power-saver on low battery / balanced on AC",
+        ),
+        (
+            "Auto-Freeze Idle Apps",
+            if cfg.auto_freeze_enabled { "ON".to_string() } else { "OFF".to_string() },
+            "Send SIGSTOP to unfocused background hogs",
+        ),
+        (
+            "Idle Freeze Timeout",
+            format!("{} min", cfg.idle_freeze_mins),
+            "Minutes unfocused before auto-freezing an app",
+        ),
+        (
+            "Idle Power Threshold",
+            format!("{:.1} W", cfg.idle_power_threshold_w),
+            "Minimum background power draw to trigger auto-freeze",
+        ),
+        (
+            "Low Battery Threshold",
+            format!("{:.0}%", cfg.low_battery_pct),
+            "Trigger power-saver profile & dim keyboard",
+        ),
+        (
+            "Critical Battery Threshold",
+            format!("{:.0}%", cfg.critical_battery_pct),
+            "Aggressive freeze threshold on critical charge",
+        ),
+        (
+            "Dim Keyboard on Low Battery",
+            if cfg.dim_kbd_on_low_battery { "ON".to_string() } else { "OFF".to_string() },
+            "Turn off keyboard backlight below Low Battery %",
+        ),
+    ];
+
+    let rule_items: Vec<ListItem> = rules
+        .iter()
+        .enumerate()
+        .map(|(i, (label, val, desc))| {
+            let is_sel = i == sel_idx;
+            let bg = if is_sel { Color::Rgb(32, 48, 56) } else { Color::Reset };
+            let prefix = if is_sel { " ▶ " } else { "   " };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{prefix}{:<28}", label),
+                    Style::default()
+                        .fg(if is_sel { Color::LightYellow } else { Color::White })
+                        .bg(bg)
+                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(
+                    format!("[{:^10}]", val),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {desc}"),
+                    Style::default().fg(Color::Gray).bg(bg),
+                ),
+            ]))
+        })
+        .collect();
+    f.render_widget(List::new(rule_items), chunks[1]);
+
+    let bottom_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(chunks[2]);
+
+    let whitelist_text = if cfg.whitelist.is_empty() {
+        vec![ListItem::new(Span::styled(
+            " (none — press 'w' on any app to protect it)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        cfg.whitelist
+            .iter()
+            .map(|app_name| {
+                ListItem::new(Span::styled(
+                    format!(" 🛡 {app_name}"),
+                    Style::default().fg(Color::LightGreen),
+                ))
+            })
+            .collect()
+    };
+    f.render_widget(
+        List::new(whitelist_text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    " 🛡 Protected Whitelist ",
+                    Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        bottom_cols[0],
+    );
+
+    let logs = get_autopilot_log(&app.db);
+    let log_items: Vec<ListItem> = if logs.is_empty() {
+        vec![ListItem::new(Span::styled(
+            " No Smart Saver actions recorded yet.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        logs.into_iter()
+            .take(8)
+            .map(|entry| {
+                ListItem::new(Span::styled(
+                    format!(" • {entry}"),
+                    Style::default().fg(Color::Gray),
+                ))
+            })
+            .collect()
+    };
+    f.render_widget(
+        List::new(log_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    " 📜 Recent Smart Saver Log ",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        bottom_cols[1],
+    );
+
+    let help_line = Line::from(vec![
+        Span::styled(" ↑/↓", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(": Select Rule   ", Style::default().fg(Color::Gray)),
+        Span::styled("←/→/Space", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+        Span::styled(": Adjust / Toggle (auto-saved)   ", Style::default().fg(Color::Gray)),
+        Span::styled("Esc/A", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(": Close", Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(Paragraph::new(help_line), chunks[3]);
 }
