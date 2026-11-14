@@ -1,6 +1,6 @@
 # Maintainer: b1mb4 <artemkluenkov41@gmail.com>
 pkgname=rustybattery
-pkgver=0.3.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 arch=('x86_64' 'aarch64')

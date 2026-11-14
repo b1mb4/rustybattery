@@ -2,15 +2,20 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.5.0** *(Latest)*
-- **📐 4-Tier Adaptive Responsive TUI Scaling (Tiling & Half-Screen Support):**
-  - **Auto-Hides `App Battery Details` & `Battery Level (%) History` on Half-Screen Windows (`< 120 cols` or `< 28 rows`):** Gives the primary Per-App Battery Table **100% of the window width** and vertical space when tiled side-by-side or resized smaller.
-  - **On-Demand App Details Popup (`Enter` or `d`):** When the side inspector is hidden in half-screen/tiled mode, pressing **`Enter`** or **`d`** opens `🔍 App Battery Details` (with sparkline & `[z] Freeze` / `[x] Stop` controls) as a centered modal popup. On wide screens (`>= 120 cols`), `d` toggles the right-hand side panel on/off.
-  - **Progressive Column & Header Adaptation:** Automatically condenses table columns (9 → 7 → 6 columns), header cards (3 → 2 → 1-line bar), and time tabs (`1:Charge`, `2:6h`, `3:24h`, `4:7d`) across Wide, Half-Screen, Medium, and Quarter-Screen tiles so text never clips.
+### **Version 0.6.0** *(Latest)*
+- **🔍 Live TUI Search (`/`):** Press **`/`** in the interactive TUI to filter the application table in real time by app name or category (while keeping accurate system-wide `Battery Share` percentages). Press **`Enter`** to apply or **`Esc`** to clear.
+- **🖱️ Full Mouse Support in TUI:**
+  - **Left-click** any row in the per-app table to select and inspect it.
+  - **Scroll wheel** (`Up`/`Down`) to scroll through apps or modal lists.
+  - **Left-click** any of the 4 Time Range tabs (`Since Full Charge`, `6h`, `24h`, `7d`) or the **Period Summary & Filter** box to switch ranges/filters directly.
+  - **Right-click** an app row in tiled/compact mode to open `🔍 App Battery Details` popup (and right-click to close modals).
+- **📦 Updated Packaging Versions:** Synced `packaging/PKGBUILD` and `packaging/workflows/release.yml` to `0.6.0`.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.4.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.5.0)</b></summary>
 
+- **Version 0.5.0:**
+  - 4-Tier Adaptive Responsive TUI Scaling: auto-hides `App Battery Details` & `Battery Level (%) History` on half-screen/tiled windows (`< 120 cols` or `< 28 rows`), adds on-demand `🔍 App Battery Details` modal (`Enter`/`d`), and progressively adapts columns (9 → 7 → 6), headers, and tabs.
 - **Version 0.4.0:**
   - Added **`Focused %`** column to the primary stats table in TUI & `battery summary` (tracks battery drain when an app's window is focused in the foreground, with `🎯` active indicator).
   - Added **Automatic "Smart Battery Saver" Rules** (`battery autopilot [status|on|off]` / `a` in TUI): auto-switches CPU profile on AC/battery, auto-freezes heavy background apps unfocused `>= 10m` (`>= 0.85W`) and instantly resumes on focus, plus `<= 20%` and `<= 10%` low-battery triggers.
@@ -105,6 +110,8 @@ rustybattery
 | **`x`** | **Stop / Kill App** (terminates selected application or background service) |
 | `Tab` or `1`–`4` | Switch time window (`1`: Since Full Charge, `2`: Last 6h, `3`: Last 24h, `4`: Last 7d) |
 | `s` | Cycle sort column (`Battery %`, `Focused %`, `Energy Wh`, `Live Power W`, `Live CPU %`, `Memory MB`) |
+| **`/`** | **🔍 Live Search** (filter apps & categories in real time; `Enter` to apply, `Esc` to clear) |
+| **`Mouse`** | **🖱️ Click rows/tabs/filter** (`Left-click` select/switch, `Scroll` list, `Right-click` app details popup) |
 | `f` | Cycle category filter (`All Apps & Services`, `User Apps Only`, `Desktop & System`) |
 | `c` | Toggle Battery `%` & Power (`W`) charts |
 | `i` | Install & enable the 24/7 systemd user background service |

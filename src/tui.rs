@@ -11,7 +11,10 @@ use crate::statusbar::send_status_notification;
 use anyhow::Result;
 use chrono::{Local, TimeZone};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -196,6 +199,11 @@ pub struct AppUi {
     pub charts_mode: PanelVisibility,
     pub details_mode: PanelVisibility,
     pub details_modal_open: bool,
+    pub search_query: String,
+    pub search_active: bool,
+    pub tabs_area: Rect,
+    pub filter_area: Rect,
+    pub table_area: Rect,
     pub table_state: TableState,
     pub daemon_running: bool,
     pub service_installed: bool,
@@ -228,6 +236,11 @@ impl AppUi {
             charts_mode: PanelVisibility::Auto,
             details_mode: PanelVisibility::Auto,
             details_modal_open: false,
+            search_query: String::new(),
+            search_active: false,
+            tabs_area: Rect::default(),
+            filter_area: Rect::default(),
+            table_area: Rect::default(),
             table_state: TableState::default(),
             daemon_running: false,
             service_installed: is_service_file_installed(),
@@ -285,12 +298,20 @@ impl AppUi {
 
         all_apps.retain(|r| self.filter.matches(&r.category) && (r.battery_pct >= 0.005 || r.live_cpu_pct >= 0.1 || r.memory_mb >= 15.0));
 
-        // Recompute share_of_drain_pct within filtered view
+        // Recompute share_of_drain_pct within category-filtered view (before search query filter)
         let total_drain: f64 = all_apps.iter().map(|a| a.battery_pct).sum();
         if total_drain > 0.0 {
             for a in &mut all_apps {
                 a.share_of_drain_pct = (a.battery_pct / total_drain) * 100.0;
             }
+        }
+
+        let query = self.search_query.trim().to_lowercase();
+        if !query.is_empty() {
+            all_apps.retain(|r| {
+                r.app_name.to_lowercase().contains(&query)
+                    || r.category.to_lowercase().contains(&query)
+            });
         }
 
         all_apps.sort_by(|a, b| {
@@ -348,14 +369,18 @@ impl AppUi {
 pub fn run_tui(db: Database) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run_tui_loop(&mut terminal, db);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     res
@@ -377,8 +402,8 @@ fn run_tui_loop(
             .unwrap_or_else(|| Duration::from_secs(0));
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some((targets, sel_idx)) = &mut app.optimizer_modal {
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => {
@@ -470,11 +495,47 @@ fn run_tui_loop(
                         continue;
                     }
 
+                    if app.search_active {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.search_query.clear();
+                                app.search_active = false;
+                                app.refresh_data(false)?;
+                            }
+                            KeyCode::Enter => {
+                                app.search_active = false;
+                            }
+                            KeyCode::Backspace => {
+                                app.search_query.pop();
+                                app.refresh_data(false)?;
+                            }
+                            KeyCode::Down => app.move_selection(1),
+                            KeyCode::Up => app.move_selection(-1),
+                            KeyCode::Char(c) => {
+                                app.search_query.push(c);
+                                app.refresh_data(false)?;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     let term_size = terminal.size().unwrap_or_default();
                     let term_rect = Rect::new(0, 0, term_size.width, term_size.height);
 
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Esc => {
+                            if !app.search_query.is_empty() {
+                                app.search_query.clear();
+                                app.refresh_data(false)?;
+                            } else {
+                                return Ok(());
+                            }
+                        }
+                        KeyCode::Char('/') => {
+                            app.search_active = true;
+                        }
                         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
                         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
                         KeyCode::PageDown => app.move_selection(8),
@@ -599,6 +660,104 @@ fn run_tui_loop(
                         _ => {}
                     }
                 }
+                Event::Mouse(mouse) => {
+                    let col = mouse.column;
+                    let row = mouse.row;
+                    let in_rect = |r: Rect| -> bool {
+                        col >= r.x
+                            && col < r.x.saturating_add(r.width)
+                            && row >= r.y
+                            && row < r.y.saturating_add(r.height)
+                    };
+
+                    if app.optimizer_modal.is_some() {
+                        if let Some((targets, sel_idx)) = &mut app.optimizer_modal {
+                            match mouse.kind {
+                                MouseEventKind::ScrollDown => {
+                                    if !targets.is_empty() {
+                                        *sel_idx = (*sel_idx + 1).min(targets.len() - 1);
+                                    }
+                                }
+                                MouseEventKind::ScrollUp => {
+                                    *sel_idx = sel_idx.saturating_sub(1);
+                                }
+                                MouseEventKind::Down(MouseButton::Right) => {
+                                    app.optimizer_modal = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+
+                    if app.details_modal_open {
+                        match mouse.kind {
+                            MouseEventKind::ScrollDown => app.move_selection(1),
+                            MouseEventKind::ScrollUp => app.move_selection(-1),
+                            MouseEventKind::Down(MouseButton::Right) => {
+                                app.details_modal_open = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => app.move_selection(1),
+                        MouseEventKind::ScrollUp => app.move_selection(-1),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if in_rect(app.tabs_area) && app.tabs_area.width >= 4 {
+                                let rel_x = col.saturating_sub(app.tabs_area.x);
+                                let seg = ((rel_x as usize * 4) / (app.tabs_area.width as usize))
+                                    .min(3);
+                                app.window = TimeWindow::all()[seg];
+                                app.refresh_data(false)?;
+                            } else if in_rect(app.filter_area) {
+                                app.filter = app.filter.next();
+                                app.refresh_data(false)?;
+                            } else if in_rect(app.table_area) {
+                                let header_end = app.table_area.y.saturating_add(2);
+                                let bottom_edge = app
+                                    .table_area
+                                    .y
+                                    .saturating_add(app.table_area.height.saturating_sub(1));
+                                if row >= header_end && row < bottom_edge {
+                                    let clicked = app.table_state.offset()
+                                        + row.saturating_sub(header_end) as usize;
+                                    if clicked < app.apps.len() {
+                                        app.table_state.select(Some(clicked));
+                                        app.update_selected_app_buckets();
+                                    }
+                                }
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            if in_rect(app.table_area) {
+                                let header_end = app.table_area.y.saturating_add(2);
+                                let bottom_edge = app
+                                    .table_area
+                                    .y
+                                    .saturating_add(app.table_area.height.saturating_sub(1));
+                                if row >= header_end && row < bottom_edge {
+                                    let clicked = app.table_state.offset()
+                                        + row.saturating_sub(header_end) as usize;
+                                    if clicked < app.apps.len() {
+                                        app.table_state.select(Some(clicked));
+                                        app.update_selected_app_buckets();
+                                        let term_size = terminal.size().unwrap_or_default();
+                                        let term_rect =
+                                            Rect::new(0, 0, term_size.width, term_size.height);
+                                        if !should_show_details_panel(&app, term_rect) {
+                                            app.details_modal_open = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -952,7 +1111,7 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
     }
 }
 
-fn draw_tabs_and_kpis(f: &mut Frame, app: &AppUi, area: Rect) {
+fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
     let is_compact = area.width < 115;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -962,6 +1121,8 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &AppUi, area: Rect) {
             [Constraint::Percentage(48), Constraint::Percentage(52)]
         })
         .split(area);
+    app.tabs_area = cols[0];
+    app.filter_area = cols[1];
 
     let titles: Vec<Line> = TimeWindow::all()
         .iter()
@@ -1266,7 +1427,7 @@ fn make_usage_bar(share_pct: f64, width: usize) -> String {
 fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect, total_size: Rect) {
     let show_details = should_show_details_panel(app, total_size);
 
-    let (table_area, details_area) = if show_details {
+    let (table_outer_area, details_area) = if show_details {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
@@ -1275,6 +1436,48 @@ fn draw_apps_section(f: &mut Frame, app: &mut AppUi, area: Rect, total_size: Rec
     } else {
         (area, None)
     };
+
+    let show_search_bar = app.search_active || !app.search_query.is_empty();
+    let table_area = if show_search_bar {
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(4)])
+            .split(table_outer_area);
+        let cursor = if app.search_active { "▌" } else { "" };
+        let search_line = Line::from(vec![
+            Span::styled(" 🔍 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}{}", app.search_query, cursor),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if app.search_active {
+                    "   (Enter: apply · Esc: clear)"
+                } else {
+                    "   (/: edit · Esc: clear)"
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        let search_box = Paragraph::new(search_line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if app.search_active {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }))
+                .title(Span::styled(
+                    " Search Apps & Categories [/] ",
+                    Style::default().fg(Color::LightCyan),
+                )),
+        );
+        f.render_widget(search_box, v[0]);
+        v[1]
+    } else {
+        table_outer_area
+    };
+    app.table_area = table_area;
 
     // Adaptive column tier based on the actual width available to the table
     let table_w = table_area.width;
@@ -1733,6 +1936,8 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect, total_size: Rect) {
             Span::styled(":Smart ", Style::default().fg(Color::Gray)),
             Span::styled("Enter/d", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(":Details ", Style::default().fg(Color::Gray)),
+            Span::styled("/", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(":Search ", Style::default().fg(Color::Gray)),
             Span::styled("c", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(":Chart ", Style::default().fg(Color::Gray)),
             Span::styled("z", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
@@ -1781,6 +1986,8 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect, total_size: Rect) {
             Span::styled(": Time  ", Style::default().fg(Color::Gray)),
             Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(": Sort  ", Style::default().fg(Color::Gray)),
+            Span::styled("/", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(": Search  ", Style::default().fg(Color::Gray)),
             Span::styled("f", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(": Filter  ", Style::default().fg(Color::Gray)),
             Span::styled("c", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
