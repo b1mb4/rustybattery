@@ -2,15 +2,17 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.7.0** *(Latest)*
-- **⚙️ Configurable Smart Saver Rules (`~/.config/rustybattery/config.toml`):** Persistent TOML config storing Smart Saver rules, thresholds (`idle_freeze_mins`, `idle_power_threshold_w`, `low_battery_pct`, `critical_battery_pct`, `auto_switch_power_profile`, `auto_freeze_enabled`, `dim_kbd_on_low_battery`), and protected app `whitelist`.
-- **🎛️ Live TUI Rules Editor (`Shift+A`) & App Whitelist (`w`):**
-  - Press **`A`** (`Shift+A`) in the TUI to edit Smart Saver rules and thresholds live, view protected apps, and inspect the recent **Smart Saver Activity Log**.
-  - Press **`w`** on any app to toggle its **Protected Whitelist** badge (`🛡`) so Smart Saver never auto-freezes it (and immediately resumes it if frozen).
-- **🖥️ Enhanced CLI (`battery autopilot`):** Added `battery autopilot whitelist <app>`, `unwhitelist <app>`, and `config` subcommands, plus full rule & log output in `battery autopilot`.
+### **Version 0.8.0** *(Latest)*
+- **🖥️ Screen-On Time (SoT) Tracking:** Tracks display state via sysfs backlight/DPMS (`/sys/class/backlight/*/bl_power`, `/sys/class/drm/*/dpms`) and calculates active Screen-On Time across `Since Full Charge`, `6h`, `24h`, and `7d`.
+- **🌙 Sleep / Suspend Drain Tracking:** Detects suspend/sleep intervals (`>= 90s` gaps) and calculates total sleep duration, battery `%` lost, `Wh` lost, and sleep drain rate (`%/hr`).
+- **📊 TUI, CLI & JSON Integration:** Displays **SoT** and **Sleep Drain** directly in the TUI `Period Summary & Filter [f]` bar, in `battery summary`, and under `"drain_stats"` in `battery summary --json`.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.6.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.7.0)</b></summary>
+
+- **Version 0.7.0:**
+  - Configurable Smart Saver Rules (`~/.config/rustybattery/config.toml`) with persistent thresholds and protected app `whitelist`.
+  - Live TUI Rules Editor (`Shift+A`) & App Whitelist toggle (`w` with `🛡` badge), plus `battery autopilot whitelist|unwhitelist|config` CLI commands.
 
 - **Version 0.6.0:**
   - Live TUI Search (`/`): filter apps in real time by name or category while preserving accurate system-wide `Battery Share` percentages.

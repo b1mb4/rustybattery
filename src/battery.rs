@@ -68,6 +68,48 @@ pub struct BatterySnapshot {
     pub ac_online: bool,
     /// Estimated minutes remaining (until empty when discharging, or until full when charging)
     pub time_remaining_mins: Option<u32>,
+    /// Whether the display is currently on (from sysfs backlight/DPMS)
+    pub screen_on: bool,
+}
+
+pub fn is_screen_on() -> bool {
+    if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
+        let mut saw_bl = false;
+        for entry in entries.flatten() {
+            let bl_power = entry.path().join("bl_power");
+            if let Some(val) = read_trimmed(&bl_power) {
+                saw_bl = true;
+                if val == "0" {
+                    return true;
+                }
+            }
+        }
+        if saw_bl {
+            return false;
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+        let mut saw_dpms = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains("Writeback") {
+                continue;
+            }
+            let dpms_path = entry.path().join("dpms");
+            if let Some(val) = read_trimmed(&dpms_path) {
+                saw_dpms = true;
+                if val.eq_ignore_ascii_case("on") {
+                    return true;
+                }
+            }
+        }
+        if saw_dpms {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -284,6 +326,7 @@ pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
         cycle_count: max_cycles,
         ac_online,
         time_remaining_mins,
+        screen_on: is_screen_on(),
     })
 }
 

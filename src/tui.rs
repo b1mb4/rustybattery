@@ -5,7 +5,7 @@ use crate::autopilot::{
     AutopilotConfig, SmartAutopilot,
 };
 use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
-use crate::db::{AppSummaryRow, BatteryHistoryPoint, Database};
+use crate::db::{AppSummaryRow, BatteryHistoryPoint, Database, PeriodDrainStats};
 use crate::optimize::{
     execute_optimizations, scan_optimization_targets, set_app_frozen, stop_or_kill_app,
     OptimizationTarget,
@@ -213,6 +213,7 @@ pub struct AppUi {
     pub service_installed: bool,
     pub autopilot_enabled: bool,
     pub autopilot_config: AutopilotConfig,
+    pub drain_stats: PeriodDrainStats,
     pub status_message: Option<(String, Instant)>,
     pub since_ts: i64,
     pub optimizer_modal: Option<(Vec<OptimizationTarget>, usize)>,
@@ -253,6 +254,7 @@ impl AppUi {
             service_installed: is_service_file_installed(),
             autopilot_enabled,
             autopilot_config,
+            drain_stats: PeriodDrainStats::default(),
             status_message: None,
             since_ts: 0,
             optimizer_modal: None,
@@ -300,6 +302,7 @@ impl AppUi {
 
         self.since_ts = self.compute_since_ts();
         self.history = self.db.get_battery_history(self.since_ts).unwrap_or_default();
+        self.drain_stats = self.db.get_period_drain_stats(self.since_ts).unwrap_or_default();
 
         let mut all_apps = self
             .db
@@ -1317,17 +1320,42 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
         app.battery.power_w
     };
 
+    let sot_secs = if app.drain_stats.sot_secs > 0 {
+        app.drain_stats.sot_secs
+    } else {
+        app.drain_stats.awake_total_secs
+    };
+    let sot_label = format_duration_short(sot_secs as f64);
+    let sleep_label = if app.drain_stats.sleep_secs >= 60 {
+        format!(
+            "{:.1}%/h ({})",
+            app.drain_stats.sleep_drain_pct_per_hr,
+            format_duration_short(app.drain_stats.sleep_secs as f64)
+        )
+    } else {
+        "0m".to_string()
+    };
+
     let kpi_line = if is_compact {
         Line::from(vec![
-            Span::styled(" Drain: ", Style::default().fg(Color::Gray)),
+            Span::styled(" Drain:", Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{:.1}%", total_app_pct),
                 Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" │ Avg: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" │ SoT:", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{:.1}W", avg_watts),
+                sot_label,
                 Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" │ Sleep:", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.drain_stats.sleep_secs >= 60 {
+                    format!("{:.1}%/h", app.drain_stats.sleep_drain_pct_per_hr)
+                } else {
+                    "0m".to_string()
+                },
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -1337,21 +1365,31 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
         ])
     } else {
         Line::from(vec![
-            Span::styled(" Drain Used: ", Style::default().fg(Color::Gray)),
+            Span::styled(" Drain: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{:.1}%", total_app_pct),
                 Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" ({:.1} Wh)", total_app_wh),
+                format!(" ({:.1}Wh)", total_app_wh),
                 Style::default().fg(Color::Gray),
             ),
-            Span::styled("  │  Avg Power: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" │ Avg:", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{:.1} W", avg_watts),
+                format!("{:.1}W", avg_watts),
                 Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  │  View: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" │ SoT:", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                sot_label,
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" │ Sleep:", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                sleep_label,
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 app.filter.label(),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),

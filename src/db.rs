@@ -1,6 +1,7 @@
 use crate::apps::{bootstrap_session_app_usage, AppDeltaUsage};
 use crate::battery::{load_upower_history, BatterySnapshot, BatteryStatus};
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_double, c_int, c_void};
@@ -66,6 +67,19 @@ pub struct BatteryHistoryPoint {
     pub capacity_pct: f64,
     pub status: String,
     pub power_w: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PeriodDrainStats {
+    pub sot_secs: i64,
+    pub awake_total_secs: i64,
+    pub screen_off_awake_secs: i64,
+    pub sot_drain_pct: f64,
+    pub sleep_secs: i64,
+    pub sleep_drain_pct: f64,
+    pub sleep_drain_wh: f64,
+    pub sleep_drain_pct_per_hr: f64,
+    pub sleep_events: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -189,7 +203,8 @@ impl Database {
                  power_w REAL NOT NULL,
                  energy_now_wh REAL NOT NULL,
                  energy_full_wh REAL NOT NULL,
-                 voltage_v REAL NOT NULL
+                 voltage_v REAL NOT NULL,
+                 screen_on INTEGER NOT NULL DEFAULT 1
              );
              CREATE TABLE IF NOT EXISTS app_usage_buckets (
                  bucket_ts INTEGER NOT NULL,
@@ -219,6 +234,9 @@ impl Database {
         );
         let _ = self.exec(
             "ALTER TABLE app_usage_buckets ADD COLUMN focused_secs REAL NOT NULL DEFAULT 0.0;",
+        );
+        let _ = self.exec(
+            "ALTER TABLE battery_samples ADD COLUMN screen_on INTEGER NOT NULL DEFAULT 1;",
         );
         Ok(())
     }
@@ -415,8 +433,8 @@ impl Database {
 
         let sql = CString::new(
             "INSERT OR REPLACE INTO battery_samples
-             (timestamp, capacity_pct, status, power_w, energy_now_wh, energy_full_wh, voltage_v)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (timestamp, capacity_pct, status, power_w, energy_now_wh, energy_full_wh, voltage_v, screen_on)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         let c_status = CString::new(snap.status.as_str())?;
         let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
@@ -438,6 +456,7 @@ impl Database {
             sqlite3_bind_double(stmt, 5, snap.energy_now_wh);
             sqlite3_bind_double(stmt, 6, snap.energy_full_wh);
             sqlite3_bind_double(stmt, 7, snap.voltage_v);
+            sqlite3_bind_int64(stmt, 8, if snap.screen_on { 1 } else { 0 });
             sqlite3_step(stmt);
             sqlite3_finalize(stmt);
         }
@@ -594,6 +613,92 @@ impl Database {
             sqlite3_finalize(stmt);
         }
         Ok(points)
+    }
+
+    pub fn get_period_drain_stats(&self, since_ts: i64) -> Result<PeriodDrainStats> {
+        let sql = CString::new(
+            "SELECT timestamp, capacity_pct, status, energy_now_wh, screen_on
+             FROM battery_samples
+             WHERE timestamp >= ?1
+             ORDER BY timestamp ASC",
+        )
+        .context("Invalid SQL")?;
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        struct Row {
+            ts: i64,
+            pct: f64,
+            status: String,
+            wh: f64,
+            screen_on: bool,
+        }
+        let mut rows = Vec::new();
+        unsafe {
+            if sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()) != SQLITE_OK
+            {
+                bail!("Query failed: {}", self.last_error());
+            }
+            sqlite3_bind_int64(stmt, 1, since_ts);
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let ts = sqlite3_column_int64(stmt, 0);
+                let pct = sqlite3_column_double(stmt, 1);
+                let status_ptr = sqlite3_column_text(stmt, 2);
+                let status = if status_ptr.is_null() {
+                    "Unknown".to_string()
+                } else {
+                    CStr::from_ptr(status_ptr).to_string_lossy().to_string()
+                };
+                let wh = sqlite3_column_double(stmt, 3);
+                let screen_on = sqlite3_column_int64(stmt, 4) != 0;
+                rows.push(Row {
+                    ts,
+                    pct,
+                    status,
+                    wh,
+                    screen_on,
+                });
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        let mut stats = PeriodDrainStats::default();
+        for w in rows.windows(2) {
+            let prev = &w[0];
+            let curr = &w[1];
+            let dt = curr.ts - prev.ts;
+            if dt <= 0 {
+                continue;
+            }
+            if dt >= 90 {
+                stats.sleep_secs += dt;
+                stats.sleep_events += 1;
+                if prev.status == "Discharging" || curr.status == "Discharging" {
+                    let drop_pct = (prev.pct - curr.pct).max(0.0);
+                    let drop_wh = (prev.wh - curr.wh).max(0.0);
+                    if drop_pct < 50.0 {
+                        stats.sleep_drain_pct += drop_pct;
+                        stats.sleep_drain_wh += drop_wh;
+                    }
+                }
+            } else if prev.screen_on {
+                stats.awake_total_secs += dt;
+                if prev.status == "Discharging" {
+                    stats.sot_secs += dt;
+                    let drop_pct = (prev.pct - curr.pct).max(0.0);
+                    if drop_pct < 25.0 {
+                        stats.sot_drain_pct += drop_pct;
+                    }
+                }
+            } else if prev.status == "Discharging" {
+                stats.screen_off_awake_secs += dt;
+            }
+        }
+
+        if stats.sleep_secs >= 60 {
+            stats.sleep_drain_pct_per_hr =
+                stats.sleep_drain_pct / (stats.sleep_secs as f64 / 3600.0);
+        }
+
+        Ok(stats)
     }
 
     pub fn get_app_breakdown(

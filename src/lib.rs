@@ -25,7 +25,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "rustybattery",
-    version = "0.7.0",
+    version = "0.8.0",
     about = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 )]
 struct Cli {
@@ -367,6 +367,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
         chrono::Utc::now().timestamp() - (hours as i64) * 3600
     };
 
+    let drain_stats = db.get_period_drain_stats(since_ts).unwrap_or_default();
     let mut apps = db.get_app_breakdown(since_ts, &live_deltas)?;
     apps.sort_by(|a, b| {
         b.battery_pct
@@ -379,6 +380,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
             "battery": bat,
             "since_timestamp": since_ts,
             "autopilot_enabled": is_autopilot_enabled(&db),
+            "drain_stats": drain_stats,
             "apps": apps.into_iter().take(top).map(|a| serde_json::json!({
                 "app_name": a.app_name,
                 "category": a.category,
@@ -406,7 +408,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
 
     println!("╭────────────────────────────────────────────────────────────────────────────────────────╮");
     println!(
-        "│ 🦀 RustyBattery v0.7.0 — Per-App Power Tracker for Linux                               │"
+        "│ 🦀 RustyBattery v0.8.0 — Per-App Power Tracker for Linux                               │"
     );
     println!("├────────────────────────────────────────────────────────────────────────────────────────┤");
     println!(
@@ -423,6 +425,27 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
         bat.energy_design_wh,
         bat.health_pct,
         bat.cycle_count
+    );
+    let sot_secs = if drain_stats.sot_secs > 0 {
+        drain_stats.sot_secs
+    } else {
+        drain_stats.awake_total_secs
+    };
+    let sot_fmt = format!("{}h {:02}m", sot_secs / 3600, (sot_secs % 3600) / 60);
+    let sleep_fmt = if drain_stats.sleep_secs >= 60 {
+        format!(
+            "{}h {:02}m ({:.1}% / {:.1}%/hr)",
+            drain_stats.sleep_secs / 3600,
+            (drain_stats.sleep_secs % 3600) / 60,
+            drain_stats.sleep_drain_pct,
+            drain_stats.sleep_drain_pct_per_hr
+        )
+    } else {
+        "0h 00m (0.0%)".to_string()
+    };
+    println!(
+        "│ Screen-On Time: {:<10}   Sleep/Suspend Drain: {:<34} │",
+        sot_fmt, sleep_fmt
     );
     println!("╰────────────────────────────────────────────────────────────────────────────────────────╯");
     println!();
