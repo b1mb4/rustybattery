@@ -150,6 +150,14 @@ impl CategoryFilter {
         }
     }
 
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            CategoryFilter::All => "All",
+            CategoryFilter::UserAppsOnly => "User Apps",
+            CategoryFilter::SystemAndDesktop => "System",
+        }
+    }
+
     pub fn matches(&self, category: &str) -> bool {
         match self {
             CategoryFilter::All => true,
@@ -477,7 +485,7 @@ fn run_tui_loop(
                                 app.autopilot_modal = None;
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                *sel_idx = (*sel_idx + 1).min(7);
+                                *sel_idx = (*sel_idx + 1).min(8);
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 *sel_idx = sel_idx.saturating_sub(1);
@@ -532,6 +540,7 @@ fn run_tui_loop(
                                         }
                                     }
                                     7 => cfg.dim_kbd_on_low_battery = !cfg.dim_kbd_on_low_battery,
+                                    8 => cfg.s2idle_sleep_saver = !cfg.s2idle_sleep_saver,
                                     _ => {}
                                 }
                                 let _ = save_autopilot_config(cfg);
@@ -1256,9 +1265,9 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(if is_compact {
-            [Constraint::Percentage(46), Constraint::Percentage(54)]
+            [Constraint::Percentage(40), Constraint::Percentage(60)]
         } else {
-            [Constraint::Percentage(48), Constraint::Percentage(52)]
+            [Constraint::Percentage(42), Constraint::Percentage(58)]
         })
         .split(area);
     app.tabs_area = cols[0];
@@ -1336,7 +1345,13 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
         "0m".to_string()
     };
 
-    let kpi_line = if is_compact {
+    let filter_text = if cols[1].width >= 88 {
+        app.filter.label()
+    } else {
+        app.filter.short_label()
+    };
+
+    let kpi_line = if is_compact || cols[1].width < 68 {
         Line::from(vec![
             Span::styled(" Drain:", Style::default().fg(Color::Gray)),
             Span::styled(
@@ -1359,7 +1374,7 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
             ),
             Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                app.filter.label(),
+                app.filter.short_label(),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ),
         ])
@@ -1391,7 +1406,7 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
             ),
             Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                app.filter.label(),
+                filter_text,
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ),
         ])
@@ -2046,9 +2061,9 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect, is_modal: bool) {
             Span::styled(" App Controls:   ", Style::default().fg(Color::Gray)),
             Span::styled(
                 if sel.is_frozen {
-                    "[z] Resume App  "
+                    "[z] Resume  "
                 } else {
-                    "[z] Freeze (0% CPU)  "
+                    "[z] Freeze  "
                 },
                 Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
             ),
@@ -2056,12 +2071,12 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect, is_modal: bool) {
                 if is_app_whitelisted(&app.autopilot_config, &sel.app_name) {
                     "[w] Unwhitelist  "
                 } else {
-                    "[w] Whitelist (🛡)  "
+                    "[w] Whitelist  "
                 },
                 Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "[x] Stop App",
+                "[x] Stop",
                 Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
             ),
         ])),
@@ -2122,7 +2137,7 @@ fn draw_footer(f: &mut Frame, app: &AppUi, area: Rect, total_size: Rect) {
             Span::styled("A", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
             Span::styled(":Rules ", Style::default().fg(Color::Gray)),
             Span::styled("w", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-            Span::styled(":Safe ", Style::default().fg(Color::Gray)),
+            Span::styled(":Whitelist ", Style::default().fg(Color::Gray)),
             Span::styled("Enter/d", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(":Details ", Style::default().fg(Color::Gray)),
             Span::styled("/", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -2402,7 +2417,7 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
         .margin(1)
         .constraints([
             Constraint::Length(2),
-            Constraint::Length(10),
+            Constraint::Length(11),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
@@ -2457,6 +2472,11 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
             "Dim Keyboard on Low Battery",
             if cfg.dim_kbd_on_low_battery { "ON".to_string() } else { "OFF".to_string() },
             "Turn off keyboard backlight below Low Battery %",
+        ),
+        (
+            "s2idle Lid-Close Saver",
+            if cfg.s2idle_sleep_saver { "ON".to_string() } else { "OFF".to_string() },
+            "Block Bluetooth & enforce power-saver on lid close",
         ),
     ];
 

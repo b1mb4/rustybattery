@@ -26,6 +26,7 @@ pub struct AutopilotConfig {
     pub low_battery_pct: f64,
     pub critical_battery_pct: f64,
     pub dim_kbd_on_low_battery: bool,
+    pub s2idle_sleep_saver: bool,
     pub whitelist: Vec<String>,
 }
 
@@ -40,6 +41,7 @@ impl Default for AutopilotConfig {
             low_battery_pct: 20.0,
             critical_battery_pct: 10.0,
             dim_kbd_on_low_battery: true,
+            s2idle_sleep_saver: true,
             whitelist: Vec::new(),
         }
     }
@@ -105,6 +107,9 @@ pub fn load_autopilot_config() -> AutopilotConfig {
             "dim_kbd_on_low_battery" => {
                 cfg.dim_kbd_on_low_battery = val == "true" || val == "1"
             }
+            "s2idle_sleep_saver" => {
+                cfg.s2idle_sleep_saver = val == "true" || val == "1"
+            }
             "whitelist" => {
                 let trimmed = val.trim_start_matches('[').trim_end_matches(']');
                 cfg.whitelist = trimmed
@@ -138,6 +143,7 @@ pub fn save_autopilot_config(cfg: &AutopilotConfig) -> Result<()> {
          low_battery_pct = {:.0}\n\
          critical_battery_pct = {:.0}\n\
          dim_kbd_on_low_battery = {}\n\
+         s2idle_sleep_saver = {}\n\
          whitelist = [{}]\n",
         cfg.enabled,
         cfg.auto_switch_power_profile,
@@ -147,6 +153,7 @@ pub fn save_autopilot_config(cfg: &AutopilotConfig) -> Result<()> {
         cfg.low_battery_pct,
         cfg.critical_battery_pct,
         cfg.dim_kbd_on_low_battery,
+        cfg.s2idle_sleep_saver,
         wl_items.join(", ")
     );
     fs::write(&path, content)
@@ -239,6 +246,8 @@ fn record_autopilot_action(db: &Database, action: &str) {
 /// Stateful daemon engine for Automatic "Smart Battery Saver" Rules
 pub struct SmartAutopilot {
     last_ac_online: Option<bool>,
+    last_lid_closed: Option<bool>,
+    bt_blocked_for_sleep: bool,
     unfocused_since: HashMap<String, Instant>,
     auto_frozen_apps: HashSet<String>,
     low_bat_triggered: bool,
@@ -249,6 +258,8 @@ impl SmartAutopilot {
     pub fn new() -> Self {
         Self {
             last_ac_online: None,
+            last_lid_closed: None,
+            bt_blocked_for_sleep: false,
             unfocused_since: HashMap::new(),
             auto_frozen_apps: HashSet::new(),
             low_bat_triggered: false,
@@ -425,7 +436,66 @@ impl SmartAutopilot {
                 record_autopilot_action(db, &action);
             }
         }
+
+        // ------------------------------------------------------------------
+        // RULE 4: s2idle Lid-Close / Pre-Sleep Saver (Bluetooth + Power Profile)
+        // ------------------------------------------------------------------
+        let lid_closed = is_lid_closed();
+        if cfg.s2idle_sleep_saver {
+            if lid_closed && self.last_lid_closed != Some(true) {
+                let _ = set_system_power_profile(true);
+                let _ = dim_keyboard_backlight();
+                let mut bt_note = "";
+                if on_battery && is_bluetooth_unblocked() && set_bluetooth_blocked(true) {
+                    self.bt_blocked_for_sleep = true;
+                    bt_note = " & soft-blocked Bluetooth";
+                }
+                record_autopilot_action(
+                    db,
+                    &format!("🌙 Lid closed (s2idle) → enforced power-saver{bt_note}"),
+                );
+            } else if !lid_closed && self.last_lid_closed == Some(true) && self.bt_blocked_for_sleep {
+                let _ = set_bluetooth_blocked(false);
+                self.bt_blocked_for_sleep = false;
+                record_autopilot_action(db, "☀️ Lid opened → restored Bluetooth radio");
+            }
+        }
+        self.last_lid_closed = Some(lid_closed);
     }
+}
+
+pub fn is_lid_closed() -> bool {
+    let Ok(entries) = fs::read_dir("/proc/acpi/button/lid") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let state_path = entry.path().join("state");
+        if let Ok(s) = fs::read_to_string(&state_path) {
+            if s.to_lowercase().contains("closed") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn is_bluetooth_unblocked() -> bool {
+    if let Ok(out) = Command::new("rfkill").args(["list", "bluetooth"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        if text.contains("soft blocked: no") {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn set_bluetooth_blocked(block: bool) -> bool {
+    let action = if block { "block" } else { "unblock" };
+    Command::new("rfkill")
+        .args([action, "bluetooth"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn is_eligible_for_autofreeze(app_name: &str, category: &str) -> bool {

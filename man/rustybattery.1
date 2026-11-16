@@ -1,0 +1,109 @@
+.TH RUSTYBATTERY 1 "November 2026" "RustyBattery 0.9.0" "User Commands"
+.SH NAME
+rustybattery, battery \- Per-app power tracker, battery optimizer, and Smart Saver for Linux
+.SH SYNOPSIS
+.B battery
+[\fB\-\-summary\fR]
+[\fICOMMAND\fR]
+.br
+.B rustybattery
+[\fB\-\-summary\fR]
+[\fICOMMAND\fR]
+.SH DESCRIPTION
+.B RustyBattery
+is a lightweight, zero-dependency Linux battery & per-app power monitor written in Rust.
+It tracks per-application energy drain (\fB%\fR, \fBFocused %\fR, \fBWh\fR, \fBW\fR),
+Screen-On Time (\fBSoT\fR), Sleep/Suspend drain (\fB%/hr\fR), and battery health in a local
+SQLite database, and provides both an interactive terminal UI and a 24/7 systemd user daemon.
+.SH COMMANDS
+.TP
+.B (no command)
+Launch the interactive TUI dashboard.
+.TP
+.B summary [\-\-hours N] [\-\-top N] [\-\-json]
+Print a CLI power summary, Screen-On Time, Sleep/Suspend drain, and top draining apps.
+Pass \fB\-\-hours 0\fR (default) for since last full charge, or \fB\-\-json\fR for JSON output.
+.TP
+.B optimize [\-\-dry\-run]
+Scan and interactively optimize background hogs and system power tunables.
+.TP
+.B sleep [\-\-fix]
+Audit \fBs2idle\fR sleep mode, lid state, noisy ACPI USB/PCI wakeup triggers, Bluetooth status,
+and 24h sleep drain rate. Pass \fB\-\-fix\fR to immediately apply \fBs2idle\fR optimizations.
+.TP
+.B autopilot [status|on|off|whitelist APP|unwhitelist APP|config]
+View or configure Smart Battery Saver rules, thresholds, and protected app whitelist.
+.TP
+.B freeze APP \fR/\fB resume APP \fR/\fB stop APP
+Freeze (\fBcgroup.freeze = 1\fR or \fBSIGSTOP\fR), resume, or stop a running application.
+.TP
+.B service [install|uninstall|status]
+Manage the 24/7 systemd user background collector (\fBrustybattery.service\fR).
+.TP
+.B statusbar [\-\-format waybar|polybar|i3|plain] [\-\-top N] [\-\-print\-config]
+Output compact JSON/text status for Waybar, Polybar, or i3status.
+.TP
+.B notify
+Send a desktop notification with current battery status and top draining apps.
+.TP
+.B man [\-\-install]
+Open this manual page in \fBman\fR, or install \fBrustybattery.1\fR and \fBbattery.1\fR into
+\fI~/.local/share/man/man1/\fR so \fBman battery\fR and \fBman rustybattery\fR work directly.
+.SH TUI KEYBOARD & MOUSE CONTROLS
+.TP
+.B ↑ / ↓ \fRor\fB j / k
+Move app selection (or scroll wheel). Left-click selects a row; right-click opens details.
+.TP
+.B Enter / d
+Open or close the \fBApp Battery Details\fR inspector modal.
+.TP
+.B /
+Live-filter applications by name or category (\fBEnter\fR applies, \fBEsc\fR clears).
+.TP
+.B Tab / 1\-4
+Switch time range: \fB1\fR Since Full Charge, \fB2\fR 6h, \fB3\fR 24h, \fB4\fR 7d (or click tabs).
+.TP
+.B s / f
+Cycle sort column (\fBs\fR) or category filter (\fBf\fR: All / User Apps / System).
+.TP
+.B c
+Toggle charts visibility (Auto / Show / Hide).
+.TP
+.B o
+Open the interactive \fBBattery Optimizer\fR modal.
+.TP
+.B a / A
+Toggle Smart Battery Saver (\fBa\fR) or open the live \fBSmart Saver Rules & Log\fR editor (\fBShift+A\fR).
+.TP
+.B z / w / x
+On the selected app: freeze/resume (\fBz\fR), toggle Smart Saver whitelist (\fBw\fR), or stop (\fBx\fR).
+.TP
+.B q
+Quit the TUI.
+.SH FILES
+.TP
+.I ~/.config/rustybattery/config.toml
+Persistent Smart Battery Saver rules, thresholds, and protected app whitelist.
+.TP
+.I ~/.local/share/rustybattery/history.db
+SQLite database storing battery samples, Screen-On Time, and per-app energy buckets.
+.TP
+.I ~/.config/systemd/user/rustybattery.service
+Systemd user unit for the 24/7 background collector and Smart Saver daemon.
+.SH EXAMPLES
+.TP
+.B battery
+Open the interactive TUI.
+.TP
+.B battery summary \-\-hours 24 \-\-top 10
+Show 24-hour SoT, sleep drain, and top 10 draining apps.
+.TP
+.B battery autopilot whitelist Spotify
+Protect Spotify from being auto-frozen by Smart Saver.
+.TP
+.B battery man \-\-install
+Install \fBman battery\fR and \fBman rustybattery\fR locally.
+.SH AUTHOR
+b1mb4 <artemkluenkov41@gmail.com>
+.br
+https://github.com/b1mb4/rustybattery

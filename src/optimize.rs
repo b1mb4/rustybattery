@@ -13,6 +13,103 @@ pub enum TargetKind {
     SystemService,
     /// Linux CPU Power Profile (`powerprofilesctl`, `tuned-adm`, `tlp`, or cpufreq sysfs)
     PowerProfile,
+    /// Soft-block Bluetooth via `rfkill` so Bluetooth controller enters deep sleep during s2idle
+    BluetoothRadio,
+    /// Disable noisy USB/PCIe wakeup triggers in `/proc/acpi/wakeup` for deeper s2idle residency
+    AcpiWakeups,
+}
+
+#[derive(Debug, Clone)]
+pub struct S2IdleStatus {
+    pub mem_sleep: String,
+    pub lid_closed: bool,
+    pub suspend_success: u64,
+    pub suspend_fail: u64,
+    pub bluetooth_unblocked: bool,
+    pub noisy_wakeups: Vec<(String, String)>,
+    pub hibernate_delay_configured: bool,
+}
+
+pub fn scan_noisy_acpi_wakeups() -> Vec<(String, String)> {
+    let Ok(content) = fs::read_to_string("/proc/acpi/wakeup") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in content.lines().skip(1) {
+        if !line.contains("*enabled") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let Some(&dev) = parts.first() else {
+            continue;
+        };
+        let is_noisy = dev.starts_with("XHC")
+            || dev.starts_with("EHC")
+            || dev.starts_with("NHI")
+            || dev.starts_with("GPP")
+            || dev.starts_with("GP1")
+            || dev.starts_with("PTXH");
+        if is_noisy {
+            let sysfs_node = parts.get(3).copied().unwrap_or("").to_string();
+            out.push((dev.to_string(), sysfs_node));
+        }
+    }
+    out
+}
+
+pub fn disable_noisy_acpi_wakeups(devices: &[String]) -> Result<usize> {
+    let mut toggled = 0usize;
+    for dev in devices {
+        if fs::write("/proc/acpi/wakeup", format!("{dev}\n")).is_ok() {
+            toggled += 1;
+        }
+    }
+    if toggled == devices.len() {
+        return Ok(toggled);
+    }
+
+    let script = devices
+        .iter()
+        .map(|d| format!("echo {d} > /proc/acpi/wakeup"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    if let Ok(out) = Command::new("sudo")
+        .args(["-n", "sh", "-c", &script])
+        .output()
+    {
+        if out.status.success() {
+            return Ok(devices.len());
+        }
+    }
+    anyhow::bail!(
+        "Disabling ACPI wakeups requires root. Run:\n  sudo sh -c '{}'",
+        script
+    )
+}
+
+pub fn inspect_s2idle_status() -> S2IdleStatus {
+    let mem_sleep = fs::read_to_string("/sys/power/mem_sleep")
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    let lid_closed = crate::autopilot::is_lid_closed();
+    let suspend_success = read_u64_file(Path::new("/sys/power/suspend_stats/success"));
+    let suspend_fail = read_u64_file(Path::new("/sys/power/suspend_stats/fail"));
+    let bluetooth_unblocked = crate::autopilot::is_bluetooth_unblocked();
+    let noisy_wakeups = scan_noisy_acpi_wakeups();
+    let sleep_conf = fs::read_to_string("/etc/systemd/sleep.conf").unwrap_or_default();
+    let hibernate_delay_configured = sleep_conf
+        .lines()
+        .any(|l| !l.trim_start().starts_with('#') && l.contains("HibernateDelaySec"));
+    S2IdleStatus {
+        mem_sleep,
+        lid_closed,
+        suspend_success,
+        suspend_fail,
+        bluetooth_unblocked,
+        noisy_wakeups,
+        hibernate_delay_configured,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -597,6 +694,44 @@ pub fn scan_optimization_targets(current_power_w: f64) -> Vec<OptimizationTarget
         });
     }
 
+    // 5. Check Bluetooth radio for s2idle sleep drain reduction
+    if crate::autopilot::is_bluetooth_unblocked() {
+        targets.push(OptimizationTarget {
+            id: "bluetooth-rfkill".to_string(),
+            display_name: "Bluetooth Radio (soft-block via rfkill for s2idle)".to_string(),
+            reason: "Turn off Bluetooth controller so it cannot prevent deep S0ix sleep residency".to_string(),
+            kind: TargetKind::BluetoothRadio,
+            unit_names: vec!["bluetooth".to_string()],
+            cgroup_paths: Vec::new(),
+            memory_mb: 0.0,
+            pids_count: 0,
+            estimated_watts: 0.45,
+            selected: true,
+        });
+    }
+
+    // 6. Check noisy ACPI USB/PCIe wakeup triggers that disturb s2idle
+    let noisy_wakeups = scan_noisy_acpi_wakeups();
+    if !noisy_wakeups.is_empty() {
+        let dev_names: Vec<String> = noisy_wakeups.into_iter().map(|(d, _)| d).collect();
+        targets.push(OptimizationTarget {
+            id: "acpi-wakeups".to_string(),
+            display_name: format!(
+                "s2idle USB/PCI Wakeup Hygiene ({} noisy triggers: {})",
+                dev_names.len(),
+                dev_names.join(", ")
+            ),
+            reason: "Disable spurious XHC/NHI/GPP ACPI wakeups so USB receivers don't wake s2idle".to_string(),
+            kind: TargetKind::AcpiWakeups,
+            unit_names: dev_names,
+            cgroup_paths: Vec::new(),
+            memory_mb: 0.0,
+            pids_count: 0,
+            estimated_watts: 0.85,
+            selected: true,
+        });
+    }
+
     targets
 }
 
@@ -758,6 +893,29 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
                     );
                 }
             }
+            TargetKind::BluetoothRadio => {
+                if crate::autopilot::set_bluetooth_blocked(true) {
+                    estimated_watts_saved += t.estimated_watts;
+                    actions_taken.push(
+                        "Soft-blocked Bluetooth radio via rfkill (~0.45 W saved & deeper s2idle)"
+                            .to_string(),
+                    );
+                } else {
+                    failed_actions.push("Failed to run `rfkill block bluetooth`".to_string());
+                }
+            }
+            TargetKind::AcpiWakeups => match disable_noisy_acpi_wakeups(&t.unit_names) {
+                Ok(n) => {
+                    estimated_watts_saved += t.estimated_watts;
+                    actions_taken.push(format!(
+                        "Disabled {n} noisy ACPI wakeup trigger(s) ({}) for deeper s2idle",
+                        t.unit_names.join(", ")
+                    ));
+                }
+                Err(e) => {
+                    failed_actions.push(e.to_string());
+                }
+            },
         }
     }
 

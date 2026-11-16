@@ -15,7 +15,8 @@ use crate::autopilot::{
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
 use crate::optimize::{
-    execute_optimizations, scan_optimization_targets, set_app_frozen, stop_or_kill_app,
+    disable_noisy_acpi_wakeups, execute_optimizations, inspect_s2idle_status,
+    scan_optimization_targets, set_app_frozen, stop_or_kill_app,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -25,7 +26,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "rustybattery",
-    version = "0.8.0",
+    version = "0.9.0",
     about = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 )]
 struct Cli {
@@ -120,6 +121,20 @@ enum Commands {
         mode: String,
         /// App name for whitelist/unwhitelist actions
         target: Option<String>,
+    },
+
+    /// Audit s2idle / lid-closed sleep drain and apply immediate system-level improvements
+    Sleep {
+        /// Immediately apply s2idle sleep optimizations (rfkill Bluetooth, ACPI wakeups, Smart Saver lid rule)
+        #[arg(long)]
+        fix: bool,
+    },
+
+    /// View the manual page or install it for `man battery` / `man rustybattery`
+    Man {
+        /// Install man pages into ~/.local/share/man/man1/
+        #[arg(long)]
+        install: bool,
     },
 }
 
@@ -317,6 +332,10 @@ pub fn run() -> Result<()> {
                         "  • Dim Keyboard on Low Battery: {}",
                         if cfg.dim_kbd_on_low_battery { "ON" } else { "OFF" }
                     );
+                    println!(
+                        "  • s2idle Lid-Close Saver:      {}",
+                        if cfg.s2idle_sleep_saver { "ON (auto-blocks BT & enforces power-saver)" } else { "OFF" }
+                    );
                     println!();
                     println!(
                         "Protected Whitelist ({}): {}",
@@ -341,6 +360,149 @@ pub fn run() -> Result<()> {
                     println!("  battery autopilot config");
                     println!("  TUI: press `A` to edit rules live, `w` to whitelist selected app");
                 }
+            }
+            Ok(())
+        }
+        Commands::Sleep { fix } => {
+            let db = Database::open(&default_db_path())?;
+            let since_24h = chrono::Utc::now().timestamp() - 24 * 3600;
+            let drain = db.get_period_drain_stats(since_24h).unwrap_or_default();
+            let mut cfg = load_autopilot_config();
+
+            if fix {
+                println!("⚡ Applying Immediate s2idle System-Level Improvements...");
+                println!("──────────────────────────────────────────────────────────────────────");
+                if !cfg.s2idle_sleep_saver {
+                    cfg.s2idle_sleep_saver = true;
+                }
+                save_autopilot_config(&cfg)?;
+                println!("  ✔ Enabled `s2idle_sleep_saver = true` in {}", config_file_path().display());
+
+                if crate::autopilot::is_bluetooth_unblocked() {
+                    if crate::autopilot::set_bluetooth_blocked(true) {
+                        println!("  ✔ Soft-blocked Bluetooth radio via `rfkill block bluetooth`");
+                    }
+                } else {
+                    println!("  ✔ Bluetooth radio is already soft-blocked (`rfkill`)");
+                }
+
+                let st = inspect_s2idle_status();
+                if !st.noisy_wakeups.is_empty() {
+                    let devs: Vec<String> = st.noisy_wakeups.iter().map(|(d, _)| d.clone()).collect();
+                    match disable_noisy_acpi_wakeups(&devs) {
+                        Ok(n) => println!(
+                            "  ✔ Disabled {n} noisy ACPI USB/PCI wakeup trigger(s): {}",
+                            devs.join(", ")
+                        ),
+                        Err(e) => {
+                            println!("  ⚠ {e}");
+                        }
+                    }
+                } else {
+                    println!("  ✔ No noisy ACPI USB/PCI wakeup triggers are enabled");
+                }
+                println!();
+            }
+
+            let st = inspect_s2idle_status();
+            println!("🌙 RustyBattery — s2idle & Lid-Closed Sleep Drain Audit");
+            println!("──────────────────────────────────────────────────────────────────────");
+            println!("Kernel Sleep Mode:    {}", st.mem_sleep);
+            println!(
+                "Laptop Lid State:     {}",
+                if st.lid_closed { "Closed" } else { "Open" }
+            );
+            println!(
+                "Suspend Cycles:       {} succeeded, {} failed",
+                st.suspend_success, st.suspend_fail
+            );
+            println!(
+                "24h Sleep Drain:      {:.1}% lost over {}h {:02}m ({:.2}%/hr)",
+                drain.sleep_drain_pct,
+                drain.sleep_secs / 3600,
+                (drain.sleep_secs % 3600) / 60,
+                drain.sleep_drain_pct_per_hr
+            );
+            println!(
+                "s2idle Lid Saver:     {}",
+                if cfg.s2idle_sleep_saver {
+                    "● ENABLED (auto-blocks BT & enforces power-saver on lid close)"
+                } else {
+                    "○ DISABLED"
+                }
+            );
+            println!(
+                "Bluetooth Radio:      {}",
+                if st.bluetooth_unblocked {
+                    "⚠ ACTIVE (can prevent deep S0ix residency; run `battery sleep --fix`)"
+                } else {
+                    "✔ Soft-blocked (0W in s2idle)"
+                }
+            );
+            if st.noisy_wakeups.is_empty() {
+                println!("Noisy ACPI Wakeups:   ✔ All noisy USB/PCI triggers disabled");
+            } else {
+                let list: Vec<String> = st
+                    .noisy_wakeups
+                    .iter()
+                    .map(|(d, n)| format!("{d} ({n})"))
+                    .collect();
+                println!(
+                    "Noisy ACPI Wakeups:   ⚠ {} enabled: {}",
+                    st.noisy_wakeups.len(),
+                    list.join(", ")
+                );
+                let devs: Vec<String> = st.noisy_wakeups.iter().map(|(d, _)| d.clone()).collect();
+                let script = devs
+                    .iter()
+                    .map(|d| format!("echo {d} > /proc/acpi/wakeup"))
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+                println!("  → Fix command:      sudo sh -c '{script}'");
+            }
+            println!(
+                "Hibernate Delay:      {}",
+                if st.hibernate_delay_configured {
+                    "✔ Configured in /etc/systemd/sleep.conf"
+                } else {
+                    "ℹ Not set (optional: set `HibernateDelaySec=2h` in /etc/systemd/sleep.conf)"
+                }
+            );
+            println!();
+            println!("Tip: Run `battery sleep --fix` or press `o` in TUI (`battery`) to apply optimizations.");
+            Ok(())
+        }
+        Commands::Man { install } => {
+            const MAN_PAGE: &str = include_str!("../man/rustybattery.1");
+            if install {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                let man_root = std::path::PathBuf::from(&home).join(".local/share/man");
+                let man_dir = man_root.join("man1");
+                std::fs::create_dir_all(&man_dir)?;
+                std::fs::write(man_dir.join("rustybattery.1"), MAN_PAGE)?;
+                std::fs::write(man_dir.join("battery.1"), ".so man1/rustybattery.1\n")?;
+                let manpath_cfg = std::path::PathBuf::from(&home).join(".manpath");
+                let man_line = format!("MANDATORY_MANPATH\t{}\n", man_root.display());
+                let existing = std::fs::read_to_string(&manpath_cfg).unwrap_or_default();
+                if !existing.contains(&man_root.display().to_string()) {
+                    let updated = format!("{existing}{man_line}");
+                    let _ = std::fs::write(&manpath_cfg, updated);
+                }
+                println!("✔ Installed manual pages to {}", man_dir.display());
+                println!("  Try: `man battery` or `man rustybattery`");
+                return Ok(());
+            }
+
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            if let Ok(mut child) = Command::new("man").arg("-l").arg("-").stdin(Stdio::piped()).spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(MAN_PAGE.as_bytes());
+                }
+                let _ = child.wait();
+            } else {
+                println!("{MAN_PAGE}");
             }
             Ok(())
         }
@@ -408,7 +570,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
 
     println!("╭────────────────────────────────────────────────────────────────────────────────────────╮");
     println!(
-        "│ 🦀 RustyBattery v0.8.0 — Per-App Power Tracker for Linux                               │"
+        "│ 🦀 RustyBattery v0.9.0 — Per-App Power Tracker for Linux                               │"
     );
     println!("├────────────────────────────────────────────────────────────────────────────────────────┤");
     println!(

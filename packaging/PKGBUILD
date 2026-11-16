@@ -1,6 +1,6 @@
 # Maintainer: b1mb4 <artemkluenkov41@gmail.com>
 pkgname=rustybattery
-pkgver=0.8.0
+pkgver=0.9.0
 pkgrel=1
 pkgdesc="RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 arch=('x86_64' 'aarch64')
@@ -20,6 +20,8 @@ package() {
   cd "$srcdir/$pkgname"
   install -Dm755 "target/release/rustybattery" "$pkgdir/usr/bin/rustybattery"
   ln -s /usr/bin/rustybattery "$pkgdir/usr/bin/battery"
+  install -Dm644 "man/rustybattery.1" "$pkgdir/usr/share/man/man1/rustybattery.1"
+  install -Dm644 "man/battery.1" "$pkgdir/usr/share/man/man1/battery.1"
   install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

@@ -2,13 +2,19 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.8.0** *(Latest)*
-- **🖥️ Screen-On Time (SoT) Tracking:** Tracks display state via sysfs backlight/DPMS (`/sys/class/backlight/*/bl_power`, `/sys/class/drm/*/dpms`) and calculates active Screen-On Time across `Since Full Charge`, `6h`, `24h`, and `7d`.
-- **🌙 Sleep / Suspend Drain Tracking:** Detects suspend/sleep intervals (`>= 90s` gaps) and calculates total sleep duration, battery `%` lost, `Wh` lost, and sleep drain rate (`%/hr`).
-- **📊 TUI, CLI & JSON Integration:** Displays **SoT** and **Sleep Drain** directly in the TUI `Period Summary & Filter [f]` bar, in `battery summary`, and under `"drain_stats"` in `battery summary --json`.
+### **Version 0.9.0** *(Latest)*
+- **🌙 `s2idle` & Lid-Closed Sleep Improvements (`battery sleep [--fix]`):**
+  - Added `battery sleep` audit command & `--fix` auto-remediation for kernel `s2idle` mode, noisy ACPI USB/PCIe wakeup triggers (`XHC*`, `NHI*`, `GPP*`, `GP1*`), Bluetooth `rfkill` state, and `HibernateDelaySec`.
+  - Added automatic **`s2idle_sleep_saver`** rule to Smart Battery Saver (enforces `power-saver`, dims keyboard backlight, and soft-blocks Bluetooth via `rfkill` on lid close, restoring Bluetooth on lid open).
+  - Added one-click Bluetooth `rfkill` and ACPI wakeup hygiene targets to `battery optimize` & the TUI `o` Optimizer modal.
+- **📖 Unix Manual Pages (`man battery` / `man rustybattery`):** Added full troff manual pages (`man/rustybattery.1`, `man/battery.1`) and `battery man [--install]`.
+- **🎨 TUI Layout Polish:** Fixed right-edge clipping on `[x] Stop` in `App Battery Details` and filter labels in `Period Summary & Filter [f]`.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.7.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.8.0)</b></summary>
+
+- **Version 0.8.0:**
+  - Screen-On Time (SoT) tracking via sysfs backlight/DPMS and Sleep/Suspend drain tracking (`%/hr`, `Wh`, `%`) across TUI, `battery summary`, and `--json`.
 
 - **Version 0.7.0:**
   - Configurable Smart Saver Rules (`~/.config/rustybattery/config.toml`) with persistent thresholds and protected app `whitelist`.

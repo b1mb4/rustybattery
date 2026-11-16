@@ -81,6 +81,8 @@ add_path_if_missing "$HOME/.zshrc"
 
 # Install and enable the 24/7 systemd user background service
 "$INSTALL_DIR/rustybattery" service install || true
+# Install local man pages (`man battery`, `man rustybattery`)
+"$INSTALL_DIR/rustybattery" man --install || true
 
 printf "\n\033[1;32m🎉 RustyBattery installed successfully!\033[0m\n"
 printf "  • Launch TUI:         \033[1;36mbattery\033[0m\n"
