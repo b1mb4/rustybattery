@@ -7,20 +7,14 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    name: Build & Check (Linux)
-    runs-on: ubuntu-latest
+  test:
+    name: Build & Test
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install SQLite3 development headers
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry & target
-        uses: Swatinem/rust-cache@v2
-
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit tests
+        run: cargo test --locked
       - name: Build release binary
         run: cargo build --release --locked

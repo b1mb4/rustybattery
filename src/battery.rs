@@ -70,6 +70,67 @@ pub struct BatterySnapshot {
     pub time_remaining_mins: Option<u32>,
     /// Whether the display is currently on (from sysfs backlight/DPMS)
     pub screen_on: bool,
+    /// Kernel boot ID (`/proc/sys/kernel/random/boot_id`), used to tell reboots/shutdowns apart from sleep
+    pub boot_id: String,
+    /// Cumulative seconds spent suspended since boot (`CLOCK_BOOTTIME - CLOCK_MONOTONIC`)
+    pub suspended_total_secs: f64,
+}
+
+fn clock_secs(clock: libc::clockid_t) -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec and `clock` is a kernel clock id.
+    let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+    if rc != 0 {
+        return 0.0;
+    }
+    ts.tv_sec as f64 + (ts.tv_nsec as f64 / 1_000_000_000.0)
+}
+
+/// Seconds since boot, excluding time spent suspended (does not jump on NTP/wall-clock changes).
+pub fn monotonic_secs() -> f64 {
+    clock_secs(libc::CLOCK_MONOTONIC)
+}
+
+/// Seconds since boot, including time spent suspended.
+pub fn boottime_secs() -> f64 {
+    clock_secs(libc::CLOCK_BOOTTIME)
+}
+
+/// Total seconds this boot has spent in suspend (s2idle / S3).
+pub fn suspended_total_secs() -> f64 {
+    (boottime_secs() - monotonic_secs()).max(0.0)
+}
+
+pub fn current_boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Estimates internal panel + backlight power draw (W) from sysfs backlight brightness.
+/// Typical 13"–16" laptop eDP panels draw ~0.8 W at minimum and ~4.5 W at full brightness.
+pub fn estimate_display_power_w() -> f64 {
+    if !is_screen_on() {
+        return 0.0;
+    }
+    let Ok(entries) = fs::read_dir("/sys/class/backlight") else {
+        return 2.0;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let cur = read_trimmed(&p.join("brightness")).and_then(|s| s.parse::<f64>().ok());
+        let max = read_trimmed(&p.join("max_brightness")).and_then(|s| s.parse::<f64>().ok());
+        if let (Some(cur), Some(max)) = (cur, max) {
+            if max > 0.0 {
+                let ratio = (cur / max).clamp(0.0, 1.0);
+                return 0.8 + 3.7 * ratio;
+            }
+        }
+    }
+    2.0
 }
 
 pub fn is_screen_on() -> bool {
@@ -327,6 +388,8 @@ pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
         ac_online,
         time_remaining_mins,
         screen_on: is_screen_on(),
+        boot_id: current_boot_id(),
+        suspended_total_secs: suspended_total_secs(),
     })
 }
 

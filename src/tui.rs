@@ -202,6 +202,7 @@ pub struct AppUi {
     pub autopilot: SmartAutopilot,
     pub battery: BatterySnapshot,
     pub history: Vec<BatteryHistoryPoint>,
+    pub raw_apps: Vec<AppSummaryRow>,
     pub apps: Vec<AppSummaryRow>,
     pub live_deltas: Vec<AppDeltaUsage>,
     pub selected_app_buckets: Vec<(i64, f64, f64)>,
@@ -221,9 +222,11 @@ pub struct AppUi {
     pub service_installed: bool,
     pub autopilot_enabled: bool,
     pub autopilot_config: AutopilotConfig,
+    pub autopilot_logs: Vec<String>,
     pub drain_stats: PeriodDrainStats,
     pub status_message: Option<(String, Instant)>,
     pub since_ts: i64,
+    pub last_full_charge_ts: i64,
     pub optimizer_modal: Option<(Vec<OptimizationTarget>, usize)>,
     pub autopilot_modal: Option<usize>,
 }
@@ -236,6 +239,8 @@ impl AppUi {
 
         let autopilot_enabled = is_autopilot_enabled(&db);
         let autopilot_config = load_autopilot_config();
+        let autopilot_logs = get_autopilot_log(&db);
+        let last_full_charge_ts = db.get_last_full_charge_ts();
         let tracker = AppEnergyTracker::new();
         let mut ui = Self {
             db,
@@ -243,6 +248,7 @@ impl AppUi {
             autopilot: SmartAutopilot::new(),
             battery,
             history: Vec::new(),
+            raw_apps: Vec::new(),
             apps: Vec::new(),
             live_deltas: Vec::new(),
             selected_app_buckets: Vec::new(),
@@ -262,9 +268,11 @@ impl AppUi {
             service_installed: is_service_file_installed(),
             autopilot_enabled,
             autopilot_config,
+            autopilot_logs,
             drain_stats: PeriodDrainStats::default(),
             status_message: None,
             since_ts: 0,
+            last_full_charge_ts,
             optimizer_modal: None,
             autopilot_modal: None,
         };
@@ -276,7 +284,7 @@ impl AppUi {
     pub fn compute_since_ts(&self) -> i64 {
         let now = chrono::Utc::now().timestamp();
         match self.window {
-            TimeWindow::SinceCharge => self.db.get_last_full_charge_ts(),
+            TimeWindow::SinceCharge => self.last_full_charge_ts,
             TimeWindow::Last6Hours => now - 6 * 3600,
             TimeWindow::Last24Hours => now - 24 * 3600,
             TimeWindow::Last7Days => now - 7 * 86400,
@@ -308,16 +316,31 @@ impl AppUi {
             self.live_deltas = deltas;
         }
 
+        self.last_full_charge_ts = self.db.get_last_full_charge_ts();
         self.since_ts = self.compute_since_ts();
         self.history = self.db.get_battery_history(self.since_ts).unwrap_or_default();
         self.drain_stats = self.db.get_period_drain_stats(self.since_ts).unwrap_or_default();
+        self.autopilot_logs = get_autopilot_log(&self.db);
 
-        let mut all_apps = self
+        self.raw_apps = self
             .db
             .get_app_breakdown(self.since_ts, &self.live_deltas)
             .unwrap_or_default();
+        self.apply_filter_and_sort();
+        Ok(())
+    }
 
-        all_apps.retain(|r| self.filter.matches(&r.category) && (r.battery_pct >= 0.005 || r.live_cpu_pct >= 0.1 || r.memory_mb >= 15.0));
+    /// Re-filters and re-sorts `self.raw_apps` in memory without querying SQLite or sysfs.
+    pub fn apply_filter_and_sort(&mut self) {
+        let mut all_apps: Vec<AppSummaryRow> = self
+            .raw_apps
+            .iter()
+            .filter(|r| {
+                self.filter.matches(&r.category)
+                    && (r.battery_pct >= 0.005 || r.live_cpu_pct >= 0.1 || r.memory_mb >= 15.0)
+            })
+            .cloned()
+            .collect();
 
         // Recompute share_of_drain_pct within category-filtered view (before search query filter)
         let total_drain: f64 = all_apps.iter().map(|a| a.battery_pct).sum();
@@ -361,8 +384,6 @@ impl AppUi {
             self.table_state.select(Some(idx));
             self.update_selected_app_buckets();
         }
-
-        Ok(())
     }
 
     pub fn update_selected_app_buckets(&mut self) {
@@ -564,45 +585,8 @@ fn run_tui_loop(
                             }
                             KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
                             KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
-                            KeyCode::Char('z') => {
-                                if let Some(idx) = app.table_state.selected() {
-                                    if let Some(sel) = app.apps.get(idx).cloned() {
-                                        let next_freeze = !sel.is_frozen;
-                                        if let Ok(msg) = set_app_frozen(&sel.app_name, next_freeze)
-                                        {
-                                            app.refresh_data(true)?;
-                                            app.status_message = Some((msg, Instant::now()));
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Char('x') => {
-                                if let Some(idx) = app.table_state.selected() {
-                                    if let Some(sel) = app.apps.get(idx).cloned() {
-                                        if let Ok(msg) = stop_or_kill_app(&sel.app_name) {
-                                            app.refresh_data(true)?;
-                                            app.status_message = Some((msg, Instant::now()));
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Char('w') => {
-                                if let Some(idx) = app.table_state.selected() {
-                                    if let Some(sel) = app.apps.get(idx).cloned() {
-                                        if let Ok(added) = toggle_app_whitelist(&sel.app_name) {
-                                            if added && sel.is_frozen {
-                                                let _ = set_app_frozen(&sel.app_name, false);
-                                            }
-                                            app.refresh_data(true)?;
-                                            let msg = if added {
-                                                format!("🛡 Whitelisted {} (protected from Smart Saver)", sel.app_name)
-                                            } else {
-                                                format!("Removed {} from Smart Saver whitelist", sel.app_name)
-                                            };
-                                            app.status_message = Some((msg, Instant::now()));
-                                        }
-                                    }
-                                }
+                            KeyCode::Char(c @ ('z' | 'x' | 'w')) => {
+                                app.handle_selected_app_action(c)?;
                             }
                             _ => {}
                         }
@@ -614,20 +598,20 @@ fn run_tui_loop(
                             KeyCode::Esc => {
                                 app.search_query.clear();
                                 app.search_active = false;
-                                app.refresh_data(false)?;
+                                app.apply_filter_and_sort();
                             }
                             KeyCode::Enter => {
                                 app.search_active = false;
                             }
                             KeyCode::Backspace => {
                                 app.search_query.pop();
-                                app.refresh_data(false)?;
+                                app.apply_filter_and_sort();
                             }
                             KeyCode::Down => app.move_selection(1),
                             KeyCode::Up => app.move_selection(-1),
                             KeyCode::Char(c) => {
                                 app.search_query.push(c);
-                                app.refresh_data(false)?;
+                                app.apply_filter_and_sort();
                             }
                             _ => {}
                         }
@@ -642,7 +626,7 @@ fn run_tui_loop(
                         KeyCode::Esc => {
                             if !app.search_query.is_empty() {
                                 app.search_query.clear();
-                                app.refresh_data(false)?;
+                                app.apply_filter_and_sort();
                             } else {
                                 return Ok(());
                             }
@@ -680,11 +664,11 @@ fn run_tui_loop(
                         }
                         KeyCode::Char('s') => {
                             app.sort_by = app.sort_by.next();
-                            app.refresh_data(false)?;
+                            app.apply_filter_and_sort();
                         }
                         KeyCode::Char('f') => {
                             app.filter = app.filter.next();
-                            app.refresh_data(false)?;
+                            app.apply_filter_and_sort();
                         }
                         KeyCode::Char('c') => {
                             let currently_shown = should_show_charts(&app, term_rect);
@@ -707,38 +691,8 @@ fn run_tui_loop(
                             let targets = scan_optimization_targets(app.battery.power_w);
                             app.optimizer_modal = Some((targets, 0));
                         }
-                        KeyCode::Char('z') => {
-                            if let Some(idx) = app.table_state.selected() {
-                                if let Some(sel) = app.apps.get(idx).cloned() {
-                                    let next_freeze = !sel.is_frozen;
-                                    match set_app_frozen(&sel.app_name, next_freeze) {
-                                        Ok(msg) => {
-                                            app.refresh_data(true)?;
-                                            app.status_message = Some((msg, Instant::now()));
-                                        }
-                                        Err(e) => {
-                                            app.status_message =
-                                                Some((format!("Freeze error: {e}"), Instant::now()));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        KeyCode::Char('x') => {
-                            if let Some(idx) = app.table_state.selected() {
-                                if let Some(sel) = app.apps.get(idx).cloned() {
-                                    match stop_or_kill_app(&sel.app_name) {
-                                        Ok(msg) => {
-                                            app.refresh_data(true)?;
-                                            app.status_message = Some((msg, Instant::now()));
-                                        }
-                                        Err(e) => {
-                                            app.status_message =
-                                                Some((format!("Stop error: {e}"), Instant::now()));
-                                        }
-                                    }
-                                }
-                            }
+                        KeyCode::Char(c @ ('z' | 'x' | 'w')) => {
+                            app.handle_selected_app_action(c)?;
                         }
                         KeyCode::Char('a') => {
                             let next_state = !app.autopilot_enabled;
@@ -752,24 +706,6 @@ fn run_tui_loop(
                         KeyCode::Char('A') => {
                             app.autopilot_config = load_autopilot_config();
                             app.autopilot_modal = Some(0);
-                        }
-                        KeyCode::Char('w') => {
-                            if let Some(idx) = app.table_state.selected() {
-                                if let Some(sel) = app.apps.get(idx).cloned() {
-                                    if let Ok(added) = toggle_app_whitelist(&sel.app_name) {
-                                        if added && sel.is_frozen {
-                                            let _ = set_app_frozen(&sel.app_name, false);
-                                        }
-                                        app.refresh_data(true)?;
-                                        let msg = if added {
-                                            format!("🛡 Whitelisted {} (protected from Smart Saver)", sel.app_name)
-                                        } else {
-                                            format!("Removed {} from Smart Saver whitelist", sel.app_name)
-                                        };
-                                        app.status_message = Some((msg, Instant::now()));
-                                    }
-                                }
-                            }
                         }
                         KeyCode::Char('r') => {
                             app.refresh_data(true)?;
@@ -859,7 +795,7 @@ fn run_tui_loop(
                                 app.refresh_data(false)?;
                             } else if in_rect(app.filter_area) {
                                 app.filter = app.filter.next();
-                                app.refresh_data(false)?;
+                                app.apply_filter_and_sort();
                             } else if in_rect(app.table_area) {
                                 let header_end = app.table_area.y.saturating_add(2);
                                 let bottom_edge = app
@@ -1131,7 +1067,7 @@ fn draw_battery_header(f: &mut Frame, app: &AppUi, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(sub_info), left_rows[1]);
 
-    let last_charge_ts = app.db.get_last_full_charge_ts();
+    let last_charge_ts = app.last_full_charge_ts;
     let hours_ago = ((chrono::Utc::now().timestamp() - last_charge_ts).max(0) as f64) / 3600.0;
 
     let daemon_span = if app.daemon_running {
@@ -2545,14 +2481,14 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
         bottom_cols[0],
     );
 
-    let logs = get_autopilot_log(&app.db);
+    let logs = &app.autopilot_logs;
     let log_items: Vec<ListItem> = if logs.is_empty() {
         vec![ListItem::new(Span::styled(
             " No Smart Saver actions recorded yet.",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        logs.into_iter()
+        logs.iter()
             .take(8)
             .map(|entry| {
                 ListItem::new(Span::styled(
@@ -2584,4 +2520,71 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
         Span::styled(": Close", Style::default().fg(Color::Gray)),
     ]);
     f.render_widget(Paragraph::new(help_line), chunks[3]);
+}
+
+impl AppUi {
+    fn handle_selected_app_action(&mut self, action: char) -> Result<()> {
+        let Some(idx) = self.table_state.selected() else {
+            return Ok(());
+        };
+        let Some(sel) = self.apps.get(idx).cloned() else {
+            return Ok(());
+        };
+        match action {
+            'z' => match set_app_frozen(&sel.app_name, !sel.is_frozen) {
+                Ok(msg) => {
+                    self.refresh_data(true)?;
+                    self.status_message = Some((msg, Instant::now()));
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Freeze error: {e}"), Instant::now()));
+                }
+            },
+            'x' => match stop_or_kill_app(&sel.app_name) {
+                Ok(msg) => {
+                    self.refresh_data(true)?;
+                    self.status_message = Some((msg, Instant::now()));
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Stop error: {e}"), Instant::now()));
+                }
+            },
+            'w' => {
+                if let Ok(added) = toggle_app_whitelist(&sel.app_name) {
+                    if added && sel.is_frozen {
+                        let _ = set_app_frozen(&sel.app_name, false);
+                    }
+                    self.refresh_data(true)?;
+                    let msg = if added {
+                        format!(
+                            "🛡 Whitelisted {} (protected from Smart Saver)",
+                            sel.app_name
+                        )
+                    } else {
+                        format!("Removed {} from Smart Saver whitelist", sel.app_name)
+                    };
+                    self.status_message = Some((msg, Instant::now()));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn category_filter_matches_expected_groups() {
+        assert!(CategoryFilter::All.matches("Browser"));
+        assert!(CategoryFilter::All.matches("System"));
+        assert!(CategoryFilter::UserAppsOnly.matches("Browser"));
+        assert!(CategoryFilter::UserAppsOnly.matches("Development"));
+        assert!(!CategoryFilter::UserAppsOnly.matches("System"));
+        assert!(CategoryFilter::SystemAndDesktop.matches("System"));
+        assert!(CategoryFilter::SystemAndDesktop.matches("Desktop UI"));
+        assert!(!CategoryFilter::SystemAndDesktop.matches("Browser"));
+    }
 }

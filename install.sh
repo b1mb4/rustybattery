@@ -12,24 +12,6 @@ printf "\033[1;36m🦀 Installing RustyBattery — Per-App Power Tracker for Lin
 
 mkdir -p "$INSTALL_DIR"
 
-ensure_sqlite_dev() {
-    if ldconfig -p 2>/dev/null | grep -q "libsqlite3.so"; then
-        return 0
-    fi
-    printf "\033[1;33mChecking SQLite3 shared library...\033[0m\n"
-    if command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y sqlite-devel
-    elif command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-    elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -Sy --noconfirm sqlite
-    elif command -v zypper >/dev/null 2>&1; then
-        sudo zypper install -y sqlite3-devel
-    elif command -v apk >/dev/null 2>&1; then
-        sudo apk add sqlite-dev
-    fi
-}
-
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/rustybattery-linux-${ARCH}.tar.gz"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -51,7 +33,6 @@ fi
 
 if [ "$INSTALLED_PREBUILT" -eq 0 ]; then
     printf "Building RustyBattery from source with Cargo...\n"
-    ensure_sqlite_dev
     if ! command -v cargo >/dev/null 2>&1; then
         printf "\033[1;33mRust/Cargo not found. Installing via rustup...\033[0m\n"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

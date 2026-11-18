@@ -16,7 +16,8 @@ use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
 use crate::optimize::{
     disable_noisy_acpi_wakeups, execute_optimizations, inspect_s2idle_status,
-    scan_optimization_targets, set_app_frozen, stop_or_kill_app,
+    scan_disabled_noisy_acpi_wakeups, scan_optimization_targets, set_acpi_wakeups_state,
+    set_app_frozen, stop_or_kill_app,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,7 +27,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     name = "rustybattery",
-    version = "0.9.0",
+    version,
     about = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 )]
 struct Cli {
@@ -128,6 +129,9 @@ enum Commands {
         /// Immediately apply s2idle sleep optimizations (rfkill Bluetooth, ACPI wakeups, Smart Saver lid rule)
         #[arg(long)]
         fix: bool,
+        /// Revert s2idle optimizations (re-enable ACPI wakeups & unblock Bluetooth)
+        #[arg(long)]
+        undo: bool,
     },
 
     /// View the manual page or install it for `man battery` / `man rustybattery`
@@ -150,6 +154,10 @@ enum ServiceAction {
     Uninstall,
     /// Check the status of the background collector service and database
     Status,
+    /// Downsample old samples (>7d) and prune expired history (>90d)
+    Prune,
+    /// Reset accumulated per-app usage buckets (keeps battery curve)
+    ResetStats,
 }
 
 pub fn run() -> Result<()> {
@@ -243,6 +251,32 @@ pub fn run() -> Result<()> {
                         "DISABLED"
                     }
                 );
+                let st = db.stats();
+                println!(
+                    "Database Size:   {:.1} KB ({} battery rows, {} app buckets, {} sleep sessions)",
+                    (st.file_size_bytes as f64) / 1024.0,
+                    st.battery_rows,
+                    st.app_rows,
+                    st.sleep_sessions
+                );
+                Ok(())
+            }
+            ServiceAction::Prune => {
+                let db = Database::open(&default_db_path())?;
+                let rep = db.prune(chrono::Utc::now().timestamp())?;
+                println!(
+                    "✔ Pruned database: downsampled {} rows, deleted {} old battery rows & {} old app buckets{}",
+                    rep.downsampled_rows,
+                    rep.deleted_battery_rows,
+                    rep.deleted_app_rows,
+                    if rep.vacuumed { " (VACUUM completed)" } else { "" }
+                );
+                Ok(())
+            }
+            ServiceAction::ResetStats => {
+                let db = Database::open(&default_db_path())?;
+                let n = db.reset_app_usage()?;
+                println!("✔ Cleared {n} per-app usage bucket(s). Fresh attribution started.");
                 Ok(())
             }
         },
@@ -363,13 +397,33 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Sleep { fix } => {
+        Commands::Sleep { fix, undo } => {
             let db = Database::open(&default_db_path())?;
             let since_24h = chrono::Utc::now().timestamp() - 24 * 3600;
             let drain = db.get_period_drain_stats(since_24h).unwrap_or_default();
             let mut cfg = load_autopilot_config();
 
-            if fix {
+            if undo {
+                println!("↩ Reverting s2idle Sleep Optimizations...");
+                println!("──────────────────────────────────────────────────────────────────────");
+                if crate::autopilot::set_bluetooth_blocked(false) {
+                    println!("  ✔ Unblocked Bluetooth radio (`rfkill unblock bluetooth`)");
+                }
+                let disabled = scan_disabled_noisy_acpi_wakeups();
+                if !disabled.is_empty() {
+                    let devs: Vec<String> = disabled.into_iter().map(|(d, _)| d).collect();
+                    match set_acpi_wakeups_state(&devs, true) {
+                        Ok(n) => println!(
+                            "  ✔ Re-enabled {n} ACPI wakeup trigger(s): {}",
+                            devs.join(", ")
+                        ),
+                        Err(e) => println!("  ⚠ {e}"),
+                    }
+                } else {
+                    println!("  ✔ All ACPI USB/PCI wakeup triggers are already enabled");
+                }
+                println!();
+            } else if fix {
                 println!("⚡ Applying Immediate s2idle System-Level Improvements...");
                 println!("──────────────────────────────────────────────────────────────────────");
                 if !cfg.s2idle_sleep_saver {
@@ -468,8 +522,25 @@ pub fn run() -> Result<()> {
                     "ℹ Not set (optional: set `HibernateDelaySec=2h` in /etc/systemd/sleep.conf)"
                 }
             );
+            let sessions = db.get_sleep_sessions(5);
+            if !sessions.is_empty() {
+                println!();
+                println!("Recent Recorded Sleep Sessions:");
+                for s in sessions {
+                    let dur_m = s.duration_secs() / 60;
+                    println!(
+                        "  • {}h {:02}m — {:.1}% → {:.1}% (-{:.1}%, {:.2}%/hr)",
+                        dur_m / 60,
+                        dur_m % 60,
+                        s.start_pct,
+                        s.end_pct,
+                        s.drain_pct(),
+                        s.drain_pct_per_hr()
+                    );
+                }
+            }
             println!();
-            println!("Tip: Run `battery sleep --fix` or press `o` in TUI (`battery`) to apply optimizations.");
+            println!("Tip: Run `battery sleep --fix` (or `--undo` to revert), or press `o` in TUI (`battery`).");
             Ok(())
         }
         Commands::Man { install } => {
@@ -570,7 +641,11 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
 
     println!("╭────────────────────────────────────────────────────────────────────────────────────────╮");
     println!(
-        "│ 🦀 RustyBattery v0.9.0 — Per-App Power Tracker for Linux                               │"
+        "│ 🦀 {:<83} │",
+        format!(
+            "RustyBattery v{} — Per-App Power Tracker for Linux",
+            env!("CARGO_PKG_VERSION")
+        )
     );
     println!("├────────────────────────────────────────────────────────────────────────────────────────┤");
     println!(

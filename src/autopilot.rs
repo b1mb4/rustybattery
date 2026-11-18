@@ -6,17 +6,21 @@ use crate::optimize::{
 };
 use anyhow::{Context, Result};
 use chrono::Local;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime};
 
 const META_AUTOPILOT_ENABLED: &str = "autopilot_enabled";
 const META_LAST_AUTOPILOT_ACTION: &str = "autopilot_last_action";
 const META_AUTOPILOT_LOG: &str = "autopilot_action_log";
+const META_BT_BLOCKED_BY_SLEEP: &str = "autopilot_bt_blocked_for_sleep";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct AutopilotConfig {
     pub enabled: bool,
     pub auto_switch_power_profile: bool,
@@ -28,6 +32,12 @@ pub struct AutopilotConfig {
     pub dim_kbd_on_low_battery: bool,
     pub s2idle_sleep_saver: bool,
     pub whitelist: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ConfigFileWrapper {
+    #[serde(default)]
+    smart_saver: AutopilotConfig,
 }
 
 impl Default for AutopilotConfig {
@@ -59,105 +69,74 @@ pub fn config_file_path() -> PathBuf {
     dir.join("config.toml")
 }
 
+static CONFIG_CACHE: Mutex<Option<(Option<SystemTime>, AutopilotConfig)>> = Mutex::new(None);
+
+pub fn parse_config_str(content: &str) -> AutopilotConfig {
+    let mut cfg = if let Ok(wrapped) = toml::from_str::<ConfigFileWrapper>(content) {
+        if content.contains("[smart_saver]") {
+            wrapped.smart_saver
+        } else {
+            toml::from_str::<AutopilotConfig>(content).unwrap_or_default()
+        }
+    } else {
+        toml::from_str::<AutopilotConfig>(content).unwrap_or_default()
+    };
+    cfg.idle_freeze_mins = cfg.idle_freeze_mins.clamp(1, 120);
+    cfg.idle_power_threshold_w = cfg.idle_power_threshold_w.clamp(0.2, 10.0);
+    cfg.low_battery_pct = cfg.low_battery_pct.clamp(5.0, 80.0);
+    cfg.critical_battery_pct = cfg
+        .critical_battery_pct
+        .clamp(3.0, (cfg.low_battery_pct - 2.0).max(3.0));
+    cfg
+}
+
+pub fn format_config_str(cfg: &AutopilotConfig) -> String {
+    let wrapper = ConfigFileWrapper {
+        smart_saver: cfg.clone(),
+    };
+    let body = toml::to_string_pretty(&wrapper).unwrap_or_default();
+    format!(
+        "# RustyBattery Smart Battery Saver Configuration\n\
+         # Edit here or press Shift+A in the `battery` TUI.\n\n\
+         {body}"
+    )
+}
+
 pub fn load_autopilot_config() -> AutopilotConfig {
     let path = config_file_path();
-    let Ok(content) = fs::read_to_string(&path) else {
-        let cfg = AutopilotConfig::default();
-        let _ = save_autopilot_config(&cfg);
-        return cfg;
+    let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if let Ok(guard) = CONFIG_CACHE.lock() {
+        if let Some((cached_mtime, cached_cfg)) = &*guard {
+            if *cached_mtime == mtime && mtime.is_some() {
+                return cached_cfg.clone();
+            }
+        }
+    }
+
+    let cfg = match fs::read_to_string(&path) {
+        Ok(content) => parse_config_str(&content),
+        Err(_) => {
+            let def = AutopilotConfig::default();
+            let _ = save_autopilot_config(&def);
+            return def;
+        }
     };
 
-    let mut cfg = AutopilotConfig::default();
-    for raw_line in content.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with('[') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let key = k.trim();
-        let val = v.trim();
-        match key {
-            "enabled" => cfg.enabled = val == "true" || val == "1",
-            "auto_switch_power_profile" => {
-                cfg.auto_switch_power_profile = val == "true" || val == "1"
-            }
-            "auto_freeze_enabled" => cfg.auto_freeze_enabled = val == "true" || val == "1",
-            "idle_freeze_mins" => {
-                if let Ok(n) = val.parse::<u64>() {
-                    cfg.idle_freeze_mins = n.clamp(1, 120);
-                }
-            }
-            "idle_power_threshold_w" => {
-                if let Ok(w) = val.parse::<f64>() {
-                    cfg.idle_power_threshold_w = w.clamp(0.2, 10.0);
-                }
-            }
-            "low_battery_pct" => {
-                if let Ok(p) = val.parse::<f64>() {
-                    cfg.low_battery_pct = p.clamp(5.0, 50.0);
-                }
-            }
-            "critical_battery_pct" => {
-                if let Ok(p) = val.parse::<f64>() {
-                    cfg.critical_battery_pct = p.clamp(3.0, 30.0);
-                }
-            }
-            "dim_kbd_on_low_battery" => {
-                cfg.dim_kbd_on_low_battery = val == "true" || val == "1"
-            }
-            "s2idle_sleep_saver" => {
-                cfg.s2idle_sleep_saver = val == "true" || val == "1"
-            }
-            "whitelist" => {
-                let trimmed = val.trim_start_matches('[').trim_end_matches(']');
-                cfg.whitelist = trimmed
-                    .split(',')
-                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-            _ => {}
-        }
+    if let Ok(mut guard) = CONFIG_CACHE.lock() {
+        *guard = Some((mtime, cfg.clone()));
     }
     cfg
 }
 
 pub fn save_autopilot_config(cfg: &AutopilotConfig) -> Result<()> {
     let path = config_file_path();
-    let wl_items: Vec<String> = cfg
-        .whitelist
-        .iter()
-        .map(|s| format!("\"{}\"", s.replace('"', "")))
-        .collect();
-    let content = format!(
-        "# RustyBattery Smart Battery Saver Configuration\n\
-         # Edit here or press Shift+A in the `battery` TUI.\n\n\
-         [smart_saver]\n\
-         enabled = {}\n\
-         auto_switch_power_profile = {}\n\
-         auto_freeze_enabled = {}\n\
-         idle_freeze_mins = {}\n\
-         idle_power_threshold_w = {:.2}\n\
-         low_battery_pct = {:.0}\n\
-         critical_battery_pct = {:.0}\n\
-         dim_kbd_on_low_battery = {}\n\
-         s2idle_sleep_saver = {}\n\
-         whitelist = [{}]\n",
-        cfg.enabled,
-        cfg.auto_switch_power_profile,
-        cfg.auto_freeze_enabled,
-        cfg.idle_freeze_mins,
-        cfg.idle_power_threshold_w,
-        cfg.low_battery_pct,
-        cfg.critical_battery_pct,
-        cfg.dim_kbd_on_low_battery,
-        cfg.s2idle_sleep_saver,
-        wl_items.join(", ")
-    );
+    let content = format_config_str(cfg);
     fs::write(&path, content)
         .with_context(|| format!("Failed to write config at {}", path.display()))?;
+    let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if let Ok(mut guard) = CONFIG_CACHE.lock() {
+        *guard = Some((mtime, cfg.clone()));
+    }
     Ok(())
 }
 
@@ -319,8 +298,6 @@ impl SmartAutopilot {
                 };
                 record_autopilot_action(db, &action);
             }
-        } else if on_battery && cfg.auto_switch_power_profile {
-            let _ = set_system_power_profile(true);
         }
         self.last_ac_online = Some(snap.ac_online);
 
@@ -581,4 +558,53 @@ fn send_autopilot_notification(summary: &str, body: &str) {
             body,
         ])
         .status();
+}
+
+/// Invoked immediately by the logind `PrepareForSleep` D-Bus listener when entering or waking from sleep.
+pub fn handle_sleep_transition(db: &Database, entering_sleep: bool, on_battery: bool) {
+    let cfg = load_autopilot_config();
+    if !cfg.enabled || !cfg.s2idle_sleep_saver {
+        return;
+    }
+    if entering_sleep {
+        let _ = set_system_power_profile(true);
+        let _ = dim_keyboard_backlight();
+        let mut bt_note = "";
+        if on_battery && is_bluetooth_unblocked() && set_bluetooth_blocked(true) {
+            let _ = db.set_meta(META_BT_BLOCKED_BY_SLEEP, "1");
+            bt_note = " & soft-blocked Bluetooth";
+        }
+        record_autopilot_action(
+            db,
+            &format!("🌙 Entering s2idle sleep → enforced power-saver{bt_note}"),
+        );
+    } else if db.get_meta(META_BT_BLOCKED_BY_SLEEP).as_deref() == Some("1") {
+        let _ = set_bluetooth_blocked(false);
+        let _ = db.delete_meta(META_BT_BLOCKED_BY_SLEEP);
+        record_autopilot_action(db, "☀️ Woke from sleep → restored Bluetooth radio");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_roundtrip_preserves_special_app_names() {
+        let mut cfg = AutopilotConfig::default();
+        cfg.idle_freeze_mins = 15;
+        cfg.idle_power_threshold_w = 1.25;
+        cfg.s2idle_sleep_saver = false;
+        cfg.whitelist = vec![
+            "Spotify".to_string(),
+            "App, With Comma & #Hash".to_string(),
+        ];
+
+        let serialized = format_config_str(&cfg);
+        let parsed = parse_config_str(&serialized);
+        assert_eq!(parsed, cfg);
+        assert!(is_app_whitelisted(&parsed, "spotify"));
+        assert!(is_app_whitelisted(&parsed, "App, With Comma & #Hash"));
+        assert!(!is_app_whitelisted(&parsed, "Waterfox"));
+    }
 }

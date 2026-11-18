@@ -50,10 +50,13 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
         let _ = db.record_battery_snapshot(&initial_bat);
     }
 
+    spawn_logind_sleep_monitor(db_path.clone());
+
     let mut tracker = AppEnergyTracker::new();
     let mut notif_monitor = NotificationMonitor::new(22.0);
     let mut autopilot = SmartAutopilot::new();
     let sleep_dur = Duration::from_secs(interval_secs.max(1));
+    let mut prev_snap = read_battery_snapshot().ok();
 
     println!(
         "rustybattery daemon started (sampling every {}s -> {})",
@@ -66,8 +69,23 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
 
         let now = chrono::Utc::now().timestamp();
         let _ = db.set_meta("daemon_heartbeat_ts", &now.to_string());
+        let _ = db.prune_if_due(now);
 
         if let Ok(snap) = read_battery_snapshot() {
+            if let Some(prev) = &prev_snap {
+                let slept = snap.suspended_total_secs - prev.suspended_total_secs;
+                if snap.boot_id == prev.boot_id && slept >= 30.0 {
+                    let _ = db.record_sleep_session(&crate::db::SleepSession {
+                        start_ts: prev.timestamp,
+                        end_ts: snap.timestamp,
+                        start_pct: prev.capacity_pct,
+                        end_pct: snap.capacity_pct,
+                        start_wh: prev.energy_now_wh,
+                        end_wh: snap.energy_now_wh,
+                        on_battery: prev.status.is_discharging() || snap.status.is_discharging(),
+                    });
+                }
+            }
             let _ = db.record_battery_snapshot(&snap);
             let (deltas, _) = tracker.sample_delta(
                 snap.power_w,
@@ -77,8 +95,74 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
             let _ = db.record_app_deltas(&deltas);
             notif_monitor.evaluate(&snap, &deltas);
             autopilot.evaluate(&db, &snap, &deltas);
+            prev_snap = Some(snap);
         }
     }
+}
+
+/// Listens to `systemd-logind` `PrepareForSleep(bool)` via `gdbus monitor` so pre-sleep actions
+/// (blocking Bluetooth, enforcing `power-saver`, dimming keyboard) run before the kernel suspends.
+fn spawn_logind_sleep_monitor(db_path: PathBuf) {
+    thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+
+        let Ok(mut child) = Command::new("gdbus")
+            .args([
+                "monitor",
+                "--system",
+                "--dest",
+                "org.freedesktop.login1",
+                "--object-path",
+                "/org/freedesktop/login1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+
+        let Some(stdout) = child.stdout.take() else {
+            return;
+        };
+        let Ok(db) = Database::open(&db_path) else {
+            return;
+        };
+        let mut pre_sleep_snap: Option< crate::battery::BatterySnapshot> = None;
+
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.contains("PrepareForSleep (true,)") || line.contains("PrepareForSleep (true)") {
+                if let Ok(snap) = read_battery_snapshot() {
+                    let on_bat = !snap.ac_online && snap.status.is_discharging();
+                    crate::autopilot::handle_sleep_transition(&db, true, on_bat);
+                    let _ = db.record_battery_snapshot(&snap);
+                    pre_sleep_snap = Some(snap);
+                }
+            } else if line.contains("PrepareForSleep (false,)")
+                || line.contains("PrepareForSleep (false)")
+            {
+                if let Ok(snap) = read_battery_snapshot() {
+                    let on_bat = !snap.ac_online && snap.status.is_discharging();
+                    crate::autopilot::handle_sleep_transition(&db, false, on_bat);
+                    let _ = db.record_battery_snapshot(&snap);
+                    if let Some(start) = pre_sleep_snap.take() {
+                        if snap.timestamp - start.timestamp >= 30 {
+                            let _ = db.record_sleep_session(&crate::db::SleepSession {
+                                start_ts: start.timestamp,
+                                end_ts: snap.timestamp,
+                                start_pct: start.capacity_pct,
+                                end_pct: snap.capacity_pct,
+                                start_wh: start.energy_now_wh,
+                                end_wh: snap.energy_now_wh,
+                                on_battery: start.status.is_discharging() || on_bat,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 pub fn install_systemd_service(interval_secs: u64) -> Result<String> {

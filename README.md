@@ -2,16 +2,25 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.9.0** *(Latest)*
-- **🌙 `s2idle` & Lid-Closed Sleep Improvements (`battery sleep [--fix]`):**
-  - Added `battery sleep` audit command & `--fix` auto-remediation for kernel `s2idle` mode, noisy ACPI USB/PCIe wakeup triggers (`XHC*`, `NHI*`, `GPP*`, `GP1*`), Bluetooth `rfkill` state, and `HibernateDelaySec`.
-  - Added automatic **`s2idle_sleep_saver`** rule to Smart Battery Saver (enforces `power-saver`, dims keyboard backlight, and soft-blocks Bluetooth via `rfkill` on lid close, restoring Bluetooth on lid open).
-  - Added one-click Bluetooth `rfkill` and ACPI wakeup hygiene targets to `battery optimize` & the TUI `o` Optimizer modal.
-- **📖 Unix Manual Pages (`man battery` / `man rustybattery`):** Added full troff manual pages (`man/rustybattery.1`, `man/battery.1`) and `battery man [--install]`.
-- **🎨 TUI Layout Polish:** Fixed right-edge clipping on `[x] Stop` in `App Battery Details` and filter labels in `Period Summary & Filter [f]`.
+### **Version 0.10.0** *(Latest)*
+- **⚡ Accurate Power Attribution v2 & Monotonic Clocks:**
+  - Switched sample timing to `CLOCK_MONOTONIC` & `CLOCK_BOOTTIME` (`suspended_total_secs`) and capped awake intervals at `15s` so suspend/sleep intervals never inflate per-app drain (`>100%`).
+  - Splits discharging power across **Display & Backlight** (estimated from `/sys/class/backlight/*/brightness`), **System Idle / SoC Baseline**, and active applications; removed fabricated bootstrap history and the `8.5W` fallback.
+  - Sleep detection now verifies `boot_id` and kernel `suspended_secs` so reboots, shutdowns, and collector downtime are never miscounted as sleep.
+- **🌙 Logind `PrepareForSleep` Hook, Sleep History & Idempotent ACPI Wakeups:**
+  - Added real-time `org.freedesktop.login1` `PrepareForSleep(true/false)` D-Bus monitoring in the daemon so `s2idle` pre-sleep optimizations run immediately before suspend and record per-session sleep history (`battery sleep`).
+  - Made ACPI wakeup toggling idempotent (re-checks `/proc/acpi/wakeup` before writing), opt-in in `battery optimize`, and reversible via `battery sleep --undo`.
+- **🗄️ Bundled SQLite (`rusqlite`), Daily Retention & `toml` Config:**
+  - Replaced raw SQLite FFI with statically bundled `rusqlite` (zero `libsqlite3-dev` system requirement) and `toml` + `serde` config parsing with `mtime` caching.
+  - Added automatic daily database retention (`>7d` downsampled to 1/min, `>90d` pruned) plus `battery service prune` and `battery service reset-stats`.
+- **🚀 Hot-Path & TUI Optimizations + Unit Tests & CI:**
+  - Eliminated redundant `cgroup.procs` sysfs reads (~25% fewer file reads/tick), added recursive `.slice` lookup for freeze/stop/focus, made TUI search/sort/filter instantaneous in-memory, downsampled 7d charts, and added 13 unit tests + GitHub Actions CI.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.8.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.9.0)</b></summary>
+
+- **Version 0.9.0:**
+  - Added `battery sleep [--fix]` audit & `s2idle_sleep_saver` lid-close rule, Unix manual pages (`man battery` / `man rustybattery`), and TUI layout clipping fixes.
 
 - **Version 0.8.0:**
   - Screen-On Time (SoT) tracking via sysfs backlight/DPMS and Sleep/Suspend drain tracking (`%/hr`, `Wh`, `%`) across TUI, `battery summary`, and `--json`.

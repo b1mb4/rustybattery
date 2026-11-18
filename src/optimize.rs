@@ -30,13 +30,11 @@ pub struct S2IdleStatus {
     pub hibernate_delay_configured: bool,
 }
 
-pub fn scan_noisy_acpi_wakeups() -> Vec<(String, String)> {
-    let Ok(content) = fs::read_to_string("/proc/acpi/wakeup") else {
-        return Vec::new();
-    };
+pub fn parse_noisy_acpi_wakeups(content: &str, want_enabled: bool) -> Vec<(String, String)> {
+    let marker = if want_enabled { "*enabled" } else { "*disabled" };
     let mut out = Vec::new();
     for line in content.lines().skip(1) {
-        if !line.contains("*enabled") {
+        if !line.contains(marker) {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -57,20 +55,59 @@ pub fn scan_noisy_acpi_wakeups() -> Vec<(String, String)> {
     out
 }
 
-pub fn disable_noisy_acpi_wakeups(devices: &[String]) -> Result<usize> {
+pub fn scan_noisy_acpi_wakeups() -> Vec<(String, String)> {
+    let Ok(content) = fs::read_to_string("/proc/acpi/wakeup") else {
+        return Vec::new();
+    };
+    parse_noisy_acpi_wakeups(&content, true)
+}
+
+pub fn scan_disabled_noisy_acpi_wakeups() -> Vec<(String, String)> {
+    let Ok(content) = fs::read_to_string("/proc/acpi/wakeup") else {
+        return Vec::new();
+    };
+    parse_noisy_acpi_wakeups(&content, false)
+}
+
+/// Idempotently sets noisy ACPI wakeup devices to `target_enabled` (`false` = disable, `true` = enable),
+/// checking `/proc/acpi/wakeup` before writing so calling it twice never flips devices the wrong way.
+pub fn set_acpi_wakeups_state(devices: &[String], target_enabled: bool) -> Result<usize> {
+    let current_matching: Vec<String> = if target_enabled {
+        scan_disabled_noisy_acpi_wakeups()
+    } else {
+        scan_noisy_acpi_wakeups()
+    }
+    .into_iter()
+    .map(|(d, _)| d)
+    .filter(|d| devices.iter().any(|req| req == d))
+    .collect();
+
+    if current_matching.is_empty() {
+        return Ok(0);
+    }
+
     let mut toggled = 0usize;
-    for dev in devices {
+    for dev in &current_matching {
         if fs::write("/proc/acpi/wakeup", format!("{dev}\n")).is_ok() {
             toggled += 1;
         }
     }
-    if toggled == devices.len() {
+    if toggled == current_matching.len() {
         return Ok(toggled);
     }
 
-    let script = devices
+    let check_marker = if target_enabled {
+        "\\*disabled"
+    } else {
+        "\\*enabled"
+    };
+    let script = current_matching
         .iter()
-        .map(|d| format!("echo {d} > /proc/acpi/wakeup"))
+        .map(|d| {
+            format!(
+                "(grep -q '^{d}[[:space:]].*{check_marker}' /proc/acpi/wakeup && echo {d} > /proc/acpi/wakeup || true)"
+            )
+        })
         .collect::<Vec<_>>()
         .join(" && ");
     if let Ok(out) = Command::new("sudo")
@@ -78,13 +115,19 @@ pub fn disable_noisy_acpi_wakeups(devices: &[String]) -> Result<usize> {
         .output()
     {
         if out.status.success() {
-            return Ok(devices.len());
+            return Ok(current_matching.len());
         }
     }
-    anyhow::bail!(
-        "Disabling ACPI wakeups requires root. Run:\n  sudo sh -c '{}'",
-        script
-    )
+    let verb = if target_enabled {
+        "Re-enabling"
+    } else {
+        "Disabling"
+    };
+    anyhow::bail!("{verb} ACPI wakeups requires root. Run:\n  sudo sh -c \"{script}\"")
+}
+
+pub fn disable_noisy_acpi_wakeups(devices: &[String]) -> Result<usize> {
+    set_acpi_wakeups_state(devices, false)
 }
 
 pub fn inspect_s2idle_status() -> S2IdleStatus {
@@ -339,7 +382,38 @@ pub fn stop_or_kill_app(app_name: &str) -> Result<String> {
     )
 }
 
-/// Finds all active cgroup directories (`pids.current > 0`) that normalize to `target_app_name`.
+fn collect_matching_cgroup_dirs(
+    slice_dir: &Path,
+    slice_type: &str,
+    target_app_name: &str,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(slice_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let unit_name = entry.file_name().to_string_lossy().to_string();
+        if unit_name.ends_with(".slice") {
+            collect_matching_cgroup_dirs(&path, slice_type, target_app_name, out);
+            continue;
+        }
+        if let Some((app_name, _)) = crate::apps::normalize_cgroup_unit(&unit_name, slice_type) {
+            if app_name.eq_ignore_ascii_case(target_app_name) {
+                let pids = read_u64_file(&path.join("pids.current"));
+                if pids > 0 {
+                    out.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Finds all active cgroup directories (`pids.current > 0`) that normalize to `target_app_name`,
+/// recursing into nested `.slice` subdirectories.
 pub fn find_app_cgroup_dirs(target_app_name: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let uid = unsafe { libc::getuid() };
@@ -353,26 +427,7 @@ pub fn find_app_cgroup_dirs(target_app_name: &str) -> Vec<PathBuf> {
         (user_base.join("background.slice"), "background"),
         (PathBuf::from("/sys/fs/cgroup/system.slice"), "system"),
     ] {
-        let Ok(entries) = fs::read_dir(&slice_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let unit_name = entry.file_name().to_string_lossy().to_string();
-            if let Some((app_name, _)) =
-                crate::apps::normalize_cgroup_unit(&unit_name, slice_type)
-            {
-                if app_name.eq_ignore_ascii_case(target_app_name) {
-                    let pids = read_u64_file(&path.join("pids.current"));
-                    if pids > 0 {
-                        out.push(path);
-                    }
-                }
-            }
-        }
+        collect_matching_cgroup_dirs(&slice_dir, slice_type, target_app_name, &mut out);
     }
     out
 }
@@ -721,14 +776,14 @@ pub fn scan_optimization_targets(current_power_w: f64) -> Vec<OptimizationTarget
                 dev_names.len(),
                 dev_names.join(", ")
             ),
-            reason: "Disable spurious XHC/NHI/GPP ACPI wakeups so USB receivers don't wake s2idle".to_string(),
+            reason: "Opt-in: disable XHC/NHI/GPP ACPI wakeups (note: may disable external USB keyboard wake)".to_string(),
             kind: TargetKind::AcpiWakeups,
             unit_names: dev_names,
             cgroup_paths: Vec::new(),
             memory_mb: 0.0,
             pids_count: 0,
             estimated_watts: 0.85,
-            selected: true,
+            selected: false,
         });
     }
 
@@ -968,5 +1023,35 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
         freed_memory_mb,
         stopped_pids,
         estimated_watts_saved,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_noisy_acpi_wakeups_while_ignoring_lid_and_power_button() {
+        let sample = "\
+Device\tS-state\t  Status   Sysfs node
+LID0\t  S4\t*enabled   platform:PNP0C0D:00
+PWRB\t  S4\t*enabled   platform:PNP0C0C:00
+XHC0\t  S4\t*enabled   pci:0000:73:00.3
+XHC1\t  S4\t*disabled  pci:0000:73:00.4
+NHI1\t  S0\t*enabled   pci:0000:74:00.6
+";
+        let enabled = parse_noisy_acpi_wakeups(sample, true);
+        assert_eq!(
+            enabled,
+            vec![
+                ("XHC0".to_string(), "pci:0000:73:00.3".to_string()),
+                ("NHI1".to_string(), "pci:0000:74:00.6".to_string()),
+            ]
+        );
+        let disabled = parse_noisy_acpi_wakeups(sample, false);
+        assert_eq!(
+            disabled,
+            vec![("XHC1".to_string(), "pci:0000:73:00.4".to_string())]
+        );
     }
 }
