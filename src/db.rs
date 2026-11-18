@@ -303,15 +303,21 @@ impl Database {
                  value TEXT NOT NULL
              );",
         )?;
-        // Seamless schema migrations for older databases (errors = column already exists)
-        for stmt in [
-            "ALTER TABLE app_usage_buckets ADD COLUMN focused_battery_pct REAL NOT NULL DEFAULT 0.0;",
-            "ALTER TABLE app_usage_buckets ADD COLUMN focused_secs REAL NOT NULL DEFAULT 0.0;",
-            "ALTER TABLE battery_samples ADD COLUMN screen_on INTEGER NOT NULL DEFAULT 1;",
-            "ALTER TABLE battery_samples ADD COLUMN boot_id TEXT NOT NULL DEFAULT '';",
-            "ALTER TABLE battery_samples ADD COLUMN suspended_secs REAL NOT NULL DEFAULT -1;",
-        ] {
-            let _ = self.conn.execute_batch(stmt);
+        let user_ver: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if user_ver < 1 {
+            for stmt in [
+                "ALTER TABLE app_usage_buckets ADD COLUMN focused_battery_pct REAL NOT NULL DEFAULT 0.0;",
+                "ALTER TABLE app_usage_buckets ADD COLUMN focused_secs REAL NOT NULL DEFAULT 0.0;",
+                "ALTER TABLE battery_samples ADD COLUMN screen_on INTEGER NOT NULL DEFAULT 1;",
+                "ALTER TABLE battery_samples ADD COLUMN boot_id TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE battery_samples ADD COLUMN suspended_secs REAL NOT NULL DEFAULT -1;",
+            ] {
+                let _ = self.conn.execute_batch(stmt);
+            }
+            let _ = self.conn.execute_batch("PRAGMA user_version = 1;");
         }
         Ok(())
     }
@@ -372,15 +378,29 @@ impl Database {
     }
 
     pub fn record_battery_snapshot(&self, snap: &BatterySnapshot) -> Result<()> {
-        // Remember the moment the battery was last (near) full while plugged in
-        if (snap.capacity_pct >= 90.0 && !snap.status.is_discharging())
+        let full_threshold = snap
+            .charge_limit_pct
+            .unwrap_or(95)
+            .saturating_sub(2)
+            .max(50) as f64;
+        if (snap.capacity_pct >= full_threshold && !snap.status.is_discharging())
             || snap.status == BatteryStatus::Full
         {
             let _ = self.set_meta("last_full_charge_ts", &snap.timestamp.to_string());
         }
 
+        let prev_discharging = self.get_meta("last_sample_discharging").as_deref() == Some("1");
+        let now_discharging = snap.status.is_discharging();
+        if now_discharging && !prev_discharging {
+            let _ = self.set_meta("last_unplug_ts", &snap.timestamp.to_string());
+        }
+        let _ = self.set_meta(
+            "last_sample_discharging",
+            if now_discharging { "1" } else { "0" },
+        );
+
         self.conn.execute(
-            "INSERT OR REPLACE INTO battery_samples
+            "INSERT OR IGNORE INTO battery_samples
              (timestamp, capacity_pct, status, power_w, energy_now_wh, energy_full_wh, voltage_v,
               screen_on, boot_id, suspended_secs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -452,35 +472,75 @@ impl Database {
         Ok(())
     }
 
-    /// Timestamp the battery was last unplugged at (near) full charge.
-    /// Falls back to the last 24 hours while plugged in or when no recent full charge is known.
+    /// Timestamp the battery was last unplugged or reached full/charge-limit capacity.
+    /// Falls back to the last 24 hours when no recent charge/unplug event is recorded.
     pub fn get_last_full_charge_ts(&self) -> i64 {
         let now = chrono::Utc::now().timestamp();
         let fallback = now - 24 * 3600;
+        let week_ago = now - 7 * 24 * 3600;
+
+        if let Some(unplug_ts) = self
+            .get_meta("last_unplug_ts")
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            if unplug_ts >= week_ago && unplug_ts <= now {
+                return unplug_ts;
+            }
+        }
+
+        if let Some(full_ts) = self
+            .get_meta("last_full_charge_ts")
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            if full_ts >= week_ago && now - full_ts >= 60 {
+                return full_ts;
+            }
+        }
+
         let ts: Option<i64> = self
             .conn
             .query_row(
                 "SELECT MAX(timestamp) FROM battery_samples
-                 WHERE capacity_pct >= 90.0 AND status != 'Discharging' AND timestamp >= ?1",
-                [now - 7 * 24 * 3600],
+                 WHERE capacity_pct >= 78.0 AND status != 'Discharging' AND timestamp >= ?1",
+                [week_ago],
                 |r| r.get(0),
             )
             .ok()
             .flatten();
         match ts {
-            // Currently sitting on the charger → show the last 24h so active apps are visible
-            Some(t) if now - t < 15 * 60 => fallback,
-            Some(t) if now - t >= 15 * 60 => t,
+            Some(t) if now - t >= 60 => t,
             _ => fallback,
         }
     }
 
     pub fn get_battery_history(&self, since_ts: i64) -> Result<Vec<BatteryHistoryPoint>> {
+        let now = chrono::Utc::now().timestamp();
+        let span = (now - since_ts).max(60);
+        let bucket_secs = (span / 500).max(1);
+        if bucket_secs <= 5 {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT timestamp, capacity_pct, status, power_w
+                 FROM battery_samples WHERE timestamp >= ?1 ORDER BY timestamp ASC",
+            )?;
+            let rows = stmt.query_map([since_ts], |r| {
+                Ok(BatteryHistoryPoint {
+                    timestamp: r.get(0)?,
+                    capacity_pct: r.get(1)?,
+                    status: r.get(2)?,
+                    power_w: r.get(3)?,
+                })
+            })?;
+            return Ok(rows.filter_map(|r| r.ok()).collect());
+        }
+
         let mut stmt = self.conn.prepare_cached(
-            "SELECT timestamp, capacity_pct, status, power_w
-             FROM battery_samples WHERE timestamp >= ?1 ORDER BY timestamp ASC",
+            "SELECT MAX(timestamp), AVG(capacity_pct), MAX(status), AVG(power_w)
+             FROM battery_samples
+             WHERE timestamp >= ?1
+             GROUP BY timestamp / ?2
+             ORDER BY MAX(timestamp) ASC",
         )?;
-        let rows = stmt.query_map([since_ts], |r| {
+        let rows = stmt.query_map(params![since_ts, bucket_secs], |r| {
             Ok(BatteryHistoryPoint {
                 timestamp: r.get(0)?,
                 capacity_pct: r.get(1)?,
@@ -488,18 +548,7 @@ impl Database {
                 power_w: r.get(3)?,
             })
         })?;
-        let all: Vec<BatteryHistoryPoint> = rows.filter_map(|r| r.ok()).collect();
-        if all.len() <= 600 {
-            return Ok(all);
-        }
-        let step = (all.len() / 600).max(1);
-        let mut out: Vec<BatteryHistoryPoint> = all.iter().step_by(step).cloned().collect();
-        if let Some(last) = all.last() {
-            if out.last().map(|p| p.timestamp) != Some(last.timestamp) {
-                out.push(last.clone());
-            }
-        }
-        Ok(out)
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn get_period_drain_stats(&self, since_ts: i64) -> Result<PeriodDrainStats> {
@@ -571,7 +620,7 @@ impl Database {
     ) -> Result<Vec<AppSummaryRow>> {
         let bucket_cutoff = (since_ts / 300) * 300;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT app_name, category, unit_hint,
+            "SELECT app_name, MAX(category), MAX(unit_hint),
                     SUM(battery_pct), SUM(focused_battery_pct), SUM(focused_secs),
                     SUM(energy_wh), SUM(cpu_secs), SUM(active_secs),
                     MAX(peak_power_w), AVG(memory_mb), MAX(pids_count)
@@ -692,7 +741,7 @@ impl Database {
 
         let total = report.downsampled_rows + report.deleted_battery_rows + report.deleted_app_rows;
         if total > 20_000 {
-            self.exec("VACUUM;")?;
+            let _ = self.exec("PRAGMA incremental_vacuum(200);");
             report.vacuumed = true;
         }
         self.set_meta("last_prune_ts", &now_ts.to_string())?;

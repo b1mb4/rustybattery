@@ -74,6 +74,8 @@ pub struct BatterySnapshot {
     pub boot_id: String,
     /// Cumulative seconds spent suspended since boot (`CLOCK_BOOTTIME - CLOCK_MONOTONIC`)
     pub suspended_total_secs: f64,
+    /// Optional battery charge limit threshold (`charge_control_end_threshold`, e.g. 80%)
+    pub charge_limit_pct: Option<u8>,
 }
 
 fn clock_secs(clock: libc::clockid_t) -> f64 {
@@ -113,7 +115,11 @@ pub fn current_boot_id() -> String {
 /// Estimates internal panel + backlight power draw (W) from sysfs backlight brightness.
 /// Typical 13"–16" laptop eDP panels draw ~0.8 W at minimum and ~4.5 W at full brightness.
 pub fn estimate_display_power_w() -> f64 {
-    if !is_screen_on() {
+    estimate_display_power_w_with(is_screen_on())
+}
+
+pub fn estimate_display_power_w_with(screen_on: bool) -> f64 {
+    if !screen_on {
         return 0.0;
     }
     let Ok(entries) = fs::read_dir("/sys/class/backlight") else {
@@ -264,9 +270,10 @@ pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
     let mut total_energy_design_wh = 0.0;
     let mut total_power_w = 0.0;
     let mut max_cycles = 0u32;
-    let mut avg_voltage_v = 0.0;
+    let mut voltage_sum_v = 0.0;
     let mut cap_sum = 0u64;
     let mut overall_status = BatteryStatus::Unknown;
+    let mut charge_limit_pct: Option<u8> = None;
 
     for bat_dir in &bat_dirs {
         let status_raw =
@@ -281,11 +288,18 @@ pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
         let cap = read_u64(&bat_dir.join("capacity")).unwrap_or(0).min(100);
         cap_sum += cap;
 
+        if let Some(lim) = read_u64(&bat_dir.join("charge_control_end_threshold")) {
+            let lim_u8 = lim.min(100) as u8;
+            if lim_u8 > 0 {
+                charge_limit_pct = Some(lim_u8);
+            }
+        }
+
         let voltage_uv = read_u64(&bat_dir.join("voltage_now"))
             .or_else(|| read_u64(&bat_dir.join("voltage_min_design")))
             .unwrap_or(12_000_000);
         let voltage_v = (voltage_uv as f64 / 1_000_000.0).clamp(3.0, 30.0);
-        avg_voltage_v = voltage_v;
+        voltage_sum_v += voltage_v;
 
         let e_now = if let Some(e_uwh) = read_u64(&bat_dir.join("energy_now")) {
             e_uwh as f64 / 1_000_000.0
@@ -334,7 +348,9 @@ pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
         }
     }
 
-    let capacity_int = (cap_sum / (bat_dirs.len().max(1) as u64)).min(100) as u8;
+    let bat_count = bat_dirs.len().max(1);
+    let capacity_int = (cap_sum / (bat_count as u64)).min(100) as u8;
+    let avg_voltage_v = voltage_sum_v / (bat_count as f64);
 
     let capacity_pct = if total_energy_full_wh > 1.0 && total_energy_now_wh > 0.0 {
         ((total_energy_now_wh / total_energy_full_wh) * 100.0).clamp(0.0, 100.0)
@@ -390,6 +406,7 @@ pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
         screen_on: is_screen_on(),
         boot_id: current_boot_id(),
         suspended_total_secs: suspended_total_secs(),
+        charge_limit_pct,
     })
 }
 
@@ -417,11 +434,17 @@ pub fn load_upower_history(energy_full_wh: f64) -> Vec<UpowerHistoryPoint> {
         return Vec::new();
     };
 
+    let mut sorted_files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    sorted_files.sort();
+
     let mut charge_file: Option<PathBuf> = None;
     let mut rate_file: Option<PathBuf> = None;
 
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
+    for path in sorted_files {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
         // Exclude peripheral batteries like phones/controllers/mice
         if name.contains("iPhone")
             || name.contains("Controller")
@@ -435,9 +458,9 @@ pub fn load_upower_history(energy_full_wh: f64) -> Vec<UpowerHistoryPoint> {
             continue;
         }
         if name.starts_with("history-charge-") && name.ends_with(".dat") {
-            charge_file = Some(entry.path());
+            charge_file = Some(path);
         } else if name.starts_with("history-rate-") && name.ends_with(".dat") {
-            rate_file = Some(entry.path());
+            rate_file = Some(path);
         }
     }
 
@@ -491,12 +514,12 @@ pub fn load_upower_history(energy_full_wh: f64) -> Vec<UpowerHistoryPoint> {
                                     } else if (t2 - ts).abs() < 180 {
                                         w2
                                     } else {
-                                        10.0
+                                        0.0
                                     }
                                 }
                                 (Some(&(t1, w1)), None) if (ts - t1).abs() < 180 => w1,
                                 (None, Some(&(t2, w2))) if (t2 - ts).abs() < 180 => w2,
-                                _ => 10.0,
+                                _ => 0.0,
                             }
                         }
                     };

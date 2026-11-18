@@ -16,8 +16,19 @@ DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/rustybattery-l
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+NO_SERVICE=0
+NO_PATH=0
+FROM_SOURCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-service) NO_SERVICE=1 ;;
+        --no-path) NO_PATH=1 ;;
+        --from-source) FROM_SOURCE=1 ;;
+    esac
+done
+
 INSTALLED_PREBUILT=0
-if [ "${1:-}" != "--from-source" ] && command -v curl >/dev/null 2>&1; then
+if [ "$FROM_SOURCE" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     printf "Checking for pre-built binary (%s)...\n" "$ARCH"
     if curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/rustybattery.tar.gz" 2>/dev/null; then
         tar -xzf "$TMP_DIR/rustybattery.tar.gz" -C "$TMP_DIR"
@@ -57,11 +68,15 @@ add_path_if_missing() {
     fi
 }
 
-add_path_if_missing "$HOME/.bashrc"
-add_path_if_missing "$HOME/.zshrc"
+if [ "$NO_PATH" -eq 0 ]; then
+    add_path_if_missing "$HOME/.bashrc"
+    add_path_if_missing "$HOME/.zshrc"
+fi
 
-# Install and enable the 24/7 systemd user background service
-"$INSTALL_DIR/rustybattery" service install || true
+if [ "$NO_SERVICE" -eq 0 ]; then
+    # Install and enable the 24/7 systemd user background service
+    "$INSTALL_DIR/rustybattery" service install || true
+fi
 # Install local man pages (`man battery`, `man rustybattery`)
 "$INSTALL_DIR/rustybattery" man --install || true
 

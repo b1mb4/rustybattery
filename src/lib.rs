@@ -2,22 +2,25 @@ pub mod apps;
 pub mod autopilot;
 pub mod battery;
 pub mod db;
+pub mod guards;
 pub mod optimize;
+pub mod power;
 pub mod service;
 pub mod statusbar;
 pub mod tui;
 
-use crate::apps::AppEnergyTracker;
+use crate::apps::{detect_focused_apps, AppEnergyTracker, Focus};
 use crate::autopilot::{
     config_file_path, get_autopilot_log, get_last_autopilot_action, is_app_whitelisted,
     is_autopilot_enabled, load_autopilot_config, save_autopilot_config, set_autopilot_enabled,
+    thaw_persisted_frozen_apps, try_parse_config_str, AutopilotConfig,
 };
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
 use crate::optimize::{
     disable_noisy_acpi_wakeups, execute_optimizations, inspect_s2idle_status,
     scan_disabled_noisy_acpi_wakeups, scan_optimization_targets, set_acpi_wakeups_state,
-    set_app_frozen, stop_or_kill_app,
+    set_app_frozen, stop_or_kill_app, thaw_all_user_cgroups,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -64,6 +67,10 @@ enum Commands {
         /// Preview detected optimization targets without stopping them
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip interactive confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Freeze (0% CPU Deep Sleep) a running user application without closing its windows
@@ -72,10 +79,14 @@ enum Commands {
         app: String,
     },
 
-    /// Unfreeze / resume a frozen application
+    /// Unfreeze / resume a frozen application (or pass `--all` to thaw all frozen user cgroups)
     Resume {
         /// Application name (e.g., "Waterfox", "Obsidian")
-        app: String,
+        app: Option<String>,
+
+        /// Thaw all frozen cgroups under the current user's slice tree
+        #[arg(long)]
+        all: bool,
     },
 
     /// Stop or kill all processes/units belonging to an application
@@ -122,6 +133,12 @@ enum Commands {
         mode: String,
         /// App name for whitelist/unwhitelist actions
         target: Option<String>,
+        /// Validate config.toml syntax and report errors (`battery autopilot config --check`)
+        #[arg(long)]
+        check: bool,
+        /// Write a fresh default config.toml (`battery autopilot config --init`)
+        #[arg(long)]
+        init: bool,
     },
 
     /// Audit s2idle / lid-closed sleep drain and apply immediate system-level improvements
@@ -133,6 +150,9 @@ enum Commands {
         #[arg(long)]
         undo: bool,
     },
+
+    /// Check system capabilities (cgroup v2, focus detection, RAPL, power profiles, logind, config)
+    Doctor,
 
     /// View the manual page or install it for `man battery` / `man rustybattery`
     Man {
@@ -173,16 +193,25 @@ pub fn run() -> Result<()> {
             tui::run_tui(db)
         }
         Commands::Summary { hours, top, json } => print_summary(hours, top, json),
-        Commands::Optimize { dry_run } => run_cli_optimize(dry_run),
+        Commands::Optimize { dry_run, yes } => run_cli_optimize(dry_run, yes),
         Commands::Freeze { app } => {
             let msg = set_app_frozen(&app, true)?;
             println!("{msg}");
             Ok(())
         }
-        Commands::Resume { app } => {
-            let msg = set_app_frozen(&app, false)?;
-            println!("{msg}");
-            Ok(())
+        Commands::Resume { app, all } => {
+            if all || app.is_none() {
+                let db = Database::open(&default_db_path())?;
+                let n = thaw_all_user_cgroups() + thaw_persisted_frozen_apps(&db);
+                println!("▶ Resumed all frozen user applications ({n} cgroup unit(s) thawed).");
+                Ok(())
+            } else if let Some(name) = app {
+                let msg = set_app_frozen(&name, false)?;
+                println!("{msg}");
+                Ok(())
+            } else {
+                Ok(())
+            }
         }
         Commands::Stop { app } => {
             let msg = stop_or_kill_app(&app)?;
@@ -280,21 +309,20 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
-        Commands::Autopilot { mode, target } => {
+        Commands::Autopilot {
+            mode,
+            target,
+            check,
+            init,
+        } => {
             let db = Database::open(&default_db_path())?;
             match mode.to_lowercase().as_str() {
                 "on" | "enable" | "true" | "1" => {
                     let msg = set_autopilot_enabled(&db, true)?;
-                    let mut cfg = load_autopilot_config();
-                    cfg.enabled = true;
-                    let _ = save_autopilot_config(&cfg);
                     println!("✔ {msg}");
                 }
                 "off" | "disable" | "false" | "0" => {
                     let msg = set_autopilot_enabled(&db, false)?;
-                    let mut cfg = load_autopilot_config();
-                    cfg.enabled = false;
-                    let _ = save_autopilot_config(&cfg);
                     println!("✔ {msg}");
                 }
                 "whitelist" => {
@@ -328,11 +356,29 @@ pub fn run() -> Result<()> {
                 }
                 "config" => {
                     let path = config_file_path();
-                    let cfg = load_autopilot_config();
-                    save_autopilot_config(&cfg)?;
+                    if init {
+                        let def = AutopilotConfig::default();
+                        save_autopilot_config(&def)?;
+                        println!("✔ Initialized default config at {}", path.display());
+                        return Ok(());
+                    }
+                    if check {
+                        let raw = std::fs::read_to_string(&path)?;
+                        let cfg = try_parse_config_str(&raw)?;
+                        println!(
+                            "✔ Config at {} is valid (enabled={}, auto_freeze={}, whitelist={})",
+                            path.display(),
+                            cfg.enabled,
+                            cfg.auto_freeze_enabled,
+                            cfg.whitelist.len()
+                        );
+                        return Ok(());
+                    }
                     println!("Config Path: {}", path.display());
                     if let Ok(raw) = std::fs::read_to_string(&path) {
                         println!("\n{raw}");
+                    } else {
+                        println!("(not created yet — run `battery autopilot config --init` to create)");
                     }
                 }
                 _ => {
@@ -543,6 +589,7 @@ pub fn run() -> Result<()> {
             println!("Tip: Run `battery sleep --fix` (or `--undo` to revert), or press `o` in TUI (`battery`).");
             Ok(())
         }
+        Commands::Doctor => run_doctor(),
         Commands::Man { install } => {
             const MAN_PAGE: &str = include_str!("../man/rustybattery.1");
             if install {
@@ -583,16 +630,15 @@ pub fn run() -> Result<()> {
 fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
     let db = Database::open(&default_db_path())?;
     let bat = read_battery_snapshot()?;
-    db.ensure_initial_seed(&bat)?;
-    db.record_battery_snapshot(&bat)?;
+    let daemon_active = service::is_daemon_active(&db);
+    if !daemon_active {
+        db.ensure_initial_seed(&bat)?;
+    }
 
     let mut tracker = AppEnergyTracker::new();
     thread::sleep(Duration::from_millis(250));
     let (live_deltas, _) =
         tracker.sample_delta(bat.power_w, bat.energy_full_wh, bat.status.is_discharging());
-    if !service::is_daemon_active(&db) {
-        let _ = db.record_app_deltas(&live_deltas);
-    }
 
     let since_ts = if hours == 0 {
         db.get_last_full_charge_ts()
@@ -724,7 +770,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_cli_optimize(dry_run: bool) -> Result<()> {
+fn run_cli_optimize(dry_run: bool, yes: bool) -> Result<()> {
     let bat = read_battery_snapshot()?;
     let targets = scan_optimization_targets(bat.power_w);
 
@@ -747,17 +793,20 @@ fn run_cli_optimize(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let total_watts: f64 = targets.iter().map(|t| t.estimated_watts).sum();
-    let total_ram: f64 = targets.iter().map(|t| t.memory_mb).sum();
-    let total_pids: u32 = targets.iter().map(|t| t.pids_count).sum();
+    let selected_targets: Vec<_> = targets.iter().filter(|t| t.selected).collect();
+    let total_watts: f64 = selected_targets.iter().map(|t| t.estimated_watts).sum();
+    let total_ram: f64 = selected_targets.iter().map(|t| t.memory_mb).sum();
+    let total_pids: u32 = selected_targets.iter().map(|t| t.pids_count).sum();
 
-    println!("  Detected {} background battery hog(s):", targets.len());
+    println!("  Detected {} candidate(s) ([x] = selected by default, [ ] = opt-in in TUI `o`):", targets.len());
     println!("  ──────────────────────────────────────────────────────────────────────────────");
     for (i, t) in targets.iter().enumerate() {
+        let mark = if t.selected { "[x]" } else { "[ ]" };
         if t.memory_mb > 0.0 {
             println!(
-                "  {:>2}. {:<36} ~{:>4.2} W   {:>5.0} MB RAM   ({:>3} threads)",
+                "  {:>2}. {} {:<34} ~{:>4.2} W est.  {:>5.0} MB RAM   ({:>3} threads)",
                 i + 1,
+                mark,
                 t.display_name,
                 t.estimated_watts,
                 t.memory_mb,
@@ -765,23 +814,36 @@ fn run_cli_optimize(dry_run: bool) -> Result<()> {
             );
         } else {
             println!(
-                "  {:>2}. {:<36} ~{:>4.2} W   (System Power Profile)",
+                "  {:>2}. {} {:<34} ~{:>4.2} W est.  (System Power Tunable)",
                 i + 1,
+                mark,
                 t.display_name,
                 t.estimated_watts
             );
         }
-        println!("      └─ {}", t.reason);
+        println!("          └─ {}", t.reason);
     }
     println!();
     println!(
-        "  Potential Savings: ~{:.2} W power reduction  •  {:.0} MB RAM  •  {} background threads",
+        "  Selected Savings (est.): ~{:.2} W reduction  •  {:.0} MB RAM  •  {} threads",
         total_watts, total_ram, total_pids
     );
 
-    if dry_run {
-        println!("\n  (Dry-run mode: no services were stopped. Run `battery optimize` to apply.)");
+    if dry_run || selected_targets.is_empty() {
+        println!("\n  (Dry-run / no default targets selected. Run `battery` and press `o` to pick targets interactively.)");
         return Ok(());
+    }
+
+    if !yes && unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
+        use std::io::{self, Write};
+        print!("\n  Proceed with applying {} selected optimization(s)? [y/N]: ", selected_targets.len());
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input);
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("  Cancelled.");
+            return Ok(());
+        }
     }
 
     println!("\n  Applying optimizations...");
@@ -796,23 +858,124 @@ fn run_cli_optimize(dry_run: bool) -> Result<()> {
 
     println!();
     if !report.actions_taken.is_empty() {
-        let new_power = (bat.power_w - report.estimated_watts_saved).max(4.5);
+        let new_power = (bat.power_w - report.estimated_watts_saved).max(1.0);
         let old_mins = if bat.power_w > 0.5 {
             (bat.energy_now_wh / bat.power_w) * 60.0
         } else {
             0.0
         };
-        let new_mins = (bat.energy_now_wh / new_power) * 60.0;
+        let new_mins = if bat.power_w > 0.5 {
+            (bat.energy_now_wh / new_power) * 60.0
+        } else {
+            0.0
+        };
         let gained_mins = (new_mins - old_mins).max(0.0).round() as u32;
 
         println!(
-            "  🎉 Done! Freed {:.0} MB RAM, stopped {} threads, saved ~{:.1} W (est. +{}m extra battery time).",
+            "  🎉 Done! Freed {:.0} MB RAM, stopped {} threads, saved ~{:.1} W est. (+{}m est. battery time).",
             report.freed_memory_mb,
             report.stopped_pids,
             report.estimated_watts_saved,
             gained_mins
         );
     }
+
+    Ok(())
+}
+
+fn run_doctor() -> Result<()> {
+    println!("🩺 RustyBattery v{} — System Capabilities & Health Doctor", env!("CARGO_PKG_VERSION"));
+    println!("──────────────────────────────────────────────────────────────────────");
+
+    match read_battery_snapshot() {
+        Ok(bat) => {
+            println!(
+                "✔ Battery sysfs:        {} ({} {}, {:.1}% · {:.2} W, charge limit: {})",
+                bat.device_name,
+                bat.manufacturer,
+                bat.model_name,
+                bat.capacity_pct,
+                bat.power_w,
+                bat.charge_limit_pct
+                    .map(|l| format!("{l}%"))
+                    .unwrap_or_else(|| "none/100%".to_string())
+            );
+        }
+        Err(e) => println!("✖ Battery sysfs:        ERROR ({e})"),
+    }
+
+    let uid = unsafe { libc::getuid() };
+    let app_slice = std::path::PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice"
+    ));
+    if app_slice.exists() {
+        println!("✔ cgroup v2 hierarchy:  {} (available, cgroup.freeze supported)", app_slice.display());
+    } else {
+        println!("⚠ cgroup v2 hierarchy:  user app.slice not found (using /proc + SIGSTOP fallback)");
+    }
+
+    match detect_focused_apps() {
+        Focus::Known(set) => {
+            let list: Vec<_> = set.into_iter().collect();
+            println!("✔ Window Focus:         Known (currently focused: {})", list.join(", "));
+        }
+        Focus::Unknown => {
+            println!("⚠ Window Focus:         Unknown (auto-freeze will fail-closed / stay disabled)");
+        }
+    }
+
+    let rapl_path = std::path::Path::new("/sys/class/powercap/intel-rapl:0/energy_uj");
+    if std::fs::read_to_string(rapl_path).is_ok() {
+        println!("✔ Hardware RAPL:        readable ({})", rapl_path.display());
+    } else if rapl_path.exists() {
+        println!("ℹ Hardware RAPL:        present but root-only ({})", rapl_path.display());
+    } else {
+        println!("ℹ Hardware RAPL:        not exposed on this platform");
+    }
+
+    match crate::power::get_power_profile() {
+        Some((backend, prof)) => {
+            println!("✔ Power Profile:        {backend} (active: {prof})");
+        }
+        None => {
+            println!("⚠ Power Profile:        neither powerprofilesctl nor tuned-adm detected");
+        }
+    }
+
+    let s2 = inspect_s2idle_status();
+    println!(
+        "✔ Sleep & Wakeups:      mode={}, lid={}, noisy ACPI wakeups enabled={}",
+        s2.mem_sleep,
+        if s2.lid_closed { "closed" } else { "open" },
+        s2.noisy_wakeups.len()
+    );
+
+    let cfg_path = config_file_path();
+    if cfg_path.exists() {
+        match std::fs::read_to_string(&cfg_path).and_then(|s| {
+            try_parse_config_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }) {
+            Ok(cfg) => println!(
+                "✔ Config validation:    {} (valid, auto_freeze={})",
+                cfg_path.display(),
+                cfg.auto_freeze_enabled
+            ),
+            Err(e) => println!("✖ Config validation:    {} ({e})", cfg_path.display()),
+        }
+    } else {
+        println!("✔ Config validation:    using defaults ({} not created yet)", cfg_path.display());
+    }
+
+    let db = Database::open(&default_db_path())?;
+    let st = db.stats();
+    println!(
+        "✔ SQLite Database:      {} ({:.1} KB, {} samples, {} app buckets, daemon active={})",
+        db.path.display(),
+        (st.file_size_bytes as f64) / 1024.0,
+        st.battery_rows,
+        st.app_rows,
+        service::is_daemon_active(&db)
+    );
 
     Ok(())
 }

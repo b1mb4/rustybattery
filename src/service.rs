@@ -1,15 +1,32 @@
 use crate::apps::AppEnergyTracker;
-use crate::autopilot::SmartAutopilot;
+use crate::autopilot::{thaw_persisted_frozen_apps, SmartAutopilot};
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
-use crate::statusbar::NotificationMonitor;
+use crate::optimize::thaw_all_user_cgroups;
+use crate::statusbar::{write_cached_status, NotificationMonitor};
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
+
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub fn install_signal_handlers() {
+    let handler = handle_shutdown_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+}
 
 pub fn systemd_unit_path() -> PathBuf {
     let config_dir = dirs::config_dir()
@@ -26,9 +43,14 @@ pub fn systemd_unit_path() -> PathBuf {
 
 pub fn is_daemon_active(db: &Database) -> bool {
     let now = chrono::Utc::now().timestamp();
+    let interval = db
+        .get_meta("daemon_interval_secs")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(5);
+    let max_age = (interval * 3 + 5).max(20);
     if let Some(hb_str) = db.get_meta("daemon_heartbeat_ts") {
         if let Ok(hb) = hb_str.parse::<i64>() {
-            if (now - hb).abs() <= 20 {
+            if (now - hb).abs() <= max_age {
                 return true;
             }
         }
@@ -42,8 +64,13 @@ pub fn is_service_file_installed() -> bool {
 
 /// Runs the continuous background collector daemon.
 pub fn run_daemon(interval_secs: u64) -> Result<()> {
+    install_signal_handlers();
     let db_path = default_db_path();
     let db = Database::open(&db_path)?;
+    let _ = thaw_persisted_frozen_apps(&db);
+
+    let effective_interval = interval_secs.clamp(2, 60);
+    let _ = db.set_meta("daemon_interval_secs", &effective_interval.to_string());
 
     if let Ok(initial_bat) = read_battery_snapshot() {
         let _ = db.ensure_initial_seed(&initial_bat);
@@ -52,11 +79,12 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
 
     spawn_logind_sleep_monitor(db_path.clone());
 
-    let mut tracker = AppEnergyTracker::new();
+    let mut tracker = AppEnergyTracker::with_interval(effective_interval);
     let mut notif_monitor = NotificationMonitor::new(22.0);
     let mut autopilot = SmartAutopilot::new();
-    let sleep_dur = Duration::from_secs(interval_secs.max(1));
+    let sleep_dur = Duration::from_secs(effective_interval);
     let mut prev_snap = read_battery_snapshot().ok();
+    let mut smoothed_power_w: Option<f64> = None;
 
     println!(
         "rustybattery daemon started (sampling every {}s -> {})",
@@ -64,14 +92,18 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
         db_path.display()
     );
 
-    loop {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
         thread::sleep(sleep_dur);
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            break;
+        }
 
         let now = chrono::Utc::now().timestamp();
         let _ = db.set_meta("daemon_heartbeat_ts", &now.to_string());
         let _ = db.prune_if_due(now);
 
         if let Ok(snap) = read_battery_snapshot() {
+            let mut effective_power_w = snap.power_w;
             if let Some(prev) = &prev_snap {
                 let slept = snap.suspended_total_secs - prev.suspended_total_secs;
                 if snap.boot_id == prev.boot_id && slept >= 30.0 {
@@ -84,20 +116,41 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
                         end_wh: snap.energy_now_wh,
                         on_battery: prev.status.is_discharging() || snap.status.is_discharging(),
                     });
+                } else if snap.status.is_discharging()
+                    && prev.status.is_discharging()
+                    && prev.energy_now_wh > snap.energy_now_wh
+                {
+                    let dt = (snap.timestamp - prev.timestamp).max(1) as f64;
+                    if dt <= 60.0 {
+                        let e_rate_w = ((prev.energy_now_wh - snap.energy_now_wh) * 3600.0) / dt;
+                        if e_rate_w > 0.5 && e_rate_w < 120.0 {
+                            effective_power_w = 0.5 * snap.power_w + 0.5 * e_rate_w;
+                        }
+                    }
                 }
             }
+            let power_for_tick = match smoothed_power_w {
+                Some(prev_w) if snap.status.is_discharging() => 0.7 * effective_power_w + 0.3 * prev_w,
+                _ => effective_power_w,
+            };
+            smoothed_power_w = Some(power_for_tick);
+
             let _ = db.record_battery_snapshot(&snap);
             let (deltas, _) = tracker.sample_delta(
-                snap.power_w,
+                power_for_tick,
                 snap.energy_full_wh,
                 snap.status.is_discharging(),
             );
             let _ = db.record_app_deltas(&deltas);
+            let _ = write_cached_status(&snap, &deltas);
             notif_monitor.evaluate(&snap, &deltas);
             autopilot.evaluate(&db, &snap, &deltas);
             prev_snap = Some(snap);
         }
     }
+
+    autopilot.thaw_all(&db);
+    Ok(())
 }
 
 /// Listens to `systemd-logind` `PrepareForSleep(bool)` via `gdbus monitor` so pre-sleep actions
@@ -201,7 +254,8 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart={} daemon --interval {}
+ExecStart={exe} daemon --interval {interval}
+ExecStopPost={exe} resume --all
 Restart=always
 RestartSec=5
 Nice=10
@@ -209,8 +263,8 @@ Nice=10
 [Install]
 WantedBy=default.target
 ",
-        exe_to_use.display(),
-        interval_secs.max(2)
+        exe = exe_to_use.display(),
+        interval = interval_secs.clamp(2, 60)
     );
 
     fs::write(&unit_path, unit_content)
@@ -239,6 +293,7 @@ WantedBy=default.target
 }
 
 pub fn uninstall_systemd_service() -> Result<String> {
+    let _ = thaw_all_user_cgroups();
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "--now", "rustybattery.service"])
         .output();

@@ -229,6 +229,7 @@ pub struct AppUi {
     pub last_full_charge_ts: i64,
     pub optimizer_modal: Option<(Vec<OptimizationTarget>, usize)>,
     pub autopilot_modal: Option<usize>,
+    pub confirm_stop_app: Option<String>,
 }
 
 impl AppUi {
@@ -236,6 +237,10 @@ impl AppUi {
         let battery = read_battery_snapshot()?;
         db.ensure_initial_seed(&battery)?;
         db.record_battery_snapshot(&battery)?;
+
+        if !is_daemon_active(&db) {
+            let _ = crate::autopilot::thaw_persisted_frozen_apps(&db);
+        }
 
         let autopilot_enabled = is_autopilot_enabled(&db);
         let autopilot_config = load_autopilot_config();
@@ -275,6 +280,7 @@ impl AppUi {
             last_full_charge_ts,
             optimizer_modal: None,
             autopilot_modal: None,
+            confirm_stop_app: None,
         };
         ui.table_state.select(Some(0));
         ui.refresh_data(false)?;
@@ -409,35 +415,45 @@ impl AppUi {
 }
 
 pub fn run_tui(db: Database) -> Result<()> {
+    let orig_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        orig_hook(panic_info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_tui_loop(&mut terminal, db);
+    let mut app = AppUi::new(db)?;
+    let res = run_tui_loop(&mut terminal, &mut app);
+    if !app.daemon_running {
+        app.autopilot.thaw_all(&app.db);
+    }
 
-    disable_raw_mode()?;
-    execute!(
+    let _ = disable_raw_mode();
+    let _ = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    );
+    let _ = terminal.show_cursor();
 
     res
 }
 
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    db: Database,
+    app: &mut AppUi,
 ) -> Result<()> {
-    let mut app = AppUi::new(db)?;
     let tick_rate = Duration::from_millis(2000);
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| draw_ui(f, &mut app))?;
+        terminal.draw(|f| draw_ui(f, app))?;
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
@@ -446,6 +462,32 @@ fn run_tui_loop(
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if let Some(target_app) = app.confirm_stop_app.clone() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                app.confirm_stop_app = None;
+                                match stop_or_kill_app(&target_app) {
+                                    Ok(msg) => {
+                                        app.refresh_data(true)?;
+                                        app.status_message = Some((msg, Instant::now()));
+                                    }
+                                    Err(e) => {
+                                        app.status_message =
+                                            Some((format!("Stop error: {e}"), Instant::now()));
+                                    }
+                                }
+                            }
+                            _ => {
+                                app.confirm_stop_app = None;
+                                app.status_message = Some((
+                                    format!("Cancelled stopping {target_app}"),
+                                    Instant::now(),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+
                     if let Some((targets, sel_idx)) = &mut app.optimizer_modal {
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => {
@@ -920,6 +962,10 @@ fn draw_ui(f: &mut Frame, app: &mut AppUi) {
 
     if app.autopilot_modal.is_some() {
         draw_autopilot_modal(f, app, size);
+    }
+
+    if app.confirm_stop_app.is_some() {
+        draw_confirm_stop_modal(f, app, size);
     }
 }
 
@@ -2540,15 +2586,9 @@ impl AppUi {
                     self.status_message = Some((format!("Freeze error: {e}"), Instant::now()));
                 }
             },
-            'x' => match stop_or_kill_app(&sel.app_name) {
-                Ok(msg) => {
-                    self.refresh_data(true)?;
-                    self.status_message = Some((msg, Instant::now()));
-                }
-                Err(e) => {
-                    self.status_message = Some((format!("Stop error: {e}"), Instant::now()));
-                }
-            },
+            'x' => {
+                self.confirm_stop_app = Some(sel.app_name);
+            }
             'w' => {
                 if let Ok(added) = toggle_app_whitelist(&sel.app_name) {
                     if added && sel.is_frozen {
@@ -2570,6 +2610,51 @@ impl AppUi {
         }
         Ok(())
     }
+}
+
+fn draw_confirm_stop_modal(f: &mut Frame, app: &AppUi, area: Rect) {
+    let Some(target_app) = &app.confirm_stop_app else {
+        return;
+    };
+    let popup_width = area.width.saturating_sub(8).min(64);
+    let popup_height = 7u16.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(Color::Rgb(24, 18, 22)))
+        .title(Span::styled(
+            " ⚠ Confirm Stop Application ",
+            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Stop ", Style::default().fg(Color::White)),
+            Span::styled(
+                target_app.as_str(),
+                Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("? Unsaved work may be lost.", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [y / Enter]", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+            Span::styled(": Confirm Stop    ", Style::default().fg(Color::Gray)),
+            Span::styled("[n / Esc]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(": Cancel", Style::default().fg(Color::Gray)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]

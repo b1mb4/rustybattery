@@ -2,22 +2,21 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.10.0** *(Latest)*
-- **⚡ Accurate Power Attribution v2 & Monotonic Clocks:**
-  - Switched sample timing to `CLOCK_MONOTONIC` & `CLOCK_BOOTTIME` (`suspended_total_secs`) and capped awake intervals at `15s` so suspend/sleep intervals never inflate per-app drain (`>100%`).
-  - Splits discharging power across **Display & Backlight** (estimated from `/sys/class/backlight/*/brightness`), **System Idle / SoC Baseline**, and active applications; removed fabricated bootstrap history and the `8.5W` fallback.
-  - Sleep detection now verifies `boot_id` and kernel `suspended_secs` so reboots, shutdowns, and collector downtime are never miscounted as sleep.
-- **🌙 Logind `PrepareForSleep` Hook, Sleep History & Idempotent ACPI Wakeups:**
-  - Added real-time `org.freedesktop.login1` `PrepareForSleep(true/false)` D-Bus monitoring in the daemon so `s2idle` pre-sleep optimizations run immediately before suspend and record per-session sleep history (`battery sleep`).
-  - Made ACPI wakeup toggling idempotent (re-checks `/proc/acpi/wakeup` before writing), opt-in in `battery optimize`, and reversible via `battery sleep --undo`.
-- **🗄️ Bundled SQLite (`rusqlite`), Daily Retention & `toml` Config:**
-  - Replaced raw SQLite FFI with statically bundled `rusqlite` (zero `libsqlite3-dev` system requirement) and `toml` + `serde` config parsing with `mtime` caching.
-  - Added automatic daily database retention (`>7d` downsampled to 1/min, `>90d` pruned) plus `battery service prune` and `battery service reset-stats`.
-- **🚀 Hot-Path & TUI Optimizations + Unit Tests & CI:**
-  - Eliminated redundant `cgroup.procs` sysfs reads (~25% fewer file reads/tick), added recursive `.slice` lookup for freeze/stop/focus, made TUI search/sort/filter instantaneous in-memory, downsampled 7d charts, and added 13 unit tests + GitHub Actions CI.
+### **Version 0.11.0** *(Latest)*
+- **✨ Improved User Experience:**
+  - Safer defaults and confirmations: `x` (Stop App) in TUI and `battery optimize` now ask for `[y/N]` confirmation, stops are graceful (`SIGTERM` before `SIGKILL`), and `battery resume --all` unfreezes everything in one command.
+  - Smart Saver now restores your exact previous power profile and keyboard brightness on wake/AC, skips Bluetooth blocking in clamshell/connected mode, and guards active audio, webcam, and terminal apps from auto-freezing.
+  - Added **`battery doctor`** to quickly check system support, focus detection, power profiles, and config health.
+- **🎯 More Accurate Power Attribution:**
+  - Per-unit CPU tracking (closing a container or browser tab no longer skews active drain), better app name detection for Flatpak/GNOME apps, `80%` battery charge-limit awareness, and an **Unattributed / Hardware & Idle** bucket for non-CPU draw.
+- **🚀 Faster Statusbar & Charts:**
+  - Cached statusbar updates (`<1 ms` for Waybar/Polybar), SQL-bucketed chart history, and thin-LTO release builds.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.9.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.10.0)</b></summary>
+
+- **Version 0.10.0:**
+  - Monotonic & suspend-aware clocks, logind `PrepareForSleep` D-Bus hook, statically bundled `rusqlite` with daily DB retention, `toml` config caching, in-memory TUI search/sort/filter, and unit test suite.
 
 - **Version 0.9.0:**
   - Added `battery sleep [--fix]` audit & `s2idle_sleep_saver` lid-close rule, Unix manual pages (`man battery` / `man rustybattery`), and TUI layout clipping fixes.
@@ -89,7 +88,7 @@
 ```bash
 cargo install rustybattery
 ```
-*(Installs both `rustybattery` and the `battery` command directly into `~/.cargo/bin`. Before publishing to crates.io, you can also run `cargo install --git https://github.com/b1mb4/rustybattery`.)*
+*(Installs both `rustybattery` and the `battery` command directly into `~/.cargo/bin`.)*
 
 ### Option 2: One-Command Shell Installer (Pre-Built Binary)
 ```bash
@@ -220,16 +219,16 @@ battery service uninstall
 
 ---
 
-## 🧠 How It Works Under the Hood
+## 🧠 How It Works & Safety
 
 1. **Hardware Power Telemetry (`/sys/class/power_supply/`)**:
-   - Reads real-time energy (`energy_now`/`charge_now`, `energy_full`, `energy_full_design`), instantaneous power draw (`power_now`/`current_now`), voltage, cycle count, and charge status across all system batteries while filtering out Bluetooth/HID peripheral batteries.
-2. **Hybrid Cgroup v2 + `/proc` Attribution Engine + Window Focus Tracker**:
-   - Reads microsecond-accurate CPU accounting (`cpu.stat`), resident memory (`memory.current`), and process counts (`pids.current`) across systemd cgroup v2 (`app.slice`, `session.slice`, `background.slice`, `system.slice`), and falls back to `/proc/[pid]/stat` + `/proc/[pid]/cmdline` for standalone window managers (Hyprland, Sway, i3, XFCE) and non-systemd Linux distributions.
-   - Detects focused foreground applications via `uresourced` cgroup boost (`cpu.weight > 100` on GNOME/Fedora), Hyprland IPC (`hyprctl activewindow`), KDE (`kdotool`), and X11 (`xprop`) to separate **`Focused %`** from background drain.
-3. **Instant First-Run Bootstrap + SQLite Persistence**:
-   - Imports historical battery charge and discharge rate curves from UPower (`/var/lib/upower/history-*.dat`) and bootstraps current session app drain so charts and rankings are populated immediately on first launch.
-   - Persists time-series snapshots and 5-minute app energy buckets to `~/.local/share/rustybattery/rustybattery.db`.
+   - Reads real-time energy (`energy_now`/`charge_now`, `energy_full`, `energy_full_design`), instantaneous power draw (`power_now`/`current_now`), charge limits (`charge_control_end_threshold`), voltage, cycle count, and charge status across all system batteries while filtering out Bluetooth/HID peripheral batteries.
+2. **Per-Unit Cgroup v2 + `/proc` Attribution Engine + Window Focus Tracker**:
+   - Computes per-unit CPU deltas (`cpu.stat` per systemd unit or `/proc/[pid]/stat` keyed by `(pid, starttime)`) so exiting containers or tabs never distort attribution, and scales CPU-attributed wattage by actual CPU utilization (placing non-CPU hardware draw into **Display & Backlight (est.)** and **Unattributed / Hardware & Idle**).
+   - Detects focused foreground applications via `uresourced` cgroup boost (`cpu.weight > 100` on GNOME/Fedora), Hyprland IPC (`hyprctl activewindow`), Sway IPC (`swaymsg -t get_tree`), KDE (`kdotool`), and X11 (`xprop`). If focus is unknown, auto-freeze fails closed and never freezes apps.
+3. **Safety Guards & Instant Recovery (`battery resume --all` / `battery doctor`)**:
+   - Auto-freeze (`auto_freeze_enabled`) is **opt-in (`false` by default)**, skips apps playing/recording audio, using a webcam (`/dev/video*`), holding a systemd inhibitor, or hosting your current terminal, and automatically thaws frozen apps on daemon/TUI exit (`ExecStopPost=rustybattery resume --all`).
+   - Run `battery doctor` at any time to inspect cgroup v2 support, window focus method, RAPL permissions, power-profile backend, and database health.
 
 ---
 

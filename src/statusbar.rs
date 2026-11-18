@@ -1,10 +1,56 @@
 use crate::apps::{AppDeltaUsage, AppEnergyTracker};
+use crate::autopilot::load_autopilot_config;
 use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
 use crate::db::{default_db_path, AppSummaryRow, Database};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedStatus {
+    timestamp: i64,
+    battery: BatterySnapshot,
+    live_deltas: Vec<AppDeltaUsage>,
+}
+
+fn runtime_status_path() -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join("rustybattery");
+    let _ = fs::create_dir_all(&base);
+    base.join("status.json")
+}
+
+/// Atomically writes the latest daemon snapshot to `$XDG_RUNTIME_DIR/rustybattery/status.json`.
+pub fn write_cached_status(bat: &BatterySnapshot, deltas: &[AppDeltaUsage]) -> Result<()> {
+    let path = runtime_status_path();
+    let tmp = path.with_extension("json.tmp");
+    let payload = CachedStatus {
+        timestamp: chrono::Utc::now().timestamp(),
+        battery: bat.clone(),
+        live_deltas: deltas.to_vec(),
+    };
+    fs::write(&tmp, serde_json::to_vec(&payload)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn read_cached_status(max_age_secs: i64) -> Option<(BatterySnapshot, Vec<AppDeltaUsage>)> {
+    let path = runtime_status_path();
+    let bytes = fs::read(&path).ok()?;
+    let cached: CachedStatus = serde_json::from_slice(&bytes).ok()?;
+    let now = chrono::Utc::now().timestamp();
+    if (now - cached.timestamp).abs() <= max_age_secs {
+        Some((cached.battery, cached.live_deltas))
+    } else {
+        None
+    }
+}
 
 pub fn print_statusbar_config(bar_type: &str) {
     match bar_type.to_lowercase().as_str() {
@@ -15,7 +61,7 @@ pub fn print_statusbar_config(bar_type: &str) {
 type = custom/script
 exec = battery statusbar --format polybar
 interval = 5
-click-left = ghostty -e battery &
+click-left = xdg-terminal-exec battery || ghostty -e battery || kitty -e battery &
 click-middle = battery optimize &"#
             );
         }
@@ -50,13 +96,17 @@ pub fn run_statusbar(format: &str, top_n: usize, config_snippet: Option<&str>) -
     }
 
     let db = Database::open(&default_db_path())?;
-    let bat = read_battery_snapshot()?;
-    let _ = db.ensure_initial_seed(&bat);
-
-    let mut tracker = AppEnergyTracker::new();
-    thread::sleep(Duration::from_millis(200));
-    let (live_deltas, _) =
-        tracker.sample_delta(bat.power_w, bat.energy_full_wh, bat.status.is_discharging());
+    let (bat, live_deltas) = if let Some(cached) = read_cached_status(20) {
+        cached
+    } else {
+        let bat = read_battery_snapshot()?;
+        let _ = db.ensure_initial_seed(&bat);
+        let mut tracker = AppEnergyTracker::new();
+        thread::sleep(Duration::from_millis(200));
+        let (deltas, _) =
+            tracker.sample_delta(bat.power_w, bat.energy_full_wh, bat.status.is_discharging());
+        (bat, deltas)
+    };
 
     let since_ts = db.get_last_full_charge_ts();
     let mut apps = db.get_app_breakdown(since_ts, &live_deltas).unwrap_or_default();
@@ -286,13 +336,17 @@ impl NotificationMonitor {
             return;
         }
 
+        let cfg = load_autopilot_config();
+        let low_pct = cfg.low_battery_pct;
+        let crit_pct = cfg.critical_battery_pct;
+
         let top_live = deltas.first();
         let top_desc = top_live
             .map(|a| format!("Top consumer: {} ({:.1} W)", a.app_name, a.live_power_w))
             .unwrap_or_else(|| "Run `battery optimize` to reduce power draw.".to_string());
 
-        // 1. Check Low Battery Thresholds (10% and 20%)
-        if bat.capacity_pct <= 10.0 && !self.alerted_10_pct {
+        // 1. Check Configurable Low Battery Thresholds
+        if bat.capacity_pct <= crit_pct && !self.alerted_10_pct {
             self.alerted_10_pct = true;
             self.alerted_20_pct = true;
             let _ = send_desktop_notification(
@@ -302,7 +356,7 @@ impl NotificationMonitor {
                 "battery-empty",
             );
             return;
-        } else if bat.capacity_pct <= 20.0 && !self.alerted_20_pct {
+        } else if bat.capacity_pct <= low_pct && !self.alerted_20_pct {
             self.alerted_20_pct = true;
             let _ = send_desktop_notification(
                 &format!("⚠️ Low Battery: {:.0}% ({:.1} W)", bat.capacity_pct, bat.power_w),

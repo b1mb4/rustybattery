@@ -96,34 +96,42 @@ pub fn set_acpi_wakeups_state(devices: &[String], target_enabled: bool) -> Resul
         return Ok(toggled);
     }
 
-    let check_marker = if target_enabled {
-        "\\*disabled"
-    } else {
-        "\\*enabled"
-    };
-    let script = current_matching
-        .iter()
-        .map(|d| {
-            format!(
-                "(grep -q '^{d}[[:space:]].*{check_marker}' /proc/acpi/wakeup && echo {d} > /proc/acpi/wakeup || true)"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" && ");
-    if let Ok(out) = Command::new("sudo")
-        .args(["-n", "sh", "-c", &script])
-        .output()
-    {
-        if out.status.success() {
-            return Ok(current_matching.len());
+    // Use `sudo -n tee /proc/acpi/wakeup` passing device names on stdin (no shell command string)
+    let mut sudo_ok = true;
+    for dev in &current_matching {
+        use std::io::Write;
+        use std::process::Stdio;
+        let Ok(mut child) = Command::new("sudo")
+            .args(["-n", "tee", "/proc/acpi/wakeup"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            sudo_ok = false;
+            break;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(format!("{dev}\n").as_bytes());
+        }
+        if !child.wait().map(|s| s.success()).unwrap_or(false) {
+            sudo_ok = false;
+            break;
         }
     }
+    if sudo_ok {
+        return Ok(current_matching.len());
+    }
+
     let verb = if target_enabled {
         "Re-enabling"
     } else {
         "Disabling"
     };
-    anyhow::bail!("{verb} ACPI wakeups requires root. Run:\n  sudo sh -c \"{script}\"")
+    let devs_str = current_matching.join(" ");
+    anyhow::bail!(
+        "{verb} ACPI wakeups requires root (note: resets on reboot). Run:\n  for d in {devs_str}; do echo $d | sudo tee /proc/acpi/wakeup; done"
+    )
 }
 
 pub fn disable_noisy_acpi_wakeups(devices: &[String]) -> Result<usize> {
@@ -230,19 +238,59 @@ fn find_matching_proc_pids(target_app_name: &str) -> Vec<i32> {
             continue;
         };
         let comm = comm.trim();
-        if let Some((app_name, _)) = crate::apps::normalize_cgroup_unit(comm, "app") {
-            if app_name.eq_ignore_ascii_case(target_app_name) {
-                pids.push(pid);
-            }
+        let (app_name, _) = crate::apps::resolve_proc_app_name(&pid_dir, comm);
+        if app_name.eq_ignore_ascii_case(target_app_name) {
+            pids.push(pid);
         }
     }
     pids
+}
+
+fn thaw_slice_recursive(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".slice") {
+            count += thaw_slice_recursive(&path);
+            continue;
+        }
+        let freeze_file = path.join("cgroup.freeze");
+        if read_u64_file(&freeze_file) == 1 && fs::write(&freeze_file, "0").is_ok() {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Thaws every frozen cgroup (`cgroup.freeze == 1`) under the current user's systemd slice tree.
+pub fn thaw_all_user_cgroups() -> usize {
+    let uid = unsafe { libc::getuid() };
+    let user_base = PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+    ));
+    let mut total = 0usize;
+    for sub in ["app.slice", "session.slice", "background.slice"] {
+        total += thaw_slice_recursive(&user_base.join(sub));
+    }
+    total
 }
 
 /// Freezes (`freeze = true`) or unfreezes (`freeze = false`) an application across all Linux platforms:
 /// 1. Uses Linux cgroup v2 `cgroup.freeze` when the app runs in a cgroup scope/service.
 /// 2. Falls back to POSIX `SIGSTOP` / `SIGCONT` for standalone processes on non-systemd distros or window managers.
 pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
+    if freeze && crate::guards::is_terminal_ancestor_app(app_name) {
+        anyhow::bail!(
+            "Refusing to freeze '{app_name}' because it hosts the current terminal session"
+        );
+    }
     let dirs = find_app_cgroup_dirs(app_name);
     let val = if freeze { "1" } else { "0" };
     let mut count = 0usize;
@@ -294,6 +342,50 @@ pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
     }
 }
 
+/// Gracefully stops a user cgroup unit: sends `systemctl --user stop` (or `SIGTERM` to PIDs),
+/// waits up to `grace_ms` for processes to exit, and falls back to `cgroup.kill` only if still alive.
+fn graceful_stop_user_cgroup(dir: &Path, unit_name: &str, grace_ms: u64) -> bool {
+    let mut initiated = false;
+    if unit_name.ends_with(".service") || unit_name.ends_with(".scope") {
+        if let Ok(out) = Command::new("systemctl")
+            .args(["--user", "stop", unit_name])
+            .output()
+        {
+            if out.status.success() {
+                initiated = true;
+            }
+        }
+    }
+    if !initiated {
+        if let Ok(procs) = fs::read_to_string(dir.join("cgroup.procs")) {
+            for line in procs.lines() {
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    if pid > 1 && unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                        initiated = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let step_ms = 100u64;
+    let steps = (grace_ms / step_ms).max(1);
+    for _ in 0..steps {
+        if read_u64_file(&dir.join("pids.current")) == 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step_ms));
+    }
+
+    if read_u64_file(&dir.join("pids.current")) > 0 {
+        let kill_file = dir.join("cgroup.kill");
+        if fs::write(&kill_file, "1").is_ok() {
+            initiated = true;
+        }
+    }
+    initiated
+}
+
 /// Stops / terminates all processes and units belonging to an application across any Linux distro.
 pub fn stop_or_kill_app(app_name: &str) -> Result<String> {
     let lower = app_name.to_lowercase();
@@ -331,14 +423,7 @@ pub fn stop_or_kill_app(app_name: &str) -> Result<String> {
         let dir_str = dir.to_string_lossy();
 
         if dir_str.contains("/user.slice/") {
-            let kill_file = dir.join("cgroup.kill");
-            if fs::write(&kill_file, "1").is_ok() {
-                killed_units += 1;
-            }
-            if unit_name.ends_with(".service") || unit_name.ends_with(".scope") {
-                let _ = Command::new("systemctl")
-                    .args(["--user", "stop", &unit_name])
-                    .output();
+            if graceful_stop_user_cgroup(dir, &unit_name, 1500) {
                 killed_units += 1;
             }
         } else if dir_str.contains("/system.slice/") {
@@ -500,7 +585,7 @@ pub fn scan_optimization_targets(current_power_w: f64) -> Vec<OptimizationTarget
             memory_mb: mem_mb,
             pids_count: container_pids,
             estimated_watts: est_w,
-            selected: true,
+            selected: false,
         });
     }
 
@@ -585,7 +670,7 @@ pub fn scan_optimization_targets(current_power_w: f64) -> Vec<OptimizationTarget
                 memory_mb: (mem_bytes as f64) / (1024.0 * 1024.0),
                 pids_count: pids,
                 estimated_watts: est_w,
-                selected: true,
+                selected: false,
             });
         }
     }
@@ -720,7 +805,7 @@ pub fn scan_optimization_targets(current_power_w: f64) -> Vec<OptimizationTarget
                 memory_mb: (mem_bytes as f64) / (1024.0 * 1024.0),
                 pids_count: pids,
                 estimated_watts: est_w,
-                selected: true,
+                selected: false,
             });
         }
     }
@@ -804,7 +889,7 @@ fn stop_all_containers() -> usize {
                     .collect();
                 if !ids.is_empty() {
                     let mut stop_cmd = Command::new(runtime);
-                    stop_cmd.arg("stop").arg("-t").arg("2");
+                    stop_cmd.arg("stop").arg("-t").arg("10");
                     for id in &ids {
                         stop_cmd.arg(id);
                     }
@@ -818,56 +903,12 @@ fn stop_all_containers() -> usize {
         }
     }
 
-    // 2. Also stop user-level docker-desktop.service if running
-    let uid = unsafe { libc::getuid() };
-    let dd_kill = PathBuf::from(format!(
-        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-desktop.service/cgroup.kill"
-    ));
-    if dd_kill.exists() {
-        let _ = fs::write(&dd_kill, "1");
-    }
+    // 2. Also stop user-level docker-desktop.service gracefully if running
     let _ = Command::new("systemctl")
         .args(["--user", "stop", "docker-desktop.service"])
         .output();
 
     stopped_count
-}
-
-fn apply_linux_powersave_profile() -> bool {
-    // 1. Try power-profiles-daemon (`powerprofilesctl set power-saver` — Ubuntu, Arch, Debian, GNOME/KDE)
-    if let Ok(out) = Command::new("powerprofilesctl")
-        .args(["set", "power-saver"])
-        .output()
-    {
-        if out.status.success() {
-            return true;
-        }
-    }
-    // 2. Try Tuned (`tuned-adm profile powersave` — Fedora, RHEL, CentOS)
-    if let Ok(out) = Command::new("tuned-adm")
-        .args(["profile", "powersave"])
-        .output()
-    {
-        if out.status.success() {
-            return true;
-        }
-    }
-    // 3. Try TLP (`tlp bat` — Arch, ThinkPads, Ubuntu)
-    if let Ok(out) = Command::new("tlp").arg("bat").output() {
-        if out.status.success() {
-            return true;
-        }
-    }
-    // 4. Direct sysfs write if writable
-    if fs::write(
-        "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference",
-        "power",
-    )
-    .is_ok()
-    {
-        return true;
-    }
-    false
 }
 
 /// Executes the selected optimization targets and returns a summary report.
@@ -885,12 +926,6 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
         match t.kind {
             TargetKind::UserUnit => {
                 let mut ok = false;
-                for path in &t.cgroup_paths {
-                    let kill_file = path.join("cgroup.kill");
-                    if fs::write(&kill_file, "1").is_ok() {
-                        ok = true;
-                    }
-                }
                 for unit in &t.unit_names {
                     if let Ok(out) = Command::new("systemctl")
                         .args(["--user", "stop", unit])
@@ -899,6 +934,15 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
                         if out.status.success() {
                             ok = true;
                         }
+                    }
+                }
+                for path in &t.cgroup_paths {
+                    let uname = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if graceful_stop_user_cgroup(path, &uname, 1000) {
+                        ok = true;
                     }
                 }
                 if ok {
@@ -920,7 +964,7 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
                     stopped_pids += t.pids_count;
                     estimated_watts_saved += t.estimated_watts;
                     actions_taken.push(format!(
-                        "Stopped {} container(s) ({:.0} MB RAM freed, ~{:.1} W saved)",
+                        "Stopped {} container(s) ({:.0} MB RAM freed, ~{:.1} W saved estimate)",
                         n, t.memory_mb, t.estimated_watts
                     ));
                 } else {
@@ -935,19 +979,17 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
                 }
                 system_targets_meta.push(t);
             }
-            TargetKind::PowerProfile => {
-                if apply_linux_powersave_profile() {
+            TargetKind::PowerProfile => match crate::power::set_power_profile(true) {
+                Ok(note) => {
                     estimated_watts_saved += t.estimated_watts;
-                    actions_taken.push(
-                        "Switched Linux CPU power profile to 'powersave' (~1.5 W saved)".to_string(),
-                    );
-                } else {
-                    failed_actions.push(
-                        "Power profile switch requires host session (`powerprofilesctl set power-saver` or `tuned-adm profile powersave`)"
-                            .to_string(),
-                    );
+                    actions_taken.push(format!(
+                        "Switched Linux CPU power profile ({note}, ~1.5 W saved estimate)"
+                    ));
                 }
-            }
+                Err(e) => {
+                    failed_actions.push(e.to_string());
+                }
+            },
             TargetKind::BluetoothRadio => {
                 if crate::autopilot::set_bluetooth_blocked(true) {
                     estimated_watts_saved += t.estimated_watts;

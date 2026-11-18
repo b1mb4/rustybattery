@@ -4,6 +4,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Focus {
+    Known(HashSet<String>),
+    Unknown,
+}
+
+impl Focus {
+    pub fn contains(&self, app_name: &str) -> bool {
+        match self {
+            Focus::Known(set) => set.contains(app_name),
+            Focus::Unknown => false,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Focus::Unknown)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawAppCounter {
     pub app_name: String,
@@ -16,6 +35,10 @@ pub struct RawAppCounter {
     pub pids_count: u32,
     pub is_frozen: bool,
     pub is_focused: bool,
+    /// Per-unit / per-process CPU counter (`unit_key -> usage_usec`) so exiting containers/tabs
+    /// never cause aggregate counter drops.
+    #[serde(default)]
+    pub unit_usage: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +72,51 @@ pub struct AppDeltaUsage {
     pub is_focused: bool,
 }
 
+fn strip_systemd_launcher_prefixes(raw: &str) -> String {
+    let mut base = raw
+        .trim_end_matches(".scope")
+        .trim_end_matches(".service")
+        .trim_end_matches(".slice")
+        .to_string();
+
+    if let Some(idx) = base.find('@') {
+        base.truncate(idx);
+    }
+
+    // Strip `dbus-:1.<N>-` prefix (e.g. `dbus-:1.2-org.gnome.Nautilus@0.service`)
+    if let Some(rest) = base.strip_prefix("dbus-:") {
+        if let Some(dash_idx) = rest.find('-') {
+            base = rest[dash_idx + 1..].to_string();
+        }
+    }
+
+    for prefix in [
+        "app-flatpak-",
+        "app-gnome-",
+        "app-kde-",
+        "app-plasma-",
+        "app-systemd-",
+        "app-",
+    ] {
+        if let Some(rest) = base.strip_prefix(prefix) {
+            base = rest.to_string();
+            break;
+        }
+    }
+
+    if let Some(idx) = base.rfind('-') {
+        let tail = &base[idx + 1..];
+        if tail.len() >= 3 && tail.chars().all(|c| c.is_ascii_hexdigit()) {
+            base.truncate(idx);
+        }
+    }
+    base
+}
+
+fn has_token(tokens: &[&str], target: &str) -> bool {
+    tokens.iter().any(|&t| t == target)
+}
+
 /// Converts a raw systemd unit name, Snap scope, Flatpak scope, or process command across any Linux
 /// distribution (Ubuntu, Fedora, Arch, Debian, openSUSE, NixOS, Alpine, Void, etc.) into a
 /// human-friendly `(AppName, Category)` pair.
@@ -72,7 +140,12 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
         .replace("\\x2e", ".")
         .replace("\\x40", "@");
 
-    let lower = unescaped.to_lowercase();
+    let stripped = strip_systemd_launcher_prefixes(&unescaped);
+    let lower = stripped.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(['-', '_', '.', '@', '/'])
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // 1. Web Browsers
     if lower.contains("waterfox") {
@@ -96,7 +169,7 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     if lower.contains("vivaldi") {
         return Some(("Vivaldi".to_string(), "Browser".to_string()));
     }
-    if lower.contains("opera") {
+    if has_token(&tokens, "opera") {
         return Some(("Opera".to_string(), "Browser".to_string()));
     }
     if lower.contains("thorium") {
@@ -266,8 +339,8 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     }
     if lower.contains("waybar")
         || lower.contains("polybar")
-        || lower.contains("eww")
-        || lower.contains("ags")
+        || has_token(&tokens, "eww")
+        || has_token(&tokens, "ags")
     {
         return Some((
             "Status Bar (Waybar/Polybar)".to_string(),
@@ -276,14 +349,14 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     }
     if lower == "xorg"
         || lower == "xwayland"
-        || lower.contains("picom")
-        || lower.contains("i3")
-        || lower.contains("bspwm")
-        || lower.contains("awesome")
+        || has_token(&tokens, "picom")
+        || has_token(&tokens, "i3")
+        || has_token(&tokens, "bspwm")
+        || has_token(&tokens, "awesome")
         || lower.contains("xfwm4")
         || lower.contains("xfce4-")
         || lower.contains("cinnamon")
-        || lower.contains("marco")
+        || has_token(&tokens, "marco")
     {
         return Some((
             "Window Manager / XServer".to_string(),
@@ -386,11 +459,11 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
         || lower.contains("plasma-discover")
         || lower.contains("packagekit")
         || lower.contains("fwupd")
-        || lower.contains("snapd")
-        || lower.contains("dnf")
-        || lower.contains("apt")
+        || has_token(&tokens, "snapd")
+        || has_token(&tokens, "dnf")
+        || has_token(&tokens, "apt")
         || lower.contains("unattended-upgrade")
-        || lower.contains("pacman")
+        || has_token(&tokens, "pacman")
     {
         return Some(("Package & Store Manager".to_string(), "System".to_string()));
     }
@@ -410,10 +483,13 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
             "Background".to_string(),
         ));
     }
-    if lower.contains("gvfs") || lower.contains("udisks") || lower.contains("kio") {
+    if lower.contains("gvfs") || lower.contains("udisks") || has_token(&tokens, "kio") {
         return Some(("Storage & Virtual FS".to_string(), "Background".to_string()));
     }
-    if lower.contains("dbus") {
+    if has_token(&tokens, "dbus")
+        || lower.starts_with("dbus-daemon")
+        || lower.starts_with("dbus-broker")
+    {
         return Some(("D-Bus Message Broker".to_string(), "System".to_string()));
     }
     if lower.contains("upower")
@@ -445,46 +521,12 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
         return Some(("Security, Auth & Keyring".to_string(), "System".to_string()));
     }
 
-    let mut base = unescaped
-        .trim_end_matches(".scope")
-        .trim_end_matches(".service")
-        .trim_end_matches(".slice")
-        .to_string();
+    let mut base = stripped;
 
     if let Some(rest) = base.strip_prefix("snap.") {
         let segs: Vec<&str> = rest.split('.').collect();
         if let Some(&first) = segs.first() {
             base = first.to_string();
-        }
-    }
-
-    if let Some(idx) = base.rfind('-') {
-        let tail = &base[idx + 1..];
-        if !tail.is_empty()
-            && tail
-                .chars()
-                .all(|c| c.is_ascii_digit() || c.is_ascii_hexdigit())
-            && tail.len() >= 3
-        {
-            base.truncate(idx);
-        }
-    }
-    if let Some(idx) = base.find('@') {
-        base.truncate(idx);
-    }
-
-    for prefix in [
-        "app-flatpak-",
-        "app-gnome-",
-        "app-kde-",
-        "app-plasma-",
-        "app-systemd-",
-        "app-",
-        "dbus-:1.",
-    ] {
-        if let Some(rest) = base.strip_prefix(prefix) {
-            base = rest.to_string();
-            break;
         }
     }
 
@@ -563,9 +605,7 @@ fn scan_focused_slice_dir(dir: &Path, focused: &mut HashSet<String>) {
             continue;
         }
         let weight = read_cgroup_u64(&path, "cpu.weight");
-        let mem_min = read_cgroup_u64(&path, "memory.min");
-        let mem_low = read_cgroup_u64(&path, "memory.low");
-        if weight > 100 || mem_min > 0 || mem_low > 0 {
+        if weight > 100 {
             if let Some((app_name, _)) = normalize_cgroup_unit(&unit_name, "app") {
                 focused.insert(app_name);
             }
@@ -573,10 +613,39 @@ fn scan_focused_slice_dir(dir: &Path, focused: &mut HashSet<String>) {
     }
 }
 
-pub fn detect_focused_apps() -> HashSet<String> {
+fn find_sway_focused_class(val: &serde_json::Value) -> Option<String> {
+    if val.get("focused").and_then(|v| v.as_bool()) == Some(true) {
+        if let Some(app_id) = val.get("app_id").and_then(|v| v.as_str()) {
+            if !app_id.is_empty() {
+                return Some(app_id.to_string());
+            }
+        }
+        if let Some(cls) = val
+            .get("window_properties")
+            .and_then(|w| w.get("class"))
+            .and_then(|v| v.as_str())
+        {
+            if !cls.is_empty() {
+                return Some(cls.to_string());
+            }
+        }
+    }
+    for key in ["nodes", "floating_nodes"] {
+        if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+            for child in arr {
+                if let Some(found) = find_sway_focused_class(child) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn detect_focused_apps() -> Focus {
     let mut focused = HashSet::new();
 
-    // 1. Check cgroup v2 `cpu.weight > 100` / `memory.min > 0` in user `app.slice` (including nested `.slice` dirs)
+    // 1. Check cgroup v2 `cpu.weight > 100` in user `app.slice` (set by `uresourced` on GNOME/systemd desktops)
     let uid = unsafe { libc::getuid() };
     let app_slice_path = PathBuf::from(format!(
         "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice"
@@ -584,11 +653,11 @@ pub fn detect_focused_apps() -> HashSet<String> {
     scan_focused_slice_dir(&app_slice_path, &mut focused);
 
     if !focused.is_empty() {
-        return focused;
+        return Focus::Known(focused);
     }
 
     static SUBPROC_FOCUS_CACHE: std::sync::Mutex<
-        Option<(std::time::Instant, HashSet<String>)>,
+        Option<(std::time::Instant, Focus)>,
     > = std::sync::Mutex::new(None);
     if let Ok(guard) = SUBPROC_FOCUS_CACHE.lock() {
         if let Some((ts, cached)) = &*guard {
@@ -613,7 +682,22 @@ pub fn detect_focused_apps() -> HashSet<String> {
         }
     }
 
-    // 3. Check KDE Plasma `kdotool` if available
+    // 3. Check Sway (`SWAYSOCK` via `swaymsg -t get_tree`)
+    if focused.is_empty() && std::env::var_os("SWAYSOCK").is_some() {
+        if let Ok(out) = Command::new("swaymsg").args(["-t", "get_tree"]).output() {
+            if out.status.success() {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if let Some(cls) = find_sway_focused_class(&val) {
+                        if let Some((app_name, _)) = normalize_cgroup_unit(&cls, "app") {
+                            focused.insert(app_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Check KDE Plasma `kdotool` if available
     if focused.is_empty()
         && std::env::var("XDG_CURRENT_DESKTOP")
             .unwrap_or_default()
@@ -633,7 +717,7 @@ pub fn detect_focused_apps() -> HashSet<String> {
         }
     }
 
-    // 4. Check X11 `_NET_ACTIVE_WINDOW` via `xprop`
+    // 5. Check X11 `_NET_ACTIVE_WINDOW` via `xprop`
     if focused.is_empty() && std::env::var_os("DISPLAY").is_some() {
         if let Ok(out) = Command::new("xprop")
             .args(["-root", "_NET_ACTIVE_WINDOW"])
@@ -663,11 +747,17 @@ pub fn detect_focused_apps() -> HashSet<String> {
         }
     }
 
+    let result = if focused.is_empty() {
+        Focus::Unknown
+    } else {
+        Focus::Known(focused)
+    };
+
     if let Ok(mut guard) = SUBPROC_FOCUS_CACHE.lock() {
-        *guard = Some((std::time::Instant::now(), focused.clone()));
+        *guard = Some((std::time::Instant::now(), result.clone()));
     }
 
-    focused
+    result
 }
 
 fn read_cgroup_cpu_stat(dir: &Path) -> Option<(u64, u64, u64)> {
@@ -709,7 +799,7 @@ fn scan_slice_dir(
     slice_dir: &Path,
     slice_type: &str,
     map: &mut HashMap<String, RawAppCounter>,
-    focused_set: &HashSet<String>,
+    focused_set: &Focus,
 ) {
     let Ok(entries) = fs::read_dir(slice_dir) else {
         return;
@@ -739,6 +829,7 @@ fn scan_slice_dir(
         let pids_count = read_cgroup_u64(&path, "pids.current") as u32;
         let frozen = read_cgroup_u64(&path, "cgroup.freeze") == 1 && pids_count > 0;
         let is_focused = focused_set.contains(&app_name);
+        let unit_key = path.to_string_lossy().to_string();
 
         let entry_counter = map.entry(app_name.clone()).or_insert_with(|| RawAppCounter {
             app_name,
@@ -751,12 +842,14 @@ fn scan_slice_dir(
             pids_count: 0,
             is_frozen: false,
             is_focused: false,
+            unit_usage: HashMap::new(),
         });
         entry_counter.usage_usec = entry_counter.usage_usec.saturating_add(usage_usec);
         entry_counter.user_usec = entry_counter.user_usec.saturating_add(user_usec);
         entry_counter.system_usec = entry_counter.system_usec.saturating_add(system_usec);
         entry_counter.memory_bytes = entry_counter.memory_bytes.saturating_add(memory_bytes);
         entry_counter.pids_count = entry_counter.pids_count.saturating_add(pids_count);
+        entry_counter.unit_usage.insert(unit_key, usage_usec);
         if frozen {
             entry_counter.is_frozen = true;
         }
@@ -809,10 +902,16 @@ pub fn read_all_app_counters() -> HashMap<String, RawAppCounter> {
     map
 }
 
-fn resolve_proc_app_name(pid_dir: &Path, comm: &str) -> (String, String) {
+pub fn resolve_proc_app_name(pid_dir: &Path, comm: &str) -> (String, String) {
     let cmdline = fs::read_to_string(pid_dir.join("cmdline"))
         .unwrap_or_default()
         .replace('\0', " ");
+    let first_bin = cmdline
+        .split_whitespace()
+        .next()
+        .and_then(|arg| Path::new(arg).file_name())
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
 
     if matches!(
         comm,
@@ -824,24 +923,19 @@ fn resolve_proc_app_name(pid_dir: &Path, comm: &str) -> (String, String) {
             | "Socket Process"
             | "Utility Process"
     ) {
-        let lower_cmd = cmdline.to_lowercase();
-        if lower_cmd.contains("waterfox") {
+        if first_bin.contains("waterfox") {
             return ("Waterfox".to_string(), "Browser".to_string());
-        } else if lower_cmd.contains("librewolf") {
+        } else if first_bin.contains("librewolf") {
             return ("LibreWolf".to_string(), "Browser".to_string());
-        } else if lower_cmd.contains("zen") {
+        } else if first_bin == "zen" || first_bin.contains("zen-browser") {
             return ("Zen Browser".to_string(), "Browser".to_string());
         } else {
             return ("Firefox".to_string(), "Browser".to_string());
         }
     }
 
-    if let Some(first_arg) = cmdline.split_whitespace().next() {
-        let bin_name = Path::new(first_arg)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| comm.to_string());
-        if let Some(pair) = normalize_cgroup_unit(&bin_name, "app") {
+    if !first_bin.is_empty() {
+        if let Some(pair) = normalize_cgroup_unit(&first_bin, "app") {
             return pair;
         }
     }
@@ -851,18 +945,19 @@ fn resolve_proc_app_name(pid_dir: &Path, comm: &str) -> (String, String) {
 
 fn scan_proc_processes(
     map: &mut HashMap<String, RawAppCounter>,
-    focused_set: &HashSet<String>,
+    focused_set: &Focus,
 ) {
     let Ok(entries) = fs::read_dir("/proc") else {
         return;
     };
     let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
     let usec_per_tick = 1_000_000 / clk_tck;
 
     for entry in entries.flatten() {
         let name = entry.file_name();
         let pid_str = name.to_string_lossy();
-        if pid_str.parse::<u32>().is_err() {
+        let Ok(pid) = pid_str.parse::<u32>() else {
             continue;
         };
 
@@ -890,6 +985,7 @@ fn scan_proc_processes(
         let state_char = after[0];
         let utime = after[11].parse::<u64>().unwrap_or(0) * usec_per_tick;
         let stime = after[12].parse::<u64>().unwrap_or(0) * usec_per_tick;
+        let starttime = after[19].parse::<u64>().unwrap_or(0);
         let rss_pages = after[21].parse::<u64>().unwrap_or(0);
         let usage = utime + stime;
         if usage == 0 {
@@ -897,6 +993,7 @@ fn scan_proc_processes(
         }
         let (app_name, category) = resolve_proc_app_name(&pid_dir, comm);
         let is_focused = focused_set.contains(&app_name);
+        let unit_key = format!("proc:{pid}:{starttime}");
         let counter = map.entry(app_name.clone()).or_insert_with(|| RawAppCounter {
             app_name,
             category,
@@ -908,12 +1005,14 @@ fn scan_proc_processes(
             pids_count: 0,
             is_frozen: false,
             is_focused: false,
+            unit_usage: HashMap::new(),
         });
         counter.usage_usec += usage;
         counter.user_usec += utime;
         counter.system_usec += stime;
-        counter.memory_bytes += rss_pages * 4096;
+        counter.memory_bytes += rss_pages * page_size;
         counter.pids_count += 1;
+        counter.unit_usage.insert(unit_key, usage);
         if state_char == "T" {
             counter.is_frozen = true;
         }
@@ -923,14 +1022,31 @@ fn scan_proc_processes(
     }
 }
 
-/// Maximum seconds a single awake tick can attribute (prevents pauses/lags from inflating drain).
-const MAX_SAMPLE_DT_SECS: f64 = 15.0;
+/// Default maximum seconds a single awake tick can attribute (`max(15, 3 * interval)`).
+const DEFAULT_MAX_SAMPLE_DT_SECS: f64 = 45.0;
+
+#[derive(Debug, Clone)]
+pub struct SampleInput {
+    pub raw_dt_secs: f64,
+    pub slept_delta_secs: f64,
+    pub power_w: f64,
+    pub energy_full_wh: f64,
+    pub is_discharging: bool,
+    pub raw_display_w: f64,
+}
 
 /// Stateful tracker that computes per-tick deltas between snapshots and attributes battery drain.
 pub struct AppEnergyTracker {
     prev_counters: HashMap<String, RawAppCounter>,
     prev_monotonic_s: f64,
     prev_suspended_s: f64,
+    pub max_dt_secs: f64,
+}
+
+impl Default for AppEnergyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AppEnergyTracker {
@@ -940,15 +1056,19 @@ impl AppEnergyTracker {
             prev_counters: initial,
             prev_monotonic_s: crate::battery::monotonic_secs(),
             prev_suspended_s: crate::battery::suspended_total_secs(),
+            max_dt_secs: DEFAULT_MAX_SAMPLE_DT_SECS,
         }
     }
 
-    /// Samples current app counters, computes CPU delta over monotonic `dt_secs`, and attributes
-    /// the interval's battery energy (`power_w * dt_hours`) and battery `%` drop across active apps,
-    /// Display & Backlight, and System Baseline.
-    ///
-    /// If the machine suspended between samples (`suspended_total_secs` advanced), per-app
-    /// attribution is skipped for that interval so sleep drain is never billed to awake apps.
+    pub fn with_interval(interval_secs: u64) -> Self {
+        let mut t = Self::new();
+        t.max_dt_secs = (interval_secs.saturating_mul(3).max(15)) as f64;
+        t
+    }
+
+    /// Samples current app counters, computes per-unit CPU delta over monotonic `dt_secs`,
+    /// and attributes battery energy across active apps, Display & Backlight, System Baseline,
+    /// and Unattributed / Hardware & Idle.
     pub fn sample_delta(
         &mut self,
         power_w: f64,
@@ -966,44 +1086,52 @@ impl AppEnergyTracker {
         let display_w = crate::battery::estimate_display_power_w();
         self.compute_delta_from_snapshots(
             current,
-            raw_dt,
-            slept_delta,
-            power_w,
-            energy_full_wh,
-            is_discharging,
-            display_w,
+            SampleInput {
+                raw_dt_secs: raw_dt,
+                slept_delta_secs: slept_delta,
+                power_w,
+                energy_full_wh,
+                is_discharging,
+                raw_display_w: display_w,
+            },
         )
     }
 
-    fn compute_delta_from_snapshots(
+    pub fn compute_delta_from_snapshots(
         &mut self,
         current: HashMap<String, RawAppCounter>,
-        raw_dt_secs: f64,
-        slept_delta_secs: f64,
-        power_w: f64,
-        energy_full_wh: f64,
-        is_discharging: bool,
-        raw_display_w: f64,
+        inp: SampleInput,
     ) -> (Vec<AppDeltaUsage>, f64) {
-        // If the system slept during this tick, baseline the counters and skip app attribution.
-        if slept_delta_secs >= 5.0 {
+        if inp.slept_delta_secs >= 5.0 {
             self.prev_counters = current;
-            return (Vec::new(), raw_dt_secs.min(MAX_SAMPLE_DT_SECS));
+            return (Vec::new(), inp.raw_dt_secs.min(self.max_dt_secs));
         }
 
-        let dt_secs = raw_dt_secs.clamp(0.1, MAX_SAMPLE_DT_SECS);
+        let dt_secs = inp.raw_dt_secs.clamp(0.1, self.max_dt_secs);
+        let new_unit_cap = (dt_secs * 2_000_000.0) as u64;
         let mut app_deltas: Vec<(RawAppCounter, u64)> = Vec::new();
         let mut total_delta_usec: u64 = 0;
 
         for (name, curr) in &current {
             let delta_usec = if let Some(prev) = self.prev_counters.get(name) {
-                if curr.usage_usec >= prev.usage_usec {
+                if !curr.unit_usage.is_empty() || !prev.unit_usage.is_empty() {
+                    let mut sum = 0u64;
+                    for (ukey, &u_curr) in &curr.unit_usage {
+                        let d = match prev.unit_usage.get(ukey) {
+                            Some(&u_prev) if u_curr >= u_prev => u_curr - u_prev,
+                            Some(_) => u_curr,
+                            None => u_curr.min(new_unit_cap),
+                        };
+                        sum = sum.saturating_add(d);
+                    }
+                    sum
+                } else if curr.usage_usec >= prev.usage_usec {
                     curr.usage_usec - prev.usage_usec
                 } else {
-                    curr.usage_usec
+                    0
                 }
             } else {
-                curr.usage_usec.min((dt_secs * 2_000_000.0) as u64)
+                curr.usage_usec.min(new_unit_cap)
             };
 
             total_delta_usec = total_delta_usec.saturating_add(delta_usec);
@@ -1012,28 +1140,38 @@ impl AppEnergyTracker {
 
         self.prev_counters = current;
 
-        let effective_power_w = power_w.max(0.0);
-        let display_w = if is_discharging {
-            raw_display_w.min(effective_power_w * 0.45)
+        let effective_power_w = inp.power_w.max(0.0);
+        let display_w = if inp.is_discharging {
+            inp.raw_display_w.min(effective_power_w * 0.45)
         } else {
             0.0
         };
-        let baseline_w = if is_discharging {
+        let baseline_w = if inp.is_discharging {
             (1.0_f64).min((effective_power_w - display_w).max(0.0) * 0.30)
         } else {
             0.0
         };
         let app_pool_w = (effective_power_w - display_w - baseline_w).max(0.0);
 
-        let interval_app_wh = if is_discharging {
-            app_pool_w * (dt_secs / 3600.0)
+        // Scale CPU-attributed power by actual CPU cores used (`cpu_cores_used * 12W/core`),
+        // placing remaining non-CPU hardware draw into `Unattributed / Hardware & Idle`.
+        let cpu_cores_used = (total_delta_usec as f64 / 1_000_000.0) / dt_secs;
+        let attributed_app_w = if inp.is_discharging {
+            app_pool_w.min(cpu_cores_used * 12.0)
         } else {
             0.0
         };
-        let full_wh = energy_full_wh.max(10.0);
+        let unattributed_w = if inp.is_discharging {
+            (app_pool_w - attributed_app_w).max(0.0)
+        } else {
+            0.0
+        };
+
+        let interval_app_wh = attributed_app_w * (dt_secs / 3600.0);
+        let full_wh = inp.energy_full_wh.max(10.0);
         let interval_app_batt_pct = (interval_app_wh / full_wh) * 100.0;
 
-        let mut results = Vec::with_capacity(app_deltas.len() + 2);
+        let mut results = Vec::with_capacity(app_deltas.len() + 3);
         let denom = total_delta_usec.max(1) as f64;
 
         for (curr, d_usec) in app_deltas {
@@ -1063,7 +1201,7 @@ impl AppEnergyTracker {
                 cpu_secs,
                 active_secs,
                 focused_secs,
-                live_power_w: app_pool_w * share,
+                live_power_w: attributed_app_w * share,
                 live_cpu_pct,
                 memory_mb: (curr.memory_bytes as f64) / (1024.0 * 1024.0),
                 pids_count: curr.pids_count,
@@ -1072,10 +1210,10 @@ impl AppEnergyTracker {
             });
         }
 
-        if is_discharging && display_w > 0.05 {
+        if inp.is_discharging && display_w > 0.05 {
             let disp_wh = display_w * (dt_secs / 3600.0);
             results.push(AppDeltaUsage {
-                app_name: "Display & Backlight".to_string(),
+                app_name: "Display & Backlight (est.)".to_string(),
                 category: "System".to_string(),
                 unit_hint: "sysfs-backlight".to_string(),
                 battery_pct: (disp_wh / full_wh) * 100.0,
@@ -1093,19 +1231,20 @@ impl AppEnergyTracker {
             });
         }
 
-        if is_discharging && baseline_w > 0.05 {
-            let base_wh = baseline_w * (dt_secs / 3600.0);
+        if inp.is_discharging && (baseline_w + unattributed_w) > 0.05 {
+            let idle_w = baseline_w + unattributed_w;
+            let idle_wh = idle_w * (dt_secs / 3600.0);
             results.push(AppDeltaUsage {
-                app_name: "System Idle / SoC Baseline".to_string(),
+                app_name: "Unattributed / Hardware & Idle".to_string(),
                 category: "System".to_string(),
                 unit_hint: "soc-idle".to_string(),
-                battery_pct: (base_wh / full_wh) * 100.0,
+                battery_pct: (idle_wh / full_wh) * 100.0,
                 focused_battery_pct: 0.0,
-                energy_wh: base_wh,
+                energy_wh: idle_wh,
                 cpu_secs: 0.0,
                 active_secs: dt_secs,
                 focused_secs: 0.0,
-                live_power_w: baseline_w,
+                live_power_w: idle_w,
                 live_cpu_pct: 0.0,
                 memory_mb: 0.0,
                 pids_count: 0,
@@ -1129,6 +1268,8 @@ mod tests {
     use super::*;
 
     fn fake_counter(name: &str, usec: u64, focused: bool) -> RawAppCounter {
+        let mut unit_usage = HashMap::new();
+        unit_usage.insert(format!("{name}.service"), usec);
         RawAppCounter {
             app_name: name.to_string(),
             category: "App".to_string(),
@@ -1140,6 +1281,7 @@ mod tests {
             pids_count: 2,
             is_frozen: false,
             is_focused: focused,
+            unit_usage,
         }
     }
 
@@ -1151,51 +1293,149 @@ mod tests {
             prev_counters: init,
             prev_monotonic_s: 100.0,
             prev_suspended_s: 0.0,
+            max_dt_secs: 45.0,
         };
 
         let mut next = HashMap::new();
         next.insert("Waterfox".to_string(), fake_counter("Waterfox", 2_000_000, false));
-        // Simulate 8 hours of suspend (`slept_delta_secs = 28800.0`)
-        let (deltas, _) =
-            tracker.compute_delta_from_snapshots(next, 5.0, 28_800.0, 18.0, 60.0, true, 2.0);
+        let (deltas, _) = tracker.compute_delta_from_snapshots(
+            next,
+            SampleInput {
+                raw_dt_secs: 5.0,
+                slept_delta_secs: 28_800.0,
+                power_w: 18.0,
+                energy_full_wh: 60.0,
+                is_discharging: true,
+                raw_display_w: 2.0,
+            },
+        );
         assert!(deltas.is_empty());
     }
 
     #[test]
-    fn long_pause_is_capped_at_max_dt() {
+    fn interval_30s_attributes_full_duration_while_capping_huge_pauses() {
         let mut init = HashMap::new();
         init.insert("Code".to_string(), fake_counter("Code", 1_000_000, true));
         let mut tracker = AppEnergyTracker {
             prev_counters: init,
             prev_monotonic_s: 100.0,
             prev_suspended_s: 0.0,
+            max_dt_secs: 45.0,
         };
 
         let mut next = HashMap::new();
-        next.insert("Code".to_string(), fake_counter("Code", 2_000_000, true));
-        // Even if raw_dt_secs is 3600s, dt_secs is capped at MAX_SAMPLE_DT_SECS (15s)
-        let (deltas, dt) =
-            tracker.compute_delta_from_snapshots(next, 3600.0, 0.0, 12.0, 60.0, true, 2.0);
-        assert!((dt - MAX_SAMPLE_DT_SECS).abs() < 1e-6);
+        next.insert("Code".to_string(), fake_counter("Code", 31_000_000, true));
+        let (deltas, dt) = tracker.compute_delta_from_snapshots(
+            next,
+            SampleInput {
+                raw_dt_secs: 30.0,
+                slept_delta_secs: 0.0,
+                power_w: 12.0,
+                energy_full_wh: 60.0,
+                is_discharging: true,
+                raw_display_w: 2.0,
+            },
+        );
+        assert!((dt - 30.0).abs() < 1e-6);
         let total_wh: f64 = deltas.iter().map(|d| d.energy_wh).sum();
-        // 12W * (15s / 3600) = 0.05 Wh
-        assert!((total_wh - 0.05).abs() < 1e-4);
+        // 12W * (30s / 3600) = 0.10 Wh
+        assert!((total_wh - 0.10).abs() < 1e-4);
     }
 
     #[test]
-    fn zero_power_does_not_invent_drain() {
+    fn exiting_sub_unit_does_not_inflate_remaining_unit_delta() {
+        // Probe P1-1: Docker has 2 containers (c1 = 100s, c2 = 10s). c1 exits, c2 advances by 0.5s (to 10.5s).
+        // Editor advances by 1.0s.
+        let mut docker_prev = fake_counter("Docker / Containers", 110_000_000, false);
+        docker_prev.unit_usage.clear();
+        docker_prev.unit_usage.insert("c1".to_string(), 100_000_000);
+        docker_prev.unit_usage.insert("c2".to_string(), 10_000_000);
+
+        let mut docker_curr = fake_counter("Docker / Containers", 10_500_000, false);
+        docker_curr.unit_usage.clear();
+        docker_curr.unit_usage.insert("c2".to_string(), 10_500_000);
+
         let mut init = HashMap::new();
-        init.insert("Daemon".to_string(), fake_counter("Daemon", 100_000, false));
+        init.insert("Docker / Containers".to_string(), docker_prev);
+        init.insert("Code".to_string(), fake_counter("Code", 5_000_000, true));
+
+        let mut tracker = AppEnergyTracker {
+            prev_counters: init,
+            prev_monotonic_s: 0.0,
+            prev_suspended_s: 0.0,
+            max_dt_secs: 45.0,
+        };
+
+        let mut next = HashMap::new();
+        next.insert("Docker / Containers".to_string(), docker_curr);
+        next.insert("Code".to_string(), fake_counter("Code", 6_000_000, true));
+
+        let (deltas, _) = tracker.compute_delta_from_snapshots(
+            next,
+            SampleInput {
+                raw_dt_secs: 5.0,
+                slept_delta_secs: 0.0,
+                power_w: 12.0,
+                energy_full_wh: 60.0,
+                is_discharging: true,
+                raw_display_w: 2.0,
+            },
+        );
+        let docker = deltas.iter().find(|d| d.app_name == "Docker / Containers").unwrap();
+        let code = deltas.iter().find(|d| d.app_name == "Code").unwrap();
+        assert!((docker.cpu_secs - 0.5).abs() < 1e-6);
+        assert!((code.cpu_secs - 1.0).abs() < 1e-6);
+        assert!(code.live_power_w > docker.live_power_w);
+    }
+
+    #[test]
+    fn idle_machine_puts_power_in_unattributed_instead_of_tiny_process() {
+        // Probe P1-2: one process at 0.04% CPU (2_000 usec over 5s), battery at 9W
+        let mut init = HashMap::new();
+        init.insert("TinyDaemon".to_string(), fake_counter("TinyDaemon", 100_000, false));
         let mut tracker = AppEnergyTracker {
             prev_counters: init,
             prev_monotonic_s: 10.0,
             prev_suspended_s: 0.0,
+            max_dt_secs: 45.0,
         };
         let mut next = HashMap::new();
-        next.insert("Daemon".to_string(), fake_counter("Daemon", 200_000, false));
-        let (deltas, _) =
-            tracker.compute_delta_from_snapshots(next, 5.0, 0.0, 0.0, 60.0, true, 2.0);
-        let total_pct: f64 = deltas.iter().map(|d| d.battery_pct).sum();
-        assert_eq!(total_pct, 0.0);
+        next.insert("TinyDaemon".to_string(), fake_counter("TinyDaemon", 102_000, false));
+        let (deltas, _) = tracker.compute_delta_from_snapshots(
+            next,
+            SampleInput {
+                raw_dt_secs: 5.0,
+                slept_delta_secs: 0.0,
+                power_w: 9.0,
+                energy_full_wh: 60.0,
+                is_discharging: true,
+                raw_display_w: 2.0,
+            },
+        );
+        let daemon = deltas.iter().find(|d| d.app_name == "TinyDaemon").unwrap();
+        let unattr = deltas
+            .iter()
+            .find(|d| d.app_name == "Unattributed / Hardware & Idle")
+            .unwrap();
+        assert!(daemon.live_power_w < 0.05);
+        assert!(unattr.live_power_w > 6.5);
+    }
+
+    #[test]
+    fn classification_strips_dbus_launcher_and_matches_tokens() {
+        // Probe P1-6: D-Bus activated GNOME apps and Flatpak apps containing "apt" substring
+        let (name1, cat1) =
+            normalize_cgroup_unit("dbus-:1.2-org.gnome.Nautilus@0.service", "app").unwrap();
+        assert_eq!(name1, "Nautilus");
+        assert_eq!(cat1, "App");
+
+        let (name2, cat2) =
+            normalize_cgroup_unit("app-flatpak-net.sapples.LiveCaptions-1234.scope", "app")
+                .unwrap();
+        assert_eq!(name2, "LiveCaptions");
+        assert_eq!(cat2, "App");
+
+        let (name3, _) = normalize_cgroup_unit("dbus-broker.service", "system").unwrap();
+        assert_eq!(name3, "D-Bus Message Broker");
     }
 }

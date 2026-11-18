@@ -1,4 +1,4 @@
-.TH RUSTYBATTERY 1 "November 2026" "RustyBattery 0.10.0" "User Commands"
+.TH RUSTYBATTERY 1 "November 2026" "RustyBattery 0.11.0" "User Commands"
 .SH NAME
 rustybattery, battery \- Per-app power tracker, battery optimizer, and Smart Saver for Linux
 .SH SYNOPSIS
@@ -34,8 +34,11 @@ and 24h sleep drain rate. Pass \fB\-\-fix\fR to immediately apply \fBs2idle\fR o
 .B autopilot [status|on|off|whitelist APP|unwhitelist APP|config]
 View or configure Smart Battery Saver rules, thresholds, and protected app whitelist.
 .TP
-.B freeze APP \fR/\fB resume APP \fR/\fB stop APP
-Freeze (\fBcgroup.freeze = 1\fR or \fBSIGSTOP\fR), resume, or stop a running application.
+.B freeze APP \fR/\fB resume [APP | \-\-all] \fR/\fB stop APP
+Freeze (\fBcgroup.freeze = 1\fR or \fBSIGSTOP\fR), resume (pass \fB\-\-all\fR to thaw all frozen user cgroups), or gracefully stop a running application.
+.TP
+.B doctor
+Inspect cgroup v2 availability, active window focus method, RAPL access, power-profile backend, charge limits, and database health.
 .TP
 .B service [install|uninstall|status]
 Manage the 24/7 systemd user background collector (\fBrustybattery.service\fR).
