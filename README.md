@@ -2,18 +2,29 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.11.0** *(Latest)*
+### **Version 0.12.0** *(Latest)*
 - **✨ Improved User Experience:**
-  - Safer defaults and confirmations: `x` (Stop App) in TUI and `battery optimize` now ask for `[y/N]` confirmation, stops are graceful (`SIGTERM` before `SIGKILL`), and `battery resume --all` unfreezes everything in one command.
-  - Smart Saver now restores your exact previous power profile and keyboard brightness on wake/AC, skips Bluetooth blocking in clamshell/connected mode, and guards active audio, webcam, and terminal apps from auto-freezing.
-  - Added **`battery doctor`** to quickly check system support, focus detection, power profiles, and config health.
-- **🎯 More Accurate Power Attribution:**
-  - Per-unit CPU tracking (closing a container or browser tab no longer skews active drain), better app name detection for Flatpak/GNOME apps, `80%` battery charge-limit awareness, and an **Unattributed / Hardware & Idle** bucket for non-CPU draw.
-- **🚀 Faster Statusbar & Charts:**
-  - Cached statusbar updates (`<1 ms` for Waybar/Polybar), SQL-bucketed chart history, and thin-LTO release builds.
+  - Non-blocking service stops (`systemctl --user stop --no-block`) so optimizing or stopping apps never freezes the TUI.
+  - Strict `config.toml` validation (catches typos in key names) with automatic safe-mode fallback, atomic config saves, and clear error warnings in the TUI and `battery doctor`.
+  - Smarter "Since Full Charge" session tracking that won't reset after a brief AC plug-in, plus cached drain stats for faster TUI redraws.
+- **🔬 Calibrated Power Model, Confidence Flags & Custom App Rules:**
+  - Added **`battery calibrate`** to measure and save your laptop's baseline draw (`calibrated_baseline_w`), CPU Watts-per-core (`calibrated_cpu_w_per_core`), and configurable display power range (`display_min_w`, `display_max_w`).
+  - Added hardware RAPL package energy support (`measured`) and per-app attribution confidence tags (`measured`, `modelled`, `estimated`) in the TUI inspector and `battery summary --json`.
+  - Added support for custom user app classification rules via `~/.config/rustybattery/apps.toml` and tightened browser token matching so tools like `chrome-remote-desktop` and `mkchromecast` aren't grouped under Google Chrome.
+  - Replaced per-tick energy delta blending with an unbiased 60–90s rolling-window power estimator (`RollingEnergyEstimator`) for quantized battery gauges.
+- **🛡 Ownership-Tracked Freeze & Per-PID Audio Guards:**
+  - `battery resume --all` and daemon shutdown now track and thaw only apps frozen by RustyBattery (`rb_frozen_units.json`), with `--force-all` available to thaw all user cgroups.
+  - PipeWire/PulseAudio guard now matches active audio/mic streams per block by process ID (`application.process.id`) with a 30s cache.
+- **🔒 Database, Service & Release Hardening:**
+  - Enabled SQLite `PRAGMA auto_vacuum = INCREMENTAL` (schema v2 migration) so database file size shrinks after pruning.
+  - Hardened the `systemd` user unit (`NoNewPrivileges`, `MemoryMax=200M`, `TimeoutStopSec=15`) with interruptible daemon sleep and TUI signal handling.
+  - Added `SHA256SUMS` checksum verification to `install.sh`, `aarch64` release builds, and MSRV `1.88` CI checks.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.10.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.11.0)</b></summary>
+
+- **Version 0.11.0:**
+  - Safer defaults and confirmations (`[y/N]` prompt, graceful `SIGTERM` before `SIGKILL`, `battery resume --all`), power profile & keyboard backlight restore on wake/AC, audio/webcam/terminal freeze guards, `battery doctor`, per-unit CPU tracking, 80% charge-limit awareness, **Unattributed / Hardware & Idle** bucket, and `<1 ms` cached statusbar updates.
 
 - **Version 0.10.0:**
   - Monotonic & suspend-aware clocks, logind `PrepareForSleep` D-Bus hook, statically bundled `rusqlite` with daily DB retention, `toml` config caching, in-memory TUI search/sort/filter, and unit test suite.
