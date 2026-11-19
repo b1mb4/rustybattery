@@ -246,6 +246,58 @@ fn find_matching_proc_pids(target_app_name: &str) -> Vec<i32> {
     pids
 }
 
+fn owned_frozen_units_path() -> PathBuf {
+    let base = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("rustybattery");
+    let _ = fs::create_dir_all(&base);
+    base.join("rb_frozen_units.json")
+}
+
+fn load_owned_frozen_units() -> std::collections::HashSet<PathBuf> {
+    let path = owned_frozen_units_path();
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+fn save_owned_frozen_units(set: &std::collections::HashSet<PathBuf>) {
+    let path = owned_frozen_units_path();
+    if set.is_empty() {
+        let _ = fs::remove_file(&path);
+    } else {
+        let list: Vec<&PathBuf> = set.iter().collect();
+        if let Ok(json) = serde_json::to_string(&list) {
+            let tmp = path.with_extension("json.tmp");
+            if fs::write(&tmp, json).is_ok() {
+                let _ = fs::rename(&tmp, &path);
+            }
+        }
+    }
+}
+
+/// Thaws only the cgroup directories that RustyBattery itself froze (`rb_frozen_units.json`),
+/// leaving any cgroups frozen by the user or container tools untouched (`F-3`).
+pub fn thaw_owned_user_cgroups() -> Vec<String> {
+    let owned = load_owned_frozen_units();
+    let mut thawed = Vec::new();
+    for dir in owned {
+        let freeze_file = dir.join("cgroup.freeze");
+        if read_u64_file(&freeze_file) == 1 && fs::write(&freeze_file, "0").is_ok() {
+            let name = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| dir.display().to_string());
+            thawed.push(name);
+        }
+    }
+    save_owned_frozen_units(&std::collections::HashSet::new());
+    thawed
+}
+
 fn thaw_slice_recursive(dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -269,8 +321,10 @@ fn thaw_slice_recursive(dir: &Path) -> usize {
     count
 }
 
-/// Thaws every frozen cgroup (`cgroup.freeze == 1`) under the current user's systemd slice tree.
+/// Force-thaws every frozen cgroup (`cgroup.freeze == 1`) under the current user's systemd slice tree
+/// (`battery resume --force-all`).
 pub fn thaw_all_user_cgroups() -> usize {
+    let _ = thaw_owned_user_cgroups();
     let uid = unsafe { libc::getuid() };
     let user_base = PathBuf::from(format!(
         "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
@@ -295,16 +349,25 @@ pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
     let val = if freeze { "1" } else { "0" };
     let mut count = 0usize;
     let mut last_err = None;
+    let mut owned = load_owned_frozen_units();
 
     for dir in &dirs {
         let freeze_file = dir.join("cgroup.freeze");
         if freeze_file.exists() {
             match fs::write(&freeze_file, val) {
-                Ok(_) => count += 1,
+                Ok(_) => {
+                    count += 1;
+                    if freeze {
+                        owned.insert(dir.clone());
+                    } else {
+                        owned.remove(dir);
+                    }
+                }
                 Err(e) => last_err = Some(e),
             }
         }
     }
+    save_owned_frozen_units(&owned);
 
     if count > 0 {
         let action = if freeze {
@@ -342,13 +405,14 @@ pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
     }
 }
 
-/// Gracefully stops a user cgroup unit: sends `systemctl --user stop` (or `SIGTERM` to PIDs),
-/// waits up to `grace_ms` for processes to exit, and falls back to `cgroup.kill` only if still alive.
+/// Gracefully stops a user cgroup unit without blocking the daemon thread for 90s (`F-6`):
+/// sends `systemctl --user stop --no-block` (or `SIGTERM` to PIDs), waits up to `grace_ms`
+/// for processes to exit, and falls back to `cgroup.kill` only if still alive.
 fn graceful_stop_user_cgroup(dir: &Path, unit_name: &str, grace_ms: u64) -> bool {
     let mut initiated = false;
     if unit_name.ends_with(".service") || unit_name.ends_with(".scope") {
         if let Ok(out) = Command::new("systemctl")
-            .args(["--user", "stop", unit_name])
+            .args(["--user", "stop", "--no-block", unit_name])
             .output()
         {
             if out.status.success() {
@@ -928,7 +992,7 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
                 let mut ok = false;
                 for unit in &t.unit_names {
                     if let Ok(out) = Command::new("systemctl")
-                        .args(["--user", "stop", unit])
+                        .args(["--user", "stop", "--no-block", unit])
                         .output()
                     {
                         if out.status.success() {

@@ -116,11 +116,14 @@ pub struct AppSummaryRow {
     pub is_frozen: bool,
     /// Whether this app's window is currently focused in the foreground
     pub is_focused: bool,
+    /// Attribution confidence level (`"measured"`, `"modelled"`, `"estimated"`)
+    pub confidence: String,
 }
 
 pub struct Database {
     conn: Connection,
     pub path: PathBuf,
+    drain_cache: std::sync::Mutex<Option<(i64, i64, PeriodDrainStats)>>,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -235,6 +238,7 @@ impl Database {
         let instance = Self {
             conn,
             path: path.to_path_buf(),
+            drain_cache: std::sync::Mutex::new(None),
         };
         instance.init_schema()?;
         Ok(instance)
@@ -246,6 +250,7 @@ impl Database {
         let instance = Self {
             conn,
             path: PathBuf::from(":memory:"),
+            drain_cache: std::sync::Mutex::new(None),
         };
         instance.init_schema()?;
         Ok(instance)
@@ -258,7 +263,8 @@ impl Database {
 
     fn init_schema(&self) -> Result<()> {
         self.exec(
-            "PRAGMA journal_mode=WAL;
+            "PRAGMA auto_vacuum = INCREMENTAL;
+             PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS battery_samples (
                  timestamp INTEGER PRIMARY KEY,
@@ -318,6 +324,13 @@ impl Database {
                 let _ = self.conn.execute_batch(stmt);
             }
             let _ = self.conn.execute_batch("PRAGMA user_version = 1;");
+        }
+        if user_ver < 2 {
+            let _ = self.conn.execute_batch(
+                "PRAGMA auto_vacuum = INCREMENTAL;
+                 VACUUM;
+                 PRAGMA user_version = 2;",
+            );
         }
         Ok(())
     }
@@ -383,6 +396,7 @@ impl Database {
             .unwrap_or(95)
             .saturating_sub(2)
             .max(50) as f64;
+        let _ = self.set_meta("last_full_threshold", &format!("{:.1}", full_threshold));
         if (snap.capacity_pct >= full_threshold && !snap.status.is_discharging())
             || snap.status == BatteryStatus::Full
         {
@@ -392,7 +406,15 @@ impl Database {
         let prev_discharging = self.get_meta("last_sample_discharging").as_deref() == Some("1");
         let now_discharging = snap.status.is_discharging();
         if now_discharging && !prev_discharging {
-            let _ = self.set_meta("last_unplug_ts", &snap.timestamp.to_string());
+            let prev_unplug_ts = self
+                .get_meta("last_unplug_ts")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let near_full = snap.capacity_pct >= (full_threshold - 5.0).max(50.0);
+            let long_since_prev_unplug = snap.timestamp - prev_unplug_ts >= 30 * 60;
+            if near_full || long_since_prev_unplug {
+                let _ = self.set_meta("last_unplug_ts", &snap.timestamp.to_string());
+            }
         }
         let _ = self.set_meta(
             "last_sample_discharging",
@@ -497,12 +519,16 @@ impl Database {
             }
         }
 
+        let full_threshold = self
+            .get_meta("last_full_threshold")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(78.0);
         let ts: Option<i64> = self
             .conn
             .query_row(
                 "SELECT MAX(timestamp) FROM battery_samples
-                 WHERE capacity_pct >= 78.0 AND status != 'Discharging' AND timestamp >= ?1",
-                [week_ago],
+                 WHERE capacity_pct >= ?2 AND status != 'Discharging' AND timestamp >= ?1",
+                params![week_ago, full_threshold],
                 |r| r.get(0),
             )
             .ok()
@@ -552,6 +578,22 @@ impl Database {
     }
 
     pub fn get_period_drain_stats(&self, since_ts: i64) -> Result<PeriodDrainStats> {
+        let max_ts: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(timestamp), 0) FROM battery_samples WHERE timestamp >= ?1",
+                [since_ts],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if let Ok(cache) = self.drain_cache.lock() {
+            if let Some((cached_since, cached_max, ref stats)) = *cache {
+                if cached_since == since_ts && cached_max == max_ts {
+                    return Ok(stats.clone());
+                }
+            }
+        }
+
         let mut stmt = self.conn.prepare_cached(
             "SELECT timestamp, capacity_pct, status, energy_now_wh, screen_on, boot_id, suspended_secs
              FROM battery_samples WHERE timestamp >= ?1 ORDER BY timestamp ASC",
@@ -570,7 +612,11 @@ impl Database {
             })?
             .filter_map(|r| r.ok())
             .collect();
-        Ok(analyze_drain_rows(&rows))
+        let stats = analyze_drain_rows(&rows);
+        if let Ok(mut cache) = self.drain_cache.lock() {
+            *cache = Some((since_ts, max_ts, stats.clone()));
+        }
+        Ok(stats)
     }
 
     pub fn record_sleep_session(&self, s: &SleepSession) -> Result<()> {
@@ -649,6 +695,7 @@ impl Database {
                     pids_count: r.get::<_, i64>(11)? as u32,
                     is_frozen: false,
                     is_focused: false,
+                    confidence: "modelled".to_string(),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -663,6 +710,7 @@ impl Database {
                 existing.pids_count = live.pids_count;
                 existing.is_frozen = live.is_frozen;
                 existing.is_focused = live.is_focused;
+                existing.confidence = live.confidence.clone();
                 if live.live_power_w > existing.peak_power_w {
                     existing.peak_power_w = live.live_power_w;
                 }
@@ -685,6 +733,7 @@ impl Database {
                     pids_count: live.pids_count,
                     is_frozen: live.is_frozen,
                     is_focused: live.is_focused,
+                    confidence: live.confidence.clone(),
                 });
             }
         }
@@ -782,6 +831,12 @@ impl Database {
                 .flatten(),
             file_size_bytes: fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0),
         }
+    }
+
+    pub fn schema_version(&self) -> i64 {
+        self.conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0)
     }
 }
 
@@ -896,5 +951,15 @@ mod tests {
             on_battery: true,
         };
         assert!((s.drain_pct_per_hr() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn auto_vacuum_is_incremental() {
+        let db = Database::open_in_memory().unwrap();
+        let mode: i64 = db
+            .conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "auto_vacuum must be 2 (INCREMENTAL)");
     }
 }

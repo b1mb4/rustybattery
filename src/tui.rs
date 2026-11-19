@@ -1,8 +1,8 @@
 use crate::apps::{AppDeltaUsage, AppEnergyTracker};
 use crate::autopilot::{
     config_file_path, get_autopilot_log, is_app_whitelisted, is_autopilot_enabled,
-    load_autopilot_config, save_autopilot_config, set_autopilot_enabled, toggle_app_whitelist,
-    AutopilotConfig, SmartAutopilot,
+    last_config_error, load_autopilot_config, save_autopilot_config, set_autopilot_enabled,
+    toggle_app_whitelist, AutopilotConfig, SmartAutopilot,
 };
 use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
 use crate::db::{AppSummaryRow, BatteryHistoryPoint, Database, PeriodDrainStats};
@@ -10,7 +10,10 @@ use crate::optimize::{
     execute_optimizations, scan_optimization_targets, set_app_frozen, stop_or_kill_app,
     OptimizationTarget,
 };
-use crate::service::{install_systemd_service, is_daemon_active, is_service_file_installed};
+use crate::service::{
+    install_signal_handlers, install_systemd_service, is_daemon_active, is_service_file_installed,
+    is_stop_requested,
+};
 use crate::statusbar::send_status_notification;
 use anyhow::Result;
 use chrono::{Local, TimeZone};
@@ -306,6 +309,14 @@ impl AppUi {
         self.service_installed = is_service_file_installed();
         self.autopilot_enabled = is_autopilot_enabled(&self.db);
         self.autopilot_config = load_autopilot_config();
+        if let Some(cfg_err) = last_config_error() {
+            if self.status_message.is_none() {
+                self.status_message = Some((
+                    format!("⚠ config.toml error (safe mode): {cfg_err}"),
+                    Instant::now(),
+                ));
+            }
+        }
 
         if sample_live_tick {
             let (deltas, _) = self.tracker.sample_delta(
@@ -415,6 +426,7 @@ impl AppUi {
 }
 
 pub fn run_tui(db: Database) -> Result<()> {
+    install_signal_handlers();
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
@@ -453,6 +465,9 @@ fn run_tui_loop(
     let mut last_tick = Instant::now();
 
     loop {
+        if is_stop_requested() {
+            return Ok(());
+        }
         terminal.draw(|f| draw_ui(f, app))?;
 
         let timeout = tick_rate
@@ -2003,7 +2018,10 @@ fn draw_app_inspector(f: &mut Frame, app: &AppUi, area: Rect, is_modal: bool) {
         ListItem::new(Line::from(vec![
             Span::styled(" Live Power:     ", Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:.2} W  (Peak: {:.2} W)", sel.live_power_w, sel.peak_power_w),
+                format!(
+                    "{:.2} W  (Peak: {:.2} W · {})",
+                    sel.live_power_w, sel.peak_power_w, sel.confidence
+                ),
                 Style::default().fg(Color::LightGreen),
             ),
         ])),

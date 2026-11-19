@@ -113,7 +113,7 @@ pub fn current_boot_id() -> String {
 }
 
 /// Estimates internal panel + backlight power draw (W) from sysfs backlight brightness.
-/// Typical 13"–16" laptop eDP panels draw ~0.8 W at minimum and ~4.5 W at full brightness.
+/// Uses configured `display_min_w` and `display_max_w` from `config.toml` (defaults: 0.8 W to 4.5 W).
 pub fn estimate_display_power_w() -> f64 {
     estimate_display_power_w_with(is_screen_on())
 }
@@ -122,8 +122,12 @@ pub fn estimate_display_power_w_with(screen_on: bool) -> f64 {
     if !screen_on {
         return 0.0;
     }
+    let cfg = crate::autopilot::load_autopilot_config();
+    let min_w = cfg.display_min_w;
+    let max_w = cfg.display_max_w.max(min_w);
+    let mid_w = 0.5 * (min_w + max_w);
     let Ok(entries) = fs::read_dir("/sys/class/backlight") else {
-        return 2.0;
+        return mid_w;
     };
     for entry in entries.flatten() {
         let p = entry.path();
@@ -132,11 +136,26 @@ pub fn estimate_display_power_w_with(screen_on: bool) -> f64 {
         if let (Some(cur), Some(max)) = (cur, max) {
             if max > 0.0 {
                 let ratio = (cur / max).clamp(0.0, 1.0);
-                return 0.8 + 3.7 * ratio;
+                return min_w + (max_w - min_w) * ratio;
             }
         }
     }
-    2.0
+    mid_w
+}
+
+/// Reads cumulative hardware CPU package energy in microjoules (`energy_uj`) from Intel/AMD RAPL if readable.
+pub fn read_rapl_package_energy_uj() -> Option<u64> {
+    for path in [
+        "/sys/class/powercap/intel-rapl:0/energy_uj",
+        "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
+    ] {
+        if let Some(v) = read_u64(Path::new(path)) {
+            if v > 0 {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 pub fn is_screen_on() -> bool {
@@ -503,27 +522,30 @@ pub fn load_upower_history(energy_full_wh: f64) -> Vec<UpowerHistoryPoint> {
                     .to_string();
 
                     let power_w = match rates.binary_search_by_key(&ts, |&(t, _)| t) {
-                        Ok(idx) => rates[idx].1,
+                        Ok(idx) => Some(rates[idx].1),
                         Err(idx) => {
                             let c1 = idx.checked_sub(1).and_then(|i| rates.get(i));
                             let c2 = rates.get(idx);
                             match (c1, c2) {
                                 (Some(&(t1, w1)), Some(&(t2, w2))) => {
                                     if (ts - t1).abs() <= (t2 - ts).abs() && (ts - t1).abs() < 180 {
-                                        w1
+                                        Some(w1)
                                     } else if (t2 - ts).abs() < 180 {
-                                        w2
+                                        Some(w2)
                                     } else {
-                                        0.0
+                                        None
                                     }
                                 }
-                                (Some(&(t1, w1)), None) if (ts - t1).abs() < 180 => w1,
-                                (None, Some(&(t2, w2))) if (t2 - ts).abs() < 180 => w2,
-                                _ => 0.0,
+                                (Some(&(t1, w1)), None) if (ts - t1).abs() < 180 => Some(w1),
+                                (None, Some(&(t2, w2))) if (t2 - ts).abs() < 180 => Some(w2),
+                                _ => None,
                             }
                         }
                     };
 
+                    let Some(power_w) = power_w else {
+                        continue;
+                    };
                     let _ = energy_full_wh;
                     points.push(UpowerHistoryPoint {
                         timestamp: ts,

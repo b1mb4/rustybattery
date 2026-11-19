@@ -98,18 +98,20 @@ pub fn dim_and_save_kbd_backlight(db: &Database) -> bool {
             continue;
         }
         let b_path = entry.path().join("brightness");
-        if let Ok(cur_str) = fs::read_to_string(&b_path) {
-            if let Ok(cur_val) = cur_str.trim().parse::<u64>() {
-                if cur_val > 0 && db.get_meta(META_SAVED_KBD).is_none() {
+        let prev_val = fs::read_to_string(&b_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0);
+        if fs::write(&b_path, "0").is_ok() {
+            dimmed = true;
+            if let Some(cur_val) = prev_val {
+                if db.get_meta(META_SAVED_KBD).is_none() {
                     let _ = db.set_meta(
                         META_SAVED_KBD,
                         &format!("{}:{}", b_path.display(), cur_val),
                     );
                 }
             }
-        }
-        if fs::write(&b_path, "0").is_ok() {
-            dimmed = true;
         }
     }
     dimmed

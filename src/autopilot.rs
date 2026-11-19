@@ -26,7 +26,7 @@ const META_BT_BLOCKED_BY_SLEEP: &str = "autopilot_bt_blocked_for_sleep";
 const META_FROZEN_APPS: &str = "autopilot_frozen_apps";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AutopilotConfig {
     pub enabled: bool,
     pub auto_switch_power_profile: bool,
@@ -41,14 +41,24 @@ pub struct AutopilotConfig {
     pub whitelist: Vec<String>,
     /// Optional explicit allowlist of app names eligible for auto-freeze.
     pub freeze_allowlist: Vec<String>,
+    /// Minimum display power estimate in Watts (at 0% brightness).
+    pub display_min_w: f64,
+    /// Maximum display power estimate in Watts (at 100% brightness).
+    pub display_max_w: f64,
+    /// Calibrated or configured CPU package power per full core in Watts.
+    pub calibrated_cpu_w_per_core: f64,
+    /// Calibrated or configured system baseline power in Watts.
+    pub calibrated_baseline_w: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OptionalWrapper {
     smart_saver: Option<AutopilotConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigFileWrapper {
     smart_saver: AutopilotConfig,
 }
@@ -67,6 +77,10 @@ impl Default for AutopilotConfig {
             s2idle_sleep_saver: true,
             whitelist: Vec::new(),
             freeze_allowlist: Vec::new(),
+            display_min_w: 0.8,
+            display_max_w: 4.5,
+            calibrated_cpu_w_per_core: 12.0,
+            calibrated_baseline_w: 1.0,
         }
     }
 }
@@ -84,6 +98,19 @@ pub fn config_file_path() -> PathBuf {
 }
 
 static CONFIG_CACHE: Mutex<Option<(Option<SystemTime>, AutopilotConfig)>> = Mutex::new(None);
+static CONFIG_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn last_config_error() -> Option<String> {
+    CONFIG_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
+fn safe_fallback_config() -> AutopilotConfig {
+    AutopilotConfig {
+        enabled: false,
+        auto_freeze_enabled: false,
+        ..AutopilotConfig::default()
+    }
+}
 
 fn sanitize_config(mut cfg: AutopilotConfig) -> AutopilotConfig {
     cfg.idle_freeze_mins = cfg.idle_freeze_mins.clamp(1, 120);
@@ -94,24 +121,34 @@ fn sanitize_config(mut cfg: AutopilotConfig) -> AutopilotConfig {
         .clamp(3.0, (cfg.low_battery_pct - 2.0).max(3.0));
     cfg.whitelist.retain(|s| !s.trim().is_empty());
     cfg.freeze_allowlist.retain(|s| !s.trim().is_empty());
+    cfg.display_min_w = cfg.display_min_w.clamp(0.1, 15.0);
+    cfg.display_max_w = cfg.display_max_w.clamp(cfg.display_min_w + 0.2, 25.0);
+    cfg.calibrated_cpu_w_per_core = cfg.calibrated_cpu_w_per_core.clamp(1.0, 45.0);
+    cfg.calibrated_baseline_w = cfg.calibrated_baseline_w.clamp(0.2, 15.0);
     cfg
 }
 
-/// Strictly parses `content` as TOML and returns `Err` on syntax/type errors instead of
-/// silently resetting to defaults.
+/// Strictly parses `content` as TOML and returns `Err` on syntax, type, or unknown-key errors.
 pub fn try_parse_config_str(content: &str) -> Result<AutopilotConfig> {
-    let opt: OptionalWrapper =
-        toml::from_str(content).context("Invalid TOML syntax in config.toml")?;
-    let cfg = if let Some(inner) = opt.smart_saver {
-        inner
+    let cfg = if let Ok(opt) = toml::from_str::<OptionalWrapper>(content) {
+        if let Some(inner) = opt.smart_saver {
+            inner
+        } else {
+            toml::from_str::<AutopilotConfig>(content)
+                .context("Invalid Smart Saver config fields")?
+        }
     } else {
-        toml::from_str::<AutopilotConfig>(content).context("Invalid Smart Saver config fields")?
+        // Attempt direct flat parse or surface the `[smart_saver]` error
+        if content.contains("[smart_saver]") {
+            let wrap: OptionalWrapper =
+                toml::from_str(content).context("Invalid TOML in [smart_saver]")?;
+            wrap.smart_saver.unwrap_or_default()
+        } else {
+            toml::from_str::<AutopilotConfig>(content)
+                .context("Invalid TOML in config.toml")?
+        }
     };
     Ok(sanitize_config(cfg))
-}
-
-pub fn parse_config_str(content: &str) -> AutopilotConfig {
-    try_parse_config_str(content).unwrap_or_default()
 }
 
 pub fn format_config_str(cfg: &AutopilotConfig) -> String {
@@ -139,18 +176,47 @@ pub fn load_autopilot_config() -> AutopilotConfig {
 
     let cfg = match fs::read_to_string(&path) {
         Ok(content) => match try_parse_config_str(&content) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                eprintln!("rustybattery: config.toml parse error ({e}); keeping safe config");
-                if let Ok(guard) = CONFIG_CACHE.lock() {
-                    if let Some((_, cached_cfg)) = &*guard {
-                        return cached_cfg.clone();
-                    }
+            Ok(parsed) => {
+                if let Ok(mut err_g) = CONFIG_ERROR.lock() {
+                    *err_g = None;
                 }
-                return AutopilotConfig::default();
+                parsed
+            }
+            Err(e) => {
+                let err_msg = format!("{e:#}");
+                let is_new_err = if let Ok(mut err_g) = CONFIG_ERROR.lock() {
+                    let changed = err_g.as_deref() != Some(err_msg.as_str());
+                    *err_g = Some(err_msg.clone());
+                    changed
+                } else {
+                    false
+                };
+                if is_new_err {
+                    send_autopilot_notification(
+                        "⚠️ RustyBattery Config Error",
+                        &format!("config.toml error ({err_msg}); Smart Saver paused in safe mode."),
+                    );
+                }
+                let fallback = if let Ok(guard) = CONFIG_CACHE.lock() {
+                    guard
+                        .as_ref()
+                        .map(|(_, c)| c.clone())
+                        .unwrap_or_else(safe_fallback_config)
+                } else {
+                    safe_fallback_config()
+                };
+                if let Ok(mut guard) = CONFIG_CACHE.lock() {
+                    *guard = Some((mtime, fallback.clone()));
+                }
+                return fallback;
             }
         },
-        Err(_) => AutopilotConfig::default(),
+        Err(_) => {
+            if let Ok(mut err_g) = CONFIG_ERROR.lock() {
+                *err_g = None;
+            }
+            AutopilotConfig::default()
+        }
     };
 
     if let Ok(mut guard) = CONFIG_CACHE.lock() {
@@ -163,11 +229,17 @@ pub fn save_autopilot_config(cfg: &AutopilotConfig) -> Result<()> {
     let path = config_file_path();
     let clean = sanitize_config(cfg.clone());
     let content = format_config_str(&clean);
-    fs::write(&path, content)
-        .with_context(|| format!("Failed to write config at {}", path.display()))?;
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, content)
+        .with_context(|| format!("Failed to write temp config at {}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("Failed to rename config into {}", path.display()))?;
     let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
     if let Ok(mut guard) = CONFIG_CACHE.lock() {
         *guard = Some((mtime, clean));
+    }
+    if let Ok(mut err_g) = CONFIG_ERROR.lock() {
+        *err_g = None;
     }
     Ok(())
 }
@@ -602,25 +674,36 @@ pub fn set_bluetooth_blocked(block: bool) -> bool {
 }
 
 pub fn is_eligible_for_autofreeze(cfg: &AutopilotConfig, app_name: &str, category: &str) -> bool {
-    let lower = app_name.to_lowercase();
-    if lower.contains("gnome-shell")
-        || lower.contains("wayland")
-        || lower.contains("xorg")
-        || lower.contains("pipewire")
-        || lower.contains("wireplumber")
-        || lower.contains("pulseaudio")
-        || lower.contains("rustybattery")
-        || lower.contains("systemd")
-        || lower.contains("ptyxis")
-        || lower.contains("terminal")
-        || lower.contains("alacritty")
-        || lower.contains("kitty")
-        || lower.contains("wezterm")
-        || lower.contains("ghostty")
-        || lower.contains("konsole")
-        || lower.contains("foot")
-    {
+    if category == "Terminal" || category == "Desktop UI" || category == "System" {
         return false;
+    }
+    let lower = app_name.trim().to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split([' ', '-', '_', '.', '/'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    for protected in [
+        "gnome-shell",
+        "wayland",
+        "xorg",
+        "pipewire",
+        "wireplumber",
+        "pulseaudio",
+        "rustybattery",
+        "systemd",
+        "ptyxis",
+        "terminal",
+        "alacritty",
+        "kitty",
+        "wezterm",
+        "ghostty",
+        "konsole",
+        "foot",
+        "footclient",
+    ] {
+        if lower == protected || tokens.contains(&protected) {
+            return false;
+        }
     }
 
     if !cfg.freeze_allowlist.is_empty() {
@@ -726,10 +809,20 @@ mod tests {
     }
 
     #[test]
-    fn broken_toml_returns_err_instead_of_silent_defaults() {
-        // Probe P0-9: missing `]` in TOML must return Err
-        let broken = "[smart_saver]\nauto_freeze_enabled = false\nwhitelist = [\"Spotify\"\n";
+    fn broken_toml_returns_err_and_safe_fallback_disables_autopilot() {
+        // Probe F-1: missing `]` in TOML must return Err, and safe fallback has enabled == false
+        let broken = "[smart_saver]\nenabled = false\nwhitelist = [\"Spotify\"\n";
         assert!(try_parse_config_str(broken).is_err());
+        let safe = safe_fallback_config();
+        assert!(!safe.enabled);
+        assert!(!safe.auto_freeze_enabled);
+    }
+
+    #[test]
+    fn unknown_key_in_toml_is_rejected() {
+        // Probe F-2: misspelled key `whitelst` must return Err
+        let typo = "[smart_saver]\nauto_freeze_enabled = true\nwhitelst = [\"Spotify\"]\n";
+        assert!(try_parse_config_str(typo).is_err());
     }
 
     #[test]
@@ -785,6 +878,7 @@ mod tests {
             pids_count: 2,
             is_frozen: false,
             is_focused: true,
+            confidence: "modelled".to_string(),
         }];
         ap.evaluate(&db, &snap, &active_focused_delta);
         assert!(!ap.unfocused_since.contains_key("ClosedApp"));

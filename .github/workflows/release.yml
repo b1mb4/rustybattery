@@ -10,9 +10,9 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build & Publish Linux Release
-    runs-on: ubuntu-22.04
+  release-x86_64:
+    name: Build & Publish Linux Release (x86_64)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,7 +32,9 @@ jobs:
       - name: Package Debian/Ubuntu .deb
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then VERSION="0.11.0"; fi
+          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
           PKG_DIR="rustybattery_${VERSION}_amd64"
           mkdir -p "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share/man/man1"
           cp target/release/rustybattery "${PKG_DIR}/usr/bin/rustybattery"
@@ -46,11 +48,16 @@ jobs:
           Priority: optional
           Architecture: amd64
           Depends: libc6
+          Homepage: https://github.com/b1mb4/rustybattery
           Maintainer: b1mb4 <artemkluenkov41@gmail.com>
           Description: RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux
           EOF
           dpkg-deb --build "${PKG_DIR}"
           mv "${PKG_DIR}.deb" rustybattery_amd64.deb
+
+      - name: Generate SHA256SUMS
+        run: |
+          sha256sum rustybattery-linux-x86_64.tar.gz rustybattery_amd64.deb > SHA256SUMS
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -60,3 +67,29 @@ jobs:
           files: |
             rustybattery-linux-x86_64.tar.gz
             rustybattery_amd64.deb
+            SHA256SUMS
+
+  release-aarch64:
+    name: Build & Publish Linux Release (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary (aarch64)
+        run: cargo build --release --locked
+
+      - name: Package tarball (aarch64)
+        run: |
+          cp target/release/rustybattery .
+          tar -czf rustybattery-linux-aarch64.tar.gz rustybattery README.md install.sh man/
+          sha256sum rustybattery-linux-aarch64.tar.gz > SHA256SUMS-aarch64
+
+      - name: Upload aarch64 assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rustybattery-linux-aarch64.tar.gz
+            SHA256SUMS-aarch64

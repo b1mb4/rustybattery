@@ -1,8 +1,8 @@
 [package]
 name = "rustybattery"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 default-run = "rustybattery"
 description = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 authors = ["b1mb4 <artemkluenkov41@gmail.com>"]

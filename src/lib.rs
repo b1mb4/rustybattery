@@ -12,15 +12,15 @@ pub mod tui;
 use crate::apps::{detect_focused_apps, AppEnergyTracker, Focus};
 use crate::autopilot::{
     config_file_path, get_autopilot_log, get_last_autopilot_action, is_app_whitelisted,
-    is_autopilot_enabled, load_autopilot_config, save_autopilot_config, set_autopilot_enabled,
-    thaw_persisted_frozen_apps, try_parse_config_str, AutopilotConfig,
+    is_autopilot_enabled, last_config_error, load_autopilot_config, save_autopilot_config,
+    set_autopilot_enabled, thaw_persisted_frozen_apps, try_parse_config_str, AutopilotConfig,
 };
 use crate::battery::read_battery_snapshot;
 use crate::db::{default_db_path, Database};
 use crate::optimize::{
     disable_noisy_acpi_wakeups, execute_optimizations, inspect_s2idle_status,
     scan_disabled_noisy_acpi_wakeups, scan_optimization_targets, set_acpi_wakeups_state,
-    set_app_frozen, stop_or_kill_app, thaw_all_user_cgroups,
+    set_app_frozen, stop_or_kill_app, thaw_all_user_cgroups, thaw_owned_user_cgroups,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -79,14 +79,18 @@ enum Commands {
         app: String,
     },
 
-    /// Unfreeze / resume a frozen application (or pass `--all` to thaw all frozen user cgroups)
+    /// Unfreeze / resume a frozen application (`--all` thaws units frozen by RustyBattery; `--force-all` thaws all user cgroups)
     Resume {
         /// Application name (e.g., "Waterfox", "Obsidian")
         app: Option<String>,
 
-        /// Thaw all frozen cgroups under the current user's slice tree
+        /// Thaw all cgroup units that were frozen by RustyBattery
         #[arg(long)]
         all: bool,
+
+        /// Force-thaw every frozen cgroup under the current user's slice tree (including externally frozen units)
+        #[arg(long)]
+        force_all: bool,
     },
 
     /// Stop or kill all processes/units belonging to an application
@@ -154,6 +158,13 @@ enum Commands {
     /// Check system capabilities (cgroup v2, focus detection, RAPL, power profiles, logind, config)
     Doctor,
 
+    /// Calibrate baseline idle draw and CPU Watts-per-core for your laptop and save to config.toml
+    Calibrate {
+        /// Calibration duration in seconds (default: 4 seconds)
+        #[arg(short, long, default_value_t = 4)]
+        seconds: u64,
+    },
+
     /// View the manual page or install it for `man battery` / `man rustybattery`
     Man {
         /// Install man pages into ~/.local/share/man/man1/
@@ -199,11 +210,30 @@ pub fn run() -> Result<()> {
             println!("{msg}");
             Ok(())
         }
-        Commands::Resume { app, all } => {
-            if all || app.is_none() {
+        Commands::Resume {
+            app,
+            all,
+            force_all,
+        } => {
+            if force_all {
                 let db = Database::open(&default_db_path())?;
+                let _ = thaw_owned_user_cgroups();
                 let n = thaw_all_user_cgroups() + thaw_persisted_frozen_apps(&db);
-                println!("▶ Resumed all frozen user applications ({n} cgroup unit(s) thawed).");
+                println!("▶ Force-resumed all frozen user cgroups ({n} unit(s) thawed).");
+                Ok(())
+            } else if all || app.is_none() {
+                let db = Database::open(&default_db_path())?;
+                let owned = thaw_owned_user_cgroups();
+                let persisted = thaw_persisted_frozen_apps(&db);
+                let total = owned.len() + persisted;
+                if owned.is_empty() {
+                    println!("▶ Resumed RustyBattery-frozen applications ({total} unit(s) thawed).");
+                } else {
+                    println!(
+                        "▶ Resumed RustyBattery-frozen applications ({total} unit(s) thawed: {}).",
+                        owned.join(", ")
+                    );
+                }
                 Ok(())
             } else if let Some(name) = app {
                 let msg = set_app_frozen(&name, false)?;
@@ -590,6 +620,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::Doctor => run_doctor(),
+        Commands::Calibrate { seconds } => run_calibrate(seconds),
         Commands::Man { install } => {
             const MAN_PAGE: &str = include_str!("../man/rustybattery.1");
             if install {
@@ -674,6 +705,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
                 "cpu_secs": a.cpu_secs,
                 "memory_mb": a.memory_mb,
                 "pids_count": a.pids_count,
+                "confidence": a.confidence,
             })).collect::<Vec<_>>()
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -951,7 +983,13 @@ fn run_doctor() -> Result<()> {
     );
 
     let cfg_path = config_file_path();
-    if cfg_path.exists() {
+    let _ = load_autopilot_config();
+    if let Some(err) = last_config_error() {
+        println!(
+            "✖ Config validation:    {} (SAFE MODE — autopilot disabled: {err})",
+            cfg_path.display()
+        );
+    } else if cfg_path.exists() {
         match std::fs::read_to_string(&cfg_path).and_then(|s| {
             try_parse_config_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         }) {
@@ -969,13 +1007,62 @@ fn run_doctor() -> Result<()> {
     let db = Database::open(&default_db_path())?;
     let st = db.stats();
     println!(
-        "✔ SQLite Database:      {} ({:.1} KB, {} samples, {} app buckets, daemon active={})",
+        "✔ SQLite Database:      {} ({:.1} KB, schema v{}, {} samples, {} app buckets, daemon active={})",
         db.path.display(),
         (st.file_size_bytes as f64) / 1024.0,
+        db.schema_version(),
         st.battery_rows,
         st.app_rows,
         service::is_daemon_active(&db)
     );
 
+    Ok(())
+}
+
+fn run_calibrate(seconds: u64) -> Result<()> {
+    let dur_secs = seconds.clamp(2, 30);
+    println!("🔬 RustyBattery — Hardware Power Model Calibration ({dur_secs}s)");
+    println!("──────────────────────────────────────────────────────────────────────");
+    let bat_start = read_battery_snapshot()?;
+    let disp_w = crate::battery::estimate_display_power_w();
+    let mut tracker = AppEnergyTracker::new();
+
+    let mut power_samples = Vec::new();
+    for _ in 0..dur_secs {
+        thread::sleep(Duration::from_secs(1));
+        if let Ok(snap) = read_battery_snapshot() {
+            if snap.power_w > 0.1 {
+                power_samples.push(snap.power_w);
+            }
+        }
+    }
+
+    let avg_power_w = if power_samples.is_empty() {
+        bat_start.power_w.max(6.0)
+    } else {
+        power_samples.iter().sum::<f64>() / (power_samples.len() as f64)
+    };
+    let (deltas, dt) = tracker.sample_delta(avg_power_w, bat_start.energy_full_wh, true);
+    let total_cpu_secs: f64 = deltas.iter().map(|d| d.cpu_secs).sum();
+    let cores_busy = (total_cpu_secs / dt.max(0.5)).max(0.05);
+
+    let non_display_w = (avg_power_w - disp_w).max(1.0);
+    let baseline_w = (non_display_w * 0.25).clamp(0.5, 4.0);
+    let est_w_per_core = ((non_display_w - baseline_w).max(1.0) / cores_busy).clamp(4.0, 28.0);
+
+    let mut cfg = load_autopilot_config();
+    cfg.calibrated_baseline_w = (baseline_w * 100.0).round() / 100.0;
+    cfg.calibrated_cpu_w_per_core = (est_w_per_core * 100.0).round() / 100.0;
+    save_autopilot_config(&cfg)?;
+
+    println!("  • Average System Draw:       {:.2} W", avg_power_w);
+    println!("  • Estimated Display Draw:    {:.2} W", disp_w);
+    println!("  • Active CPU Load Observed:  {:.2} core(s)", cores_busy);
+    println!(
+        "  ✔ Saved calibrated_baseline_w = {:.2} W, calibrated_cpu_w_per_core = {:.2} W/core to {}",
+        cfg.calibrated_baseline_w,
+        cfg.calibrated_cpu_w_per_core,
+        config_file_path().display()
+    );
     Ok(())
 }

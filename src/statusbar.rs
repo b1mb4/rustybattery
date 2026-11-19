@@ -17,18 +17,18 @@ struct CachedStatus {
     live_deltas: Vec<AppDeltaUsage>,
 }
 
-fn runtime_status_path() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join("rustybattery");
+fn runtime_status_path() -> Option<PathBuf> {
+    let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let base = PathBuf::from(dir).join("rustybattery");
     let _ = fs::create_dir_all(&base);
-    base.join("status.json")
+    Some(base.join("status.json"))
 }
 
 /// Atomically writes the latest daemon snapshot to `$XDG_RUNTIME_DIR/rustybattery/status.json`.
 pub fn write_cached_status(bat: &BatterySnapshot, deltas: &[AppDeltaUsage]) -> Result<()> {
-    let path = runtime_status_path();
+    let Some(path) = runtime_status_path() else {
+        return Ok(());
+    };
     let tmp = path.with_extension("json.tmp");
     let payload = CachedStatus {
         timestamp: chrono::Utc::now().timestamp(),
@@ -41,7 +41,7 @@ pub fn write_cached_status(bat: &BatterySnapshot, deltas: &[AppDeltaUsage]) -> R
 }
 
 fn read_cached_status(max_age_secs: i64) -> Option<(BatterySnapshot, Vec<AppDeltaUsage>)> {
-    let path = runtime_status_path();
+    let path = runtime_status_path()?;
     let bytes = fs::read(&path).ok()?;
     let cached: CachedStatus = serde_json::from_slice(&bytes).ok()?;
     let now = chrono::Utc::now().timestamp();
@@ -308,7 +308,7 @@ pub fn send_status_notification(bat: &BatterySnapshot, top_apps: &[AppSummaryRow
 /// Stateful notification monitor used by `rustybattery daemon` to alert the user on
 /// sustained high power drain or low battery thresholds without spamming.
 pub struct NotificationMonitor {
-    high_drain_watts: f64,
+    pub high_drain_watts: f64,
     consecutive_high_drain_ticks: u32,
     last_high_drain_alert: Option<Instant>,
     alerted_20_pct: bool,

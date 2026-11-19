@@ -3,6 +3,60 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAppRule {
+    pub pattern: String,
+    pub name: String,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct UserAppsFile {
+    pub rules: Vec<UserAppRule>,
+}
+
+static USER_APPS_CACHE: Mutex<Option<(Option<SystemTime>, Vec<UserAppRule>)>> = Mutex::new(None);
+
+pub fn user_apps_file_path() -> PathBuf {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".config")
+        })
+        .join("rustybattery");
+    dir.join("apps.toml")
+}
+
+pub fn load_user_app_rules() -> Vec<UserAppRule> {
+    let path = user_apps_file_path();
+    let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if let Ok(guard) = USER_APPS_CACHE.lock() {
+        if let Some((cached_mtime, rules)) = &*guard {
+            if *cached_mtime == mtime {
+                return rules.clone();
+            }
+        }
+    }
+    let rules = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str::<UserAppsFile>(&s).ok())
+        .map(|f| f.rules)
+        .unwrap_or_default();
+    if let Ok(mut guard) = USER_APPS_CACHE.lock() {
+        *guard = Some((mtime, rules.clone()));
+    }
+    rules
+}
+
+fn default_confidence() -> String {
+    "modelled".to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Focus {
@@ -70,6 +124,9 @@ pub struct AppDeltaUsage {
     pub is_frozen: bool,
     /// Whether this app's window is currently focused
     pub is_focused: bool,
+    /// Attribution confidence level: `"measured"` (RAPL hardware counter), `"modelled"` (cgroup CPU model), or `"estimated"` (backlight/idle heuristic)
+    #[serde(default = "default_confidence")]
+    pub confidence: String,
 }
 
 fn strip_systemd_launcher_prefixes(raw: &str) -> String {
@@ -147,6 +204,14 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
         .filter(|s| !s.is_empty())
         .collect();
 
+    // 0. User-configured override rules from `~/.config/rustybattery/apps.toml`
+    for rule in load_user_app_rules() {
+        let pat = rule.pattern.trim().to_lowercase();
+        if !pat.is_empty() && (lower == pat || has_token(&tokens, &pat) || lower.contains(&pat)) {
+            return Some((rule.name, rule.category));
+        }
+    }
+
     // 1. Web Browsers
     if lower.contains("waterfox") {
         return Some(("Waterfox".to_string(), "Browser".to_string()));
@@ -163,7 +228,7 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     {
         return Some(("Zen Browser".to_string(), "Browser".to_string()));
     }
-    if lower.contains("firefox") {
+    if has_token(&tokens, "firefox") {
         return Some(("Firefox".to_string(), "Browser".to_string()));
     }
     if lower.contains("vivaldi") {
@@ -175,13 +240,16 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
     if lower.contains("thorium") {
         return Some(("Thorium Browser".to_string(), "Browser".to_string()));
     }
-    if lower.contains("chromium") {
+    if has_token(&tokens, "chromium") {
         return Some(("Chromium".to_string(), "Browser".to_string()));
     }
-    if lower.contains("chrome") {
+    if (has_token(&tokens, "chrome") || lower.contains("google-chrome"))
+        && !lower.contains("chrome-remote-desktop")
+        && !lower.contains("chromecast")
+    {
         return Some(("Google Chrome".to_string(), "Browser".to_string()));
     }
-    if lower.contains("brave") {
+    if has_token(&tokens, "brave") {
         return Some(("Brave Browser".to_string(), "Browser".to_string()));
     }
     if lower.contains("epiphany") || lower.contains("org.gnome.epiphany") {
@@ -1033,6 +1101,9 @@ pub struct SampleInput {
     pub energy_full_wh: f64,
     pub is_discharging: bool,
     pub raw_display_w: f64,
+    pub rapl_power_w: Option<f64>,
+    pub cpu_w_per_core: f64,
+    pub baseline_max_w: f64,
 }
 
 /// Stateful tracker that computes per-tick deltas between snapshots and attributes battery drain.
@@ -1040,6 +1111,7 @@ pub struct AppEnergyTracker {
     prev_counters: HashMap<String, RawAppCounter>,
     prev_monotonic_s: f64,
     prev_suspended_s: f64,
+    prev_rapl_uj: Option<u64>,
     pub max_dt_secs: f64,
 }
 
@@ -1056,6 +1128,7 @@ impl AppEnergyTracker {
             prev_counters: initial,
             prev_monotonic_s: crate::battery::monotonic_secs(),
             prev_suspended_s: crate::battery::suspended_total_secs(),
+            prev_rapl_uj: crate::battery::read_rapl_package_energy_uj(),
             max_dt_secs: DEFAULT_MAX_SAMPLE_DT_SECS,
         }
     }
@@ -1082,6 +1155,21 @@ impl AppEnergyTracker {
         self.prev_monotonic_s = now_mono;
         self.prev_suspended_s = now_susp;
 
+        let now_rapl = crate::battery::read_rapl_package_energy_uj();
+        let rapl_power_w = match (self.prev_rapl_uj, now_rapl) {
+            (Some(prev), Some(curr)) if curr >= prev && raw_dt >= 0.5 => {
+                let w = ((curr - prev) as f64 / 1_000_000.0) / raw_dt;
+                if w > 0.05 && w < 200.0 {
+                    Some(w)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        self.prev_rapl_uj = now_rapl;
+
+        let cfg = crate::autopilot::load_autopilot_config();
         let current = read_all_app_counters();
         let display_w = crate::battery::estimate_display_power_w();
         self.compute_delta_from_snapshots(
@@ -1093,6 +1181,9 @@ impl AppEnergyTracker {
                 energy_full_wh,
                 is_discharging,
                 raw_display_w: display_w,
+                rapl_power_w,
+                cpu_w_per_core: cfg.calibrated_cpu_w_per_core,
+                baseline_max_w: cfg.calibrated_baseline_w,
             },
         )
     }
@@ -1146,20 +1237,34 @@ impl AppEnergyTracker {
         } else {
             0.0
         };
+        let base_cap = if inp.baseline_max_w > 0.0 {
+            inp.baseline_max_w
+        } else {
+            1.0
+        };
         let baseline_w = if inp.is_discharging {
-            (1.0_f64).min((effective_power_w - display_w).max(0.0) * 0.30)
+            base_cap.min((effective_power_w - display_w).max(0.0) * 0.30)
         } else {
             0.0
         };
         let app_pool_w = (effective_power_w - display_w - baseline_w).max(0.0);
 
-        // Scale CPU-attributed power by actual CPU cores used (`cpu_cores_used * 12W/core`),
+        // Use hardware RAPL package power when readable, or calibrated `cpu_w_per_core` (default 12 W/core),
         // placing remaining non-CPU hardware draw into `Unattributed / Hardware & Idle`.
         let cpu_cores_used = (total_delta_usec as f64 / 1_000_000.0) / dt_secs;
-        let attributed_app_w = if inp.is_discharging {
-            app_pool_w.min(cpu_cores_used * 12.0)
+        let w_per_core = if inp.cpu_w_per_core > 0.0 {
+            inp.cpu_w_per_core
         } else {
-            0.0
+            12.0
+        };
+        let (attributed_app_w, app_confidence) = if inp.is_discharging {
+            if let Some(rapl_w) = inp.rapl_power_w {
+                (app_pool_w.min(rapl_w), "measured")
+            } else {
+                (app_pool_w.min(cpu_cores_used * w_per_core), "modelled")
+            }
+        } else {
+            (0.0, "modelled")
         };
         let unattributed_w = if inp.is_discharging {
             (app_pool_w - attributed_app_w).max(0.0)
@@ -1207,6 +1312,7 @@ impl AppEnergyTracker {
                 pids_count: curr.pids_count,
                 is_frozen: curr.is_frozen,
                 is_focused: curr.is_focused,
+                confidence: app_confidence.to_string(),
             });
         }
 
@@ -1228,6 +1334,7 @@ impl AppEnergyTracker {
                 pids_count: 0,
                 is_frozen: false,
                 is_focused: false,
+                confidence: "estimated".to_string(),
             });
         }
 
@@ -1250,6 +1357,7 @@ impl AppEnergyTracker {
                 pids_count: 0,
                 is_frozen: false,
                 is_focused: false,
+                confidence: "estimated".to_string(),
             });
         }
 
@@ -1293,6 +1401,7 @@ mod tests {
             prev_counters: init,
             prev_monotonic_s: 100.0,
             prev_suspended_s: 0.0,
+            prev_rapl_uj: None,
             max_dt_secs: 45.0,
         };
 
@@ -1307,6 +1416,9 @@ mod tests {
                 energy_full_wh: 60.0,
                 is_discharging: true,
                 raw_display_w: 2.0,
+                rapl_power_w: None,
+                cpu_w_per_core: 12.0,
+                baseline_max_w: 1.0,
             },
         );
         assert!(deltas.is_empty());
@@ -1320,6 +1432,7 @@ mod tests {
             prev_counters: init,
             prev_monotonic_s: 100.0,
             prev_suspended_s: 0.0,
+            prev_rapl_uj: None,
             max_dt_secs: 45.0,
         };
 
@@ -1334,6 +1447,9 @@ mod tests {
                 energy_full_wh: 60.0,
                 is_discharging: true,
                 raw_display_w: 2.0,
+                rapl_power_w: None,
+                cpu_w_per_core: 12.0,
+                baseline_max_w: 1.0,
             },
         );
         assert!((dt - 30.0).abs() < 1e-6);
@@ -1363,6 +1479,7 @@ mod tests {
             prev_counters: init,
             prev_monotonic_s: 0.0,
             prev_suspended_s: 0.0,
+            prev_rapl_uj: None,
             max_dt_secs: 45.0,
         };
 
@@ -1379,6 +1496,9 @@ mod tests {
                 energy_full_wh: 60.0,
                 is_discharging: true,
                 raw_display_w: 2.0,
+                rapl_power_w: None,
+                cpu_w_per_core: 12.0,
+                baseline_max_w: 1.0,
             },
         );
         let docker = deltas.iter().find(|d| d.app_name == "Docker / Containers").unwrap();
@@ -1397,6 +1517,7 @@ mod tests {
             prev_counters: init,
             prev_monotonic_s: 10.0,
             prev_suspended_s: 0.0,
+            prev_rapl_uj: None,
             max_dt_secs: 45.0,
         };
         let mut next = HashMap::new();
@@ -1410,6 +1531,9 @@ mod tests {
                 energy_full_wh: 60.0,
                 is_discharging: true,
                 raw_display_w: 2.0,
+                rapl_power_w: None,
+                cpu_w_per_core: 12.0,
+                baseline_max_w: 1.0,
             },
         );
         let daemon = deltas.iter().find(|d| d.app_name == "TinyDaemon").unwrap();
@@ -1437,5 +1561,15 @@ mod tests {
 
         let (name3, _) = normalize_cgroup_unit("dbus-broker.service", "system").unwrap();
         assert_eq!(name3, "D-Bus Message Broker");
+
+        let (crd_name, crd_cat) =
+            normalize_cgroup_unit("chrome-remote-desktop.service", "system").unwrap();
+        assert_ne!(crd_name, "Google Chrome");
+        assert_ne!(crd_cat, "Browser");
+
+        let (mkc_name, mkc_cat) =
+            normalize_cgroup_unit("mkchromecast.service", "app").unwrap();
+        assert_ne!(mkc_name, "Google Chrome");
+        assert_ne!(mkc_cat, "Browser");
     }
 }

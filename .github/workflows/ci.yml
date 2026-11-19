@@ -5,11 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
 
 jobs:
   test:
-    name: Build & Test
-    runs-on: ubuntu-22.04
+    name: Format, Clippy & Test
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -18,3 +20,13 @@ jobs:
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --release --locked
+
+  msrv:
+    name: MSRV (1.82)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV build
+        run: cargo check --all-targets --locked
