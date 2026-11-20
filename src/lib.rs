@@ -5,6 +5,7 @@ pub mod db;
 pub mod guards;
 pub mod optimize;
 pub mod power;
+pub mod report;
 pub mod service;
 pub mod statusbar;
 pub mod tui;
@@ -163,6 +164,45 @@ enum Commands {
         /// Calibration duration in seconds (default: 4 seconds)
         #[arg(short, long, default_value_t = 4)]
         seconds: u64,
+    },
+
+    /// Generate a daily or weekly battery health & app usage report (Markdown or JSON)
+    Report {
+        /// Number of days to summarize (default: 7)
+        #[arg(short, long, default_value_t = 7)]
+        days: u64,
+
+        /// Output format: "markdown" or "json"
+        #[arg(short, long, default_value = "markdown")]
+        format: String,
+
+        /// Maximum number of top apps to include
+        #[arg(short, long, default_value_t = 10)]
+        top: usize,
+    },
+
+    /// Export battery telemetry as CSV or Prometheus textfile metrics
+    Export {
+        /// Output format: "csv" or "prometheus"
+        #[arg(short, long, default_value = "csv")]
+        format: String,
+
+        /// Hours of history to export (0 = since last full charge)
+        #[arg(long, default_value_t = 24)]
+        hours: u64,
+    },
+
+    /// Show kernel wakeup sources (/sys/power/wakeup_sources) and 80% battery charge-limit helper
+    Wakeups {
+        /// Maximum number of wakeup sources to display
+        #[arg(short, long, default_value_t = 15)]
+        top: usize,
+    },
+
+    /// Generate shell completion scripts for bash, zsh, or fish
+    Completions {
+        /// Target shell: "bash", "zsh", or "fish"
+        shell: String,
     },
 
     /// View the manual page or install it for `man battery` / `man rustybattery`
@@ -446,6 +486,10 @@ pub fn run() -> Result<()> {
                         "  • s2idle Lid-Close Saver:      {}",
                         if cfg.s2idle_sleep_saver { "ON (auto-blocks BT & enforces power-saver)" } else { "OFF" }
                     );
+                    println!(
+                        "  • Alert Notifications:         {}",
+                        if cfg.notifications_enabled { "ON" } else { "OFF" }
+                    );
                     println!();
                     println!(
                         "Protected Whitelist ({}): {}",
@@ -621,6 +665,20 @@ pub fn run() -> Result<()> {
         }
         Commands::Doctor => run_doctor(),
         Commands::Calibrate { seconds } => run_calibrate(seconds),
+        Commands::Report { days, format, top } => {
+            let db = Database::open(&default_db_path())?;
+            report::print_report(&db, days, &format, top)
+        }
+        Commands::Export { format, hours } => {
+            let db = Database::open(&default_db_path())?;
+            report::print_export(&db, &format, hours)
+        }
+        Commands::Wakeups { top } => report::print_wakeup_report(top),
+        Commands::Completions { shell } => {
+            let script = report::generate_shell_completions(&shell)?;
+            print!("{script}");
+            Ok(())
+        }
         Commands::Man { install } => {
             const MAN_PAGE: &str = include_str!("../man/rustybattery.1");
             if install {

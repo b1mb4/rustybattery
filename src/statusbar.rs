@@ -313,6 +313,7 @@ pub struct NotificationMonitor {
     last_high_drain_alert: Option<Instant>,
     alerted_20_pct: bool,
     alerted_10_pct: bool,
+    last_budget_alerts: std::collections::HashMap<String, Instant>,
 }
 
 impl NotificationMonitor {
@@ -323,6 +324,48 @@ impl NotificationMonitor {
             last_high_drain_alert: None,
             alerted_20_pct: false,
             alerted_10_pct: false,
+            last_budget_alerts: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn evaluate_budgets(&mut self, db: &Database, bat: &BatterySnapshot) {
+        if !bat.status.is_discharging() {
+            return;
+        }
+        let cfg = load_autopilot_config();
+        if !cfg.notifications_enabled {
+            return;
+        }
+        let budget = cfg.app_hourly_budget_pct;
+        if budget <= 0.1 {
+            return;
+        }
+        let since_1h = chrono::Utc::now().timestamp() - 3600;
+        let Ok(rows) = db.get_app_breakdown(since_1h, &[]) else {
+            return;
+        };
+        for row in rows {
+            if row.category == "System" || row.battery_pct < budget {
+                continue;
+            }
+            let cooled = self
+                .last_budget_alerts
+                .get(&row.app_name)
+                .map(|t| t.elapsed() >= Duration::from_secs(1800))
+                .unwrap_or(true);
+            if cooled {
+                self.last_budget_alerts
+                    .insert(row.app_name.clone(), Instant::now());
+                let _ = send_desktop_notification(
+                    &format!("⚠️ Battery Budget Exceeded: {}", row.app_name),
+                    &format!(
+                        "{} used {:.1}% battery in the last hour (budget: {:.1}%/hr).\nRun `battery` to inspect or freeze it.",
+                        row.app_name, row.battery_pct, budget
+                    ),
+                    "normal",
+                    "battery-caution",
+                );
+            }
         }
     }
 
@@ -337,6 +380,9 @@ impl NotificationMonitor {
         }
 
         let cfg = load_autopilot_config();
+        if !cfg.notifications_enabled {
+            return;
+        }
         let low_pct = cfg.low_battery_pct;
         let crit_pct = cfg.critical_battery_pct;
 

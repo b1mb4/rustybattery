@@ -1572,4 +1572,51 @@ mod tests {
         assert_ne!(mkc_name, "Google Chrome");
         assert_ne!(mkc_cat, "Browser");
     }
+
+    #[test]
+    fn attributed_energy_never_exceeds_total_battery_energy() {
+        for power_w in [2.5, 8.0, 15.0, 35.0] {
+            for cpu_ms in [0u64, 50, 500, 5_000, 40_000] {
+                let mut init = HashMap::new();
+                init.insert("AppA".to_string(), fake_counter("AppA", 1_000_000, true));
+                init.insert("AppB".to_string(), fake_counter("AppB", 1_000_000, false));
+                let mut tracker = AppEnergyTracker {
+                    prev_counters: init,
+                    prev_monotonic_s: 0.0,
+                    prev_suspended_s: 0.0,
+                    prev_rapl_uj: None,
+                    max_dt_secs: 45.0,
+                };
+                let mut next = HashMap::new();
+                next.insert(
+                    "AppA".to_string(),
+                    fake_counter("AppA", 1_000_000 + cpu_ms * 1_000, true),
+                );
+                next.insert(
+                    "AppB".to_string(),
+                    fake_counter("AppB", 1_000_000 + (cpu_ms / 2) * 1_000, false),
+                );
+                let (deltas, dt) = tracker.compute_delta_from_snapshots(
+                    next,
+                    SampleInput {
+                        raw_dt_secs: 5.0,
+                        slept_delta_secs: 0.0,
+                        power_w,
+                        energy_full_wh: 60.0,
+                        is_discharging: true,
+                        raw_display_w: 2.5,
+                        rapl_power_w: None,
+                        cpu_w_per_core: 12.0,
+                        baseline_max_w: 1.0,
+                    },
+                );
+                let sum_wh: f64 = deltas.iter().map(|d| d.energy_wh).sum();
+                let budget_wh = power_w * (dt / 3600.0);
+                assert!(
+                    sum_wh <= budget_wh + 1e-6,
+                    "attributed {sum_wh} Wh exceeded budget {budget_wh} Wh at power={power_w}W"
+                );
+            }
+        }
+    }
 }

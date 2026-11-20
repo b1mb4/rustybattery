@@ -88,6 +88,15 @@ fi
 # Install local man pages (`man battery`, `man rustybattery`)
 "$INSTALL_DIR/rustybattery" man --install || true
 
+# Install bash/zsh/fish shell completions when standard user dirs exist
+if [ -d "$HOME/.local/share/bash-completion/completions" ] || mkdir -p "$HOME/.local/share/bash-completion/completions" 2>/dev/null; then
+    "$INSTALL_DIR/rustybattery" completions bash > "$HOME/.local/share/bash-completion/completions/battery" 2>/dev/null || true
+    "$INSTALL_DIR/rustybattery" completions bash > "$HOME/.local/share/bash-completion/completions/rustybattery" 2>/dev/null || true
+fi
+if [ -d "$HOME/.config/fish/completions" ]; then
+    "$INSTALL_DIR/rustybattery" completions fish > "$HOME/.config/fish/completions/battery.fish" 2>/dev/null || true
+fi
+
 printf "\n"
 "$INSTALL_DIR/rustybattery" doctor || true
 

@@ -2,26 +2,24 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.12.0** *(Latest)*
+### **Version 0.13.0** *(Latest)*
+- **📊 Daily/Weekly Reports & Telemetry Exporters:**
+  - Added **`battery report [--days 7] [--format markdown|json]`** to generate full battery health, screen-on time, sleep drain, and top consumer summaries.
+  - Added **`battery export --format csv|prometheus`** for spreadsheet analysis or Prometheus `node_exporter` textfile scraping.
+  - Added daily battery health & cycle-count tracking (`battery_health_daily`, SQLite schema v3) to monitor battery degradation over time.
+- **⏰ Kernel Wakeup Audit & 80% Charge-Limit Helper:**
+  - Added **`battery wakeups`** to inspect `/sys/power/wakeup_sources` (ranked by total active wake time) and display your laptop's `charge_control_end_threshold` along with a ready-to-paste `udev` rule for an 80% charge limit.
 - **✨ Improved User Experience:**
-  - Non-blocking service stops (`systemctl --user stop --no-block`) so optimizing or stopping apps never freezes the TUI.
-  - Strict `config.toml` validation (catches typos in key names) with automatic safe-mode fallback, atomic config saves, and clear error warnings in the TUI and `battery doctor`.
-  - Smarter "Since Full Charge" session tracking that won't reset after a brief AC plug-in, plus cached drain stats for faster TUI redraws.
-- **🔬 Calibrated Power Model, Confidence Flags & Custom App Rules:**
-  - Added **`battery calibrate`** to measure and save your laptop's baseline draw (`calibrated_baseline_w`), CPU Watts-per-core (`calibrated_cpu_w_per_core`), and configurable display power range (`display_min_w`, `display_max_w`).
-  - Added hardware RAPL package energy support (`measured`) and per-app attribution confidence tags (`measured`, `modelled`, `estimated`) in the TUI inspector and `battery summary --json`.
-  - Added support for custom user app classification rules via `~/.config/rustybattery/apps.toml` and tightened browser token matching so tools like `chrome-remote-desktop` and `mkchromecast` aren't grouped under Google Chrome.
-  - Replaced per-tick energy delta blending with an unbiased 60–90s rolling-window power estimator (`RollingEnergyEstimator`) for quantized battery gauges.
-- **🛡 Ownership-Tracked Freeze & Per-PID Audio Guards:**
-  - `battery resume --all` and daemon shutdown now track and thaw only apps frozen by RustyBattery (`rb_frozen_units.json`), with `--force-all` available to thaw all user cgroups.
-  - PipeWire/PulseAudio guard now matches active audio/mic streams per block by process ID (`application.process.id`) with a 30s cache.
-- **🔒 Database, Service & Release Hardening:**
-  - Enabled SQLite `PRAGMA auto_vacuum = INCREMENTAL` (schema v2 migration) so database file size shrinks after pruning.
-  - Hardened the `systemd` user unit (`NoNewPrivileges`, `MemoryMax=200M`, `TimeoutStopSec=15`) with interruptible daemon sleep and TUI signal handling.
-  - Added `SHA256SUMS` checksum verification to `install.sh`, `aarch64` release builds, and MSRV `1.88` CI checks.
+  - Added an **Alert Notifications** toggle in the `Shift+A` Smart Saver menu (`notifications_enabled` in `config.toml`) to silence background desktop alerts whenever you want.
+  - Added configurable **per-app hourly battery budget alerts** (`app_hourly_budget_pct` in `config.toml`) to notify you if an app exceeds its hourly drain budget.
+  - Added **`battery completions bash|zsh|fish`** (auto-installed by `install.sh`).
+  - Fixed SQL-bucketed battery history status to pick the **mode** (most frequent status per bucket) instead of lexicographical `MAX(status)`.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.11.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.12.0)</b></summary>
+
+- **Version 0.12.0:**
+  - Added `battery calibrate`, hardware RAPL (`measured`) and confidence tags (`measured`/`modelled`/`estimated`), `~/.config/rustybattery/apps.toml` custom app rules, unbiased rolling-window power estimator, strict `config.toml` validation with safe-mode fallback & atomic saves, ownership-tracked `battery resume --all` (`--force-all`), per-PID audio guards, non-blocking stops (`--no-block`), SQLite incremental `auto_vacuum`, hardened systemd unit, and `SHA256SUMS` + `aarch64` releases.
 
 - **Version 0.11.0:**
   - Safer defaults and confirmations (`[y/N]` prompt, graceful `SIGTERM` before `SIGKILL`, `battery resume --all`), power profile & keyboard backlight restore on wake/AC, audio/webcam/terminal freeze guards, `battery doctor`, per-unit CPU tracking, 80% charge-limit awareness, **Unattributed / Hardware & Idle** bucket, and `<1 ms` cached statusbar updates.

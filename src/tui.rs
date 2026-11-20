@@ -563,7 +563,7 @@ fn run_tui_loop(
                                 app.autopilot_modal = None;
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                *sel_idx = (*sel_idx + 1).min(8);
+                                *sel_idx = (*sel_idx + 1).min(9);
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 *sel_idx = sel_idx.saturating_sub(1);
@@ -619,6 +619,7 @@ fn run_tui_loop(
                                     }
                                     7 => cfg.dim_kbd_on_low_battery = !cfg.dim_kbd_on_low_battery,
                                     8 => cfg.s2idle_sleep_saver = !cfg.s2idle_sleep_saver,
+                                    9 => cfg.notifications_enabled = !cfg.notifications_enabled,
                                     _ => {}
                                 }
                                 let _ = save_autopilot_config(cfg);
@@ -2383,7 +2384,7 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
     };
 
     let popup_width = area.width.saturating_sub(6).min(96);
-    let popup_height = area.height.saturating_sub(4).min(26);
+    let popup_height = area.height.saturating_sub(4).min(27);
     let popup_area = Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
         y: (area.height.saturating_sub(popup_height)) / 2,
@@ -2417,7 +2418,7 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
         .margin(1)
         .constraints([
             Constraint::Length(2),
-            Constraint::Length(11),
+            Constraint::Length(12),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
@@ -2477,6 +2478,11 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
             "s2idle Lid-Close Saver",
             if cfg.s2idle_sleep_saver { "ON".to_string() } else { "OFF".to_string() },
             "Block Bluetooth & enforce power-saver on lid close",
+        ),
+        (
+            "Alert Notifications",
+            if cfg.notifications_enabled { "ON".to_string() } else { "OFF".to_string() },
+            "Enable/disable desktop alerts (low battery, high drain, autopilot)",
         ),
     ];
 

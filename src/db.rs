@@ -66,6 +66,15 @@ impl SleepSession {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BatteryHealthPoint {
+    pub day_ts: i64,
+    pub energy_full_wh: f64,
+    pub energy_design_wh: f64,
+    pub health_pct: f64,
+    pub cycle_count: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PruneReport {
     pub downsampled_rows: usize,
@@ -304,6 +313,13 @@ impl Database {
                  end_wh REAL NOT NULL,
                  on_battery INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS battery_health_daily (
+                 day_ts INTEGER PRIMARY KEY,
+                 energy_full_wh REAL NOT NULL,
+                 energy_design_wh REAL NOT NULL,
+                 health_pct REAL NOT NULL,
+                 cycle_count INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS meta (
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -330,6 +346,18 @@ impl Database {
                 "PRAGMA auto_vacuum = INCREMENTAL;
                  VACUUM;
                  PRAGMA user_version = 2;",
+            );
+        }
+        if user_ver < 3 {
+            let _ = self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS battery_health_daily (
+                     day_ts INTEGER PRIMARY KEY,
+                     energy_full_wh REAL NOT NULL,
+                     energy_design_wh REAL NOT NULL,
+                     health_pct REAL NOT NULL,
+                     cycle_count INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 3;",
             );
         }
         Ok(())
@@ -439,7 +467,52 @@ impl Database {
                 snap.suspended_total_secs
             ],
         )?;
+
+        if snap.energy_full_wh > 1.0 && snap.energy_design_wh > 1.0 {
+            let day_ts = (snap.timestamp / 86_400) * 86_400;
+            let _ = self.conn.execute(
+                "INSERT INTO battery_health_daily
+                 (day_ts, energy_full_wh, energy_design_wh, health_pct, cycle_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(day_ts) DO UPDATE SET
+                     energy_full_wh = excluded.energy_full_wh,
+                     energy_design_wh = excluded.energy_design_wh,
+                     health_pct = excluded.health_pct,
+                     cycle_count = MAX(cycle_count, excluded.cycle_count)",
+                params![
+                    day_ts,
+                    snap.energy_full_wh,
+                    snap.energy_design_wh,
+                    snap.health_pct,
+                    snap.cycle_count as i64
+                ],
+            );
+        }
         Ok(())
+    }
+
+    /// Returns daily battery health snapshots (oldest first) for degradation tracking.
+    pub fn get_health_history(&self, days: i64) -> Vec<BatteryHealthPoint> {
+        let cutoff = chrono::Utc::now().timestamp() - days.max(1) * 86_400;
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT day_ts, energy_full_wh, energy_design_wh, health_pct, cycle_count
+             FROM battery_health_daily
+             WHERE day_ts >= ?1
+             ORDER BY day_ts ASC",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([cutoff], |r| {
+            Ok(BatteryHealthPoint {
+                day_ts: r.get(0)?,
+                energy_full_wh: r.get(1)?,
+                energy_design_wh: r.get(2)?,
+                health_pct: r.get(3)?,
+                cycle_count: r.get::<_, i64>(4)? as u32,
+            })
+        })
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 
     pub fn record_app_deltas(&self, deltas: &[AppDeltaUsage]) -> Result<()> {
@@ -560,7 +633,25 @@ impl Database {
         }
 
         let mut stmt = self.conn.prepare_cached(
-            "SELECT MAX(timestamp), AVG(capacity_pct), MAX(status), AVG(power_w)
+            "SELECT
+                 MAX(timestamp),
+                 AVG(capacity_pct),
+                 CASE
+                     WHEN SUM(CASE WHEN status = 'Discharging' THEN 1 ELSE 0 END)
+                          >= SUM(CASE WHEN status = 'Charging' THEN 1 ELSE 0 END)
+                          AND SUM(CASE WHEN status = 'Discharging' THEN 1 ELSE 0 END)
+                          >= SUM(CASE WHEN status = 'Full' THEN 1 ELSE 0 END)
+                          AND SUM(CASE WHEN status = 'Discharging' THEN 1 ELSE 0 END) > 0
+                         THEN 'Discharging'
+                     WHEN SUM(CASE WHEN status = 'Charging' THEN 1 ELSE 0 END)
+                          >= SUM(CASE WHEN status = 'Full' THEN 1 ELSE 0 END)
+                          AND SUM(CASE WHEN status = 'Charging' THEN 1 ELSE 0 END) > 0
+                         THEN 'Charging'
+                     WHEN SUM(CASE WHEN status = 'Full' THEN 1 ELSE 0 END) > 0
+                         THEN 'Full'
+                     ELSE MIN(status)
+                 END,
+                 AVG(power_w)
              FROM battery_samples
              WHERE timestamp >= ?1
              GROUP BY timestamp / ?2
@@ -961,5 +1052,63 @@ mod tests {
             .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, 2, "auto_vacuum must be 2 (INCREMENTAL)");
+    }
+
+    #[test]
+    fn history_bucket_status_uses_mode_not_max_string() {
+        let db = Database::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let base = now - 3 * 86_400; // span > 500*5 so SQL bucketing path runs
+        for (offset, status) in [
+            (0, "Discharging"),
+            (10, "Discharging"),
+            (20, "Discharging"),
+            (30, "Unknown"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO battery_samples (timestamp, capacity_pct, status, power_w, energy_now_wh, energy_full_wh, voltage_v)
+                     VALUES (?1, 80.0, ?2, 8.0, 48.0, 60.0, 12.0)",
+                    params![base + offset, status],
+                )
+                .unwrap();
+        }
+        let hist = db.get_battery_history(base - 60).unwrap();
+        assert!(!hist.is_empty());
+        assert_eq!(hist[0].status, "Discharging");
+    }
+
+    #[test]
+    fn daily_health_history_records_and_updates_cycles() {
+        let db = Database::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let snap = BatterySnapshot {
+            timestamp: now,
+            device_name: "BAT0".to_string(),
+            manufacturer: "Test".to_string(),
+            model_name: "Test".to_string(),
+            technology: "Li-ion".to_string(),
+            capacity_pct: 80.0,
+            capacity_int: 80,
+            status: BatteryStatus::Discharging,
+            power_w: 8.0,
+            energy_now_wh: 44.0,
+            energy_full_wh: 55.0,
+            energy_design_wh: 60.0,
+            health_pct: 91.7,
+            voltage_v: 12.0,
+            cycle_count: 142,
+            ac_online: false,
+            time_remaining_mins: Some(300),
+            screen_on: true,
+            boot_id: "b1".to_string(),
+            suspended_total_secs: 0.0,
+            charge_limit_pct: Some(80),
+        };
+        db.record_battery_snapshot(&snap).unwrap();
+        let hist = db.get_health_history(7);
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].cycle_count, 142);
+        assert!((hist[0].health_pct - 91.7).abs() < 1e-6);
     }
 }

@@ -49,6 +49,10 @@ pub struct AutopilotConfig {
     pub calibrated_cpu_w_per_core: f64,
     /// Calibrated or configured system baseline power in Watts.
     pub calibrated_baseline_w: f64,
+    /// Optional per-app hourly battery drain budget (% of battery in 1 hour); 0.0 disables alerts.
+    pub app_hourly_budget_pct: f64,
+    /// Enable or disable background desktop alert notifications (low battery, high drain, budget, autopilot actions).
+    pub notifications_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +85,8 @@ impl Default for AutopilotConfig {
             display_max_w: 4.5,
             calibrated_cpu_w_per_core: 12.0,
             calibrated_baseline_w: 1.0,
+            app_hourly_budget_pct: 0.0,
+            notifications_enabled: true,
         }
     }
 }
@@ -125,6 +131,7 @@ fn sanitize_config(mut cfg: AutopilotConfig) -> AutopilotConfig {
     cfg.display_max_w = cfg.display_max_w.clamp(cfg.display_min_w + 0.2, 25.0);
     cfg.calibrated_cpu_w_per_core = cfg.calibrated_cpu_w_per_core.clamp(1.0, 45.0);
     cfg.calibrated_baseline_w = cfg.calibrated_baseline_w.clamp(0.2, 15.0);
+    cfg.app_hourly_budget_pct = cfg.app_hourly_budget_pct.clamp(0.0, 100.0);
     cfg
 }
 
@@ -717,6 +724,9 @@ pub fn is_eligible_for_autofreeze(cfg: &AutopilotConfig, app_name: &str, categor
 }
 
 fn send_autopilot_notification(summary: &str, body: &str) {
+    if !load_autopilot_config().notifications_enabled {
+        return;
+    }
     let _ = Command::new("notify-send")
         .args([
             "-a",

@@ -228,6 +228,7 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
             let _ = db.record_app_deltas(&deltas);
             let _ = write_cached_status(&snap, &deltas);
             notif_monitor.evaluate(&snap, &deltas);
+            notif_monitor.evaluate_budgets(&db, &snap);
             autopilot.evaluate(&db, &snap, &deltas);
             prev_snap = Some(snap);
         }
