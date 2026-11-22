@@ -535,7 +535,7 @@ pub fn load_upower_history(energy_full_wh: f64) -> Vec<UpowerHistoryPoint> {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     if let (Ok(ts), Ok(w)) = (parts[0].parse::<i64>(), parts[1].parse::<f64>()) {
-                        if ts > 1_000_000_000 && w >= 0.0 && w < 250.0 {
+                        if ts > 1_000_000_000 && (0.0..250.0).contains(&w) {
                             rates.push((ts, w));
                         }
                     }

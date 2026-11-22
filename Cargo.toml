@@ -2,7 +2,7 @@
 name = "rustybattery"
 version = "0.14.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 default-run = "rustybattery"
 description = "RustyBattery — Per-App Power Tracker & Battery Optimizer for Linux"
 authors = ["b1mb4 <artemkluenkov41@gmail.com>"]
@@ -21,11 +21,11 @@ strip = true
 anyhow = "1.0.97"
 chrono = { version = "0.4.40", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5.35", features = ["derive"] }
-crossterm = "0.28"
+crossterm = "0.29"
 dirs = "6.0.0"
 libc = "0.2.171"
-ratatui = "0.29"
-rusqlite = { version = "0.32", features = ["bundled"] }
+ratatui = "0.30"
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 toml = "0.8"

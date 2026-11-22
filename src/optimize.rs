@@ -451,7 +451,7 @@ pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
                 Ok(_) => {
                     count += 1;
                     if freeze {
-                        if !state.cgroups.iter().any(|p| p == dir) {
+                        if !state.cgroups.contains(dir) {
                             state.cgroups.push(dir.clone());
                         }
                     } else {

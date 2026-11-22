@@ -1013,14 +1013,16 @@ mod tests {
 
     #[test]
     fn config_roundtrip_preserves_special_app_names() {
-        let mut cfg = AutopilotConfig::default();
-        cfg.idle_freeze_mins = 15;
-        cfg.idle_power_threshold_w = 1.25;
-        cfg.s2idle_sleep_saver = false;
-        cfg.whitelist = vec![
-            "Spotify".to_string(),
-            "App, With Comma & #Hash".to_string(),
-        ];
+        let cfg = AutopilotConfig {
+            idle_freeze_mins: 15,
+            idle_power_threshold_w: 1.25,
+            s2idle_sleep_saver: false,
+            whitelist: vec![
+                "Spotify".to_string(),
+                "App, With Comma & #Hash".to_string(),
+            ],
+            ..AutopilotConfig::default()
+        };
 
         let serialized = format_config_str(&cfg);
         let parsed = try_parse_config_str(&serialized).unwrap();
@@ -1033,8 +1035,10 @@ mod tests {
     #[test]
     fn whitelist_uses_exact_match_and_rejects_empty_or_substring() {
         // Probe P0-9: empty entry '' and 'Code' against 'Decoder Studio'
-        let mut cfg = AutopilotConfig::default();
-        cfg.whitelist = vec!["".to_string(), "Code".to_string(), "Water*".to_string()];
+        let cfg = AutopilotConfig {
+            whitelist: vec!["".to_string(), "Code".to_string(), "Water*".to_string()],
+            ..AutopilotConfig::default()
+        };
         assert!(!is_app_whitelisted(&cfg, "Spotify"));
         assert!(!is_app_whitelisted(&cfg, "Decoder Studio"));
         assert!(is_app_whitelisted(&cfg, "code"));

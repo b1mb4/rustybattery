@@ -866,7 +866,7 @@ fn run_tui_loop(
                                     .table_area
                                     .y
                                     .saturating_add(app.table_area.height.saturating_sub(1));
-                                if row >= header_end && row < bottom_edge {
+                                if (header_end..bottom_edge).contains(&row) {
                                     let clicked = app.table_state.offset()
                                         + row.saturating_sub(header_end) as usize;
                                     if clicked < app.apps.len() {
@@ -883,7 +883,7 @@ fn run_tui_loop(
                                     .table_area
                                     .y
                                     .saturating_add(app.table_area.height.saturating_sub(1));
-                                if row >= header_end && row < bottom_edge {
+                                if (header_end..bottom_edge).contains(&row) {
                                     let clicked = app.table_state.offset()
                                         + row.saturating_sub(header_end) as usize;
                                     if clicked < app.apps.len() {
