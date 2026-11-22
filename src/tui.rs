@@ -478,7 +478,7 @@ fn run_tui_loop(
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
+            .unwrap_or(Duration::ZERO);
 
         if event::poll(timeout)? {
             match event::read()? {
@@ -735,11 +735,11 @@ fn run_tui_loop(
                             app.apply_filter_and_sort();
                         }
                         KeyCode::Char('c') => {
-                            let currently_shown = should_show_charts(&app, term_rect);
+                            let currently_shown = should_show_charts(app, term_rect);
                             app.charts_mode = app.charts_mode.toggle(currently_shown);
                         }
                         KeyCode::Enter => {
-                            if !should_show_details_panel(&app, term_rect) {
+                            if !should_show_details_panel(app, term_rect) {
                                 app.details_modal_open = !app.details_modal_open;
                             }
                         }
@@ -747,7 +747,7 @@ fn run_tui_loop(
                             if term_rect.width < 120 {
                                 app.details_modal_open = !app.details_modal_open;
                             } else {
-                                let currently_shown = should_show_details_panel(&app, term_rect);
+                                let currently_shown = should_show_details_panel(app, term_rect);
                                 app.details_mode = app.details_mode.toggle(currently_shown);
                             }
                         }
@@ -892,7 +892,7 @@ fn run_tui_loop(
                                         let term_size = terminal.size().unwrap_or_default();
                                         let term_rect =
                                             Rect::new(0, 0, term_size.width, term_size.height);
-                                        if !should_show_details_panel(&app, term_rect) {
+                                        if !should_show_details_panel(app, term_rect) {
                                             app.details_modal_open = true;
                                         }
                                     }

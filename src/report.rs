@@ -70,12 +70,12 @@ pub fn write_atomic_text(path: &Path, content: &str) -> Result<()> {
     let tmp_name = format!(".{file_name}.tmp.{}", std::process::id());
     let tmp_path = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
-        _ => Path::new(&tmp_name).to_path_buf(),
+        _ => std::path::PathBuf::from(tmp_name),
     };
     fs::write(&tmp_path, content)?;
     crate::paths::set_private_file_mode(&tmp_path);
     if let Err(e) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(tmp_path);
         return Err(e.into());
     }
     Ok(())
@@ -810,7 +810,7 @@ mod tests {
             & 0o777;
         assert_eq!(file_mode, 0o600);
         assert_eq!(dir_mode, 0o700);
-        assert_eq!(fs::read_to_string(&target).unwrap(), "a,b\n1,2\n");
+        assert_eq!(fs::read_to_string(target).unwrap(), "a,b\n1,2\n");
         let _ = fs::remove_dir_all(dir);
     }
 

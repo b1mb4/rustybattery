@@ -323,14 +323,14 @@ pub fn install_systemd_service(interval_secs: u64) -> Result<String> {
         let _ = fs::remove_file(&target_bin);
         if fs::copy(&current_exe, &target_bin).is_ok() {
             let _ = fs::remove_file(&battery_alias_bin);
-            let _ = std::os::unix::fs::symlink(&target_bin, &battery_alias_bin);
+            let _ = std::os::unix::fs::symlink(&target_bin, battery_alias_bin);
             target_bin
         } else {
             current_exe
         }
     } else {
         let _ = fs::remove_file(&battery_alias_bin);
-        let _ = std::os::unix::fs::symlink(&target_bin, &battery_alias_bin);
+        let _ = std::os::unix::fs::symlink(target_bin, battery_alias_bin);
         current_exe
     };
 
