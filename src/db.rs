@@ -1,4 +1,4 @@
-use crate::apps::AppDeltaUsage;
+use crate::apps::{AppDeltaUsage, Confidence};
 use crate::battery::{load_upower_history, BatterySnapshot, BatteryStatus};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 
 /// Raw samples are kept at full resolution for this long, then downsampled to 1 per minute.
 const RAW_RETENTION_SECS: i64 = 7 * 24 * 3600;
-/// Anything older than this is deleted entirely.
-const MAX_RETENTION_SECS: i64 = 90 * 24 * 3600;
 /// Gaps between awake samples longer than this mean the collector wasn't running (not sleep).
 const MAX_AWAKE_GAP_SECS: i64 = 90;
 /// Minimum suspended time inside an interval to count it as a sleep event.
@@ -125,24 +123,11 @@ pub struct AppSummaryRow {
     pub is_frozen: bool,
     /// Whether this app's window is currently focused in the foreground
     pub is_focused: bool,
-    /// Attribution confidence level (`"measured"`, `"modelled"`, `"estimated"`)
-    pub confidence: String,
+    /// Attribution confidence level (`MeasuredTotalModelledSplit`, `Modelled`, or `Estimated`)
+    pub confidence: Confidence,
 }
 
-pub struct Database {
-    conn: Connection,
-    pub path: PathBuf,
-    drain_cache: std::sync::Mutex<Option<(i64, i64, PeriodDrainStats)>>,
-}
-
-pub fn default_db_path() -> PathBuf {
-    let base = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("rustybattery");
-    let _ = fs::create_dir_all(&base);
-    base.join("rustybattery.db")
-}
-
+#[derive(Clone)]
 struct DrainRow {
     ts: i64,
     pct: f64,
@@ -153,9 +138,36 @@ struct DrainRow {
     suspended: f64,
 }
 
+struct DrainCacheState {
+    since_bucket: i64,
+    last_row: Option<DrainRow>,
+    stats: PeriodDrainStats,
+}
+
+pub struct Database {
+    conn: Connection,
+    pub path: PathBuf,
+    drain_cache: std::sync::Mutex<Option<DrainCacheState>>,
+    last_health_write: std::sync::Mutex<Option<(i64, f64, u32)>>,
+}
+
+pub fn default_db_path() -> PathBuf {
+    let base = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("rustybattery");
+    let _ = fs::create_dir_all(&base);
+    crate::paths::set_private_dir_mode(&base);
+    base.join("rustybattery.db")
+}
+
 /// Pure interval analysis used by [`Database::get_period_drain_stats`] (unit-tested).
 fn analyze_drain_rows(rows: &[DrainRow]) -> PeriodDrainStats {
     let mut stats = PeriodDrainStats::default();
+    fold_drain_rows(&mut stats, rows);
+    stats
+}
+
+fn fold_drain_rows(stats: &mut PeriodDrainStats, rows: &[DrainRow]) {
     for w in rows.windows(2) {
         let (prev, curr) = (&w[0], &w[1]);
         let dt = curr.ts - prev.ts;
@@ -171,7 +183,7 @@ fn analyze_drain_rows(rows: &[DrainRow]) -> PeriodDrainStats {
             // Legacy / UPower-imported rows: we can't tell sleep from "collector not running",
             // so only short gaps are counted (as awake time).
             if dt <= MAX_AWAKE_GAP_SECS {
-                add_awake(&mut stats, prev, curr, dt as f64);
+                add_awake(stats, prev, curr, dt as f64);
             }
             continue;
         }
@@ -200,14 +212,15 @@ fn analyze_drain_rows(rows: &[DrainRow]) -> PeriodDrainStats {
 
         if awake > 0.0 && awake <= MAX_AWAKE_GAP_SECS as f64 {
             let frac = if dt > 0 { awake / dt as f64 } else { 1.0 };
-            add_awake_scaled(&mut stats, prev, curr, awake, frac);
+            add_awake_scaled(stats, prev, curr, awake, frac);
         }
     }
 
     if stats.sleep_secs >= 60 {
         stats.sleep_drain_pct_per_hr = stats.sleep_drain_pct / (stats.sleep_secs as f64 / 3600.0);
+    } else {
+        stats.sleep_drain_pct_per_hr = 0.0;
     }
-    stats
 }
 
 fn add_awake(stats: &mut PeriodDrainStats, prev: &DrainRow, curr: &DrainRow, secs: f64) {
@@ -240,6 +253,7 @@ impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).ok();
+            crate::paths::set_private_dir_mode(parent);
         }
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open SQLite database at {}", path.display()))?;
@@ -248,8 +262,12 @@ impl Database {
             conn,
             path: path.to_path_buf(),
             drain_cache: std::sync::Mutex::new(None),
+            last_health_write: std::sync::Mutex::new(None),
         };
         instance.init_schema()?;
+        if path != Path::new(":memory:") {
+            crate::paths::set_private_file_mode(path);
+        }
         Ok(instance)
     }
 
@@ -260,6 +278,7 @@ impl Database {
             conn,
             path: PathBuf::from(":memory:"),
             drain_cache: std::sync::Mutex::new(None),
+            last_health_write: std::sync::Mutex::new(None),
         };
         instance.init_schema()?;
         Ok(instance)
@@ -275,6 +294,10 @@ impl Database {
             "PRAGMA auto_vacuum = INCREMENTAL;
              PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS boots (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 boot_id TEXT UNIQUE NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS battery_samples (
                  timestamp INTEGER PRIMARY KEY,
                  capacity_pct REAL NOT NULL,
@@ -285,7 +308,8 @@ impl Database {
                  voltage_v REAL NOT NULL,
                  screen_on INTEGER NOT NULL DEFAULT 1,
                  boot_id TEXT NOT NULL DEFAULT '',
-                 suspended_secs REAL NOT NULL DEFAULT -1
+                 suspended_secs REAL NOT NULL DEFAULT -1,
+                 boot_ref INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS app_usage_buckets (
                  bucket_ts INTEGER NOT NULL,
@@ -301,6 +325,7 @@ impl Database {
                  peak_power_w REAL NOT NULL,
                  memory_mb REAL NOT NULL,
                  pids_count INTEGER NOT NULL,
+                 confidence TEXT NOT NULL DEFAULT 'modelled',
                  PRIMARY KEY (bucket_ts, app_name)
              );
              CREATE INDEX IF NOT EXISTS idx_app_usage_ts ON app_usage_buckets(bucket_ts);
@@ -360,7 +385,37 @@ impl Database {
                  PRAGMA user_version = 3;",
             );
         }
+        if user_ver < 4 {
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE app_usage_buckets ADD COLUMN confidence TEXT NOT NULL DEFAULT 'modelled';",
+            );
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE battery_samples ADD COLUMN boot_ref INTEGER NOT NULL DEFAULT 0;",
+            );
+            let _ = self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS boots (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     boot_id TEXT UNIQUE NOT NULL
+                 );
+                 PRAGMA user_version = 4;",
+            );
+        }
         Ok(())
+    }
+
+    fn intern_boot_id(&self, boot_id: &str) -> i64 {
+        if boot_id.is_empty() {
+            return 0;
+        }
+        let _ = self.conn.execute(
+            "INSERT OR IGNORE INTO boots (boot_id) VALUES (?1)",
+            [boot_id],
+        );
+        self.conn
+            .query_row("SELECT id FROM boots WHERE boot_id = ?1", [boot_id], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0)
     }
 
     pub fn get_meta(&self, key: &str) -> Option<String> {
@@ -449,11 +504,12 @@ impl Database {
             if now_discharging { "1" } else { "0" },
         );
 
+        let boot_ref = self.intern_boot_id(&snap.boot_id);
         self.conn.execute(
             "INSERT OR IGNORE INTO battery_samples
              (timestamp, capacity_pct, status, power_w, energy_now_wh, energy_full_wh, voltage_v,
-              screen_on, boot_id, suspended_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              screen_on, boot_id, suspended_secs, boot_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, ?10)",
             params![
                 snap.timestamp,
                 snap.capacity_pct,
@@ -463,30 +519,52 @@ impl Database {
                 snap.energy_full_wh,
                 snap.voltage_v,
                 snap.screen_on as i64,
-                snap.boot_id,
-                snap.suspended_total_secs
+                snap.suspended_total_secs,
+                boot_ref
             ],
         )?;
 
         if snap.energy_full_wh > 1.0 && snap.energy_design_wh > 1.0 {
-            let day_ts = (snap.timestamp / 86_400) * 86_400;
-            let _ = self.conn.execute(
-                "INSERT INTO battery_health_daily
-                 (day_ts, energy_full_wh, energy_design_wh, health_pct, cycle_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(day_ts) DO UPDATE SET
-                     energy_full_wh = excluded.energy_full_wh,
-                     energy_design_wh = excluded.energy_design_wh,
-                     health_pct = excluded.health_pct,
-                     cycle_count = MAX(cycle_count, excluded.cycle_count)",
-                params![
-                    day_ts,
-                    snap.energy_full_wh,
-                    snap.energy_design_wh,
-                    snap.health_pct,
-                    snap.cycle_count as i64
-                ],
-            );
+            let should_write = if let Ok(guard) = self.last_health_write.lock() {
+                match *guard {
+                    Some((prev_ts, prev_full, prev_cycles)) => {
+                        snap.timestamp - prev_ts >= 3600
+                            || (snap.energy_full_wh - prev_full).abs() > 0.05
+                            || snap.cycle_count != prev_cycles
+                    }
+                    None => true,
+                }
+            } else {
+                true
+            };
+            if should_write {
+                let day_ts = (snap.timestamp / 86_400) * 86_400;
+                if self
+                    .conn
+                    .execute(
+                        "INSERT INTO battery_health_daily
+                         (day_ts, energy_full_wh, energy_design_wh, health_pct, cycle_count)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(day_ts) DO UPDATE SET
+                             energy_full_wh = MAX(energy_full_wh, excluded.energy_full_wh),
+                             energy_design_wh = excluded.energy_design_wh,
+                             health_pct = MAX(health_pct, excluded.health_pct),
+                             cycle_count = MAX(cycle_count, excluded.cycle_count)",
+                        params![
+                            day_ts,
+                            snap.energy_full_wh,
+                            snap.energy_design_wh,
+                            snap.health_pct,
+                            snap.cycle_count as i64
+                        ],
+                    )
+                    .is_ok()
+                {
+                    if let Ok(mut guard) = self.last_health_write.lock() {
+                        *guard = Some((snap.timestamp, snap.energy_full_wh, snap.cycle_count));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -529,8 +607,8 @@ impl Database {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO app_usage_buckets
-                 (bucket_ts, app_name, category, unit_hint, battery_pct, focused_battery_pct, focused_secs, energy_wh, cpu_secs, active_secs, peak_power_w, memory_mb, pids_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 (bucket_ts, app_name, category, unit_hint, battery_pct, focused_battery_pct, focused_secs, energy_wh, cpu_secs, active_secs, peak_power_w, memory_mb, pids_count, confidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(bucket_ts, app_name) DO UPDATE SET
                      battery_pct = battery_pct + excluded.battery_pct,
                      focused_battery_pct = focused_battery_pct + excluded.focused_battery_pct,
@@ -540,7 +618,12 @@ impl Database {
                      active_secs = active_secs + excluded.active_secs,
                      peak_power_w = MAX(peak_power_w, excluded.peak_power_w),
                      memory_mb = excluded.memory_mb,
-                     pids_count = excluded.pids_count;",
+                     pids_count = excluded.pids_count,
+                     confidence = CASE
+                         WHEN app_usage_buckets.confidence = 'estimated' OR excluded.confidence = 'estimated' THEN 'estimated'
+                         WHEN app_usage_buckets.confidence = 'modelled' OR excluded.confidence = 'modelled' THEN 'modelled'
+                         ELSE excluded.confidence
+                     END;",
             )?;
             for d in deltas {
                 if d.cpu_secs <= 0.0 && d.battery_pct <= 0.0 {
@@ -559,7 +642,8 @@ impl Database {
                     d.active_secs,
                     d.live_power_w,
                     d.memory_mb,
-                    d.pids_count as i64
+                    d.pids_count as i64,
+                    d.confidence.as_str()
                 ])?;
             }
         }
@@ -578,7 +662,7 @@ impl Database {
             .get_meta("last_unplug_ts")
             .and_then(|s| s.parse::<i64>().ok())
         {
-            if unplug_ts >= week_ago && unplug_ts <= now {
+            if (week_ago..=now).contains(&unplug_ts) {
                 return unplug_ts;
             }
         }
@@ -669,28 +753,61 @@ impl Database {
     }
 
     pub fn get_period_drain_stats(&self, since_ts: i64) -> Result<PeriodDrainStats> {
-        let max_ts: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(timestamp), 0) FROM battery_samples WHERE timestamp >= ?1",
-                [since_ts],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if let Ok(cache) = self.drain_cache.lock() {
-            if let Some((cached_since, cached_max, ref stats)) = *cache {
-                if cached_since == since_ts && cached_max == max_ts {
-                    return Ok(stats.clone());
+        let since_bucket = if since_ts > 0 {
+            (since_ts / 300) * 300
+        } else {
+            since_ts
+        };
+
+        if let Ok(mut cache) = self.drain_cache.lock() {
+            if let Some(ref mut state) = *cache {
+                if state.since_bucket == since_bucket {
+                    if let Some(ref last_row) = state.last_row {
+                        let mut stmt = self.conn.prepare_cached(
+                            "SELECT s.timestamp, s.capacity_pct, s.status, s.energy_now_wh, s.screen_on,
+                                    COALESCE(NULLIF(s.boot_id, ''), b.boot_id, ''), s.suspended_secs
+                             FROM battery_samples s
+                             LEFT JOIN boots b ON b.id = s.boot_ref
+                             WHERE s.timestamp > ?1
+                             ORDER BY s.timestamp ASC",
+                        )?;
+                        let new_rows: Vec<DrainRow> = stmt
+                            .query_map([last_row.ts], |r| {
+                                Ok(DrainRow {
+                                    ts: r.get(0)?,
+                                    pct: r.get(1)?,
+                                    status: r.get(2)?,
+                                    wh: r.get(3)?,
+                                    screen_on: r.get::<_, i64>(4)? != 0,
+                                    boot_id: r.get(5)?,
+                                    suspended: r.get(6)?,
+                                })
+                            })?
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        if !new_rows.is_empty() {
+                            let mut chunk = Vec::with_capacity(new_rows.len() + 1);
+                            chunk.push(last_row.clone());
+                            chunk.extend(new_rows);
+                            fold_drain_rows(&mut state.stats, &chunk);
+                            state.last_row = chunk.pop();
+                        }
+                        return Ok(state.stats.clone());
+                    }
                 }
             }
         }
 
         let mut stmt = self.conn.prepare_cached(
-            "SELECT timestamp, capacity_pct, status, energy_now_wh, screen_on, boot_id, suspended_secs
-             FROM battery_samples WHERE timestamp >= ?1 ORDER BY timestamp ASC",
+            "SELECT s.timestamp, s.capacity_pct, s.status, s.energy_now_wh, s.screen_on,
+                    COALESCE(NULLIF(s.boot_id, ''), b.boot_id, ''), s.suspended_secs
+             FROM battery_samples s
+             LEFT JOIN boots b ON b.id = s.boot_ref
+             WHERE s.timestamp >= ?1
+             ORDER BY s.timestamp ASC",
         )?;
         let rows: Vec<DrainRow> = stmt
-            .query_map([since_ts], |r| {
+            .query_map([since_bucket], |r| {
                 Ok(DrainRow {
                     ts: r.get(0)?,
                     pct: r.get(1)?,
@@ -705,7 +822,11 @@ impl Database {
             .collect();
         let stats = analyze_drain_rows(&rows);
         if let Ok(mut cache) = self.drain_cache.lock() {
-            *cache = Some((since_ts, max_ts, stats.clone()));
+            *cache = Some(DrainCacheState {
+                since_bucket,
+                last_row: rows.into_iter().last(),
+                stats: stats.clone(),
+            });
         }
         Ok(stats)
     }
@@ -760,7 +881,12 @@ impl Database {
             "SELECT app_name, MAX(category), MAX(unit_hint),
                     SUM(battery_pct), SUM(focused_battery_pct), SUM(focused_secs),
                     SUM(energy_wh), SUM(cpu_secs), SUM(active_secs),
-                    MAX(peak_power_w), AVG(memory_mb), MAX(pids_count)
+                    MAX(peak_power_w), AVG(memory_mb), MAX(pids_count),
+                    CASE
+                        WHEN SUM(CASE WHEN confidence = 'estimated' THEN 1 ELSE 0 END) > 0 THEN 'estimated'
+                        WHEN SUM(CASE WHEN confidence = 'modelled' THEN 1 ELSE 0 END) > 0 THEN 'modelled'
+                        ELSE COALESCE(MAX(confidence), 'modelled')
+                    END
              FROM app_usage_buckets
              WHERE bucket_ts >= ?1
              GROUP BY app_name
@@ -768,6 +894,7 @@ impl Database {
         )?;
         let mut rows: Vec<AppSummaryRow> = stmt
             .query_map([bucket_cutoff], |r| {
+                let conf_str: String = r.get(12)?;
                 Ok(AppSummaryRow {
                     app_name: r.get(0)?,
                     category: r.get(1)?,
@@ -786,7 +913,7 @@ impl Database {
                     pids_count: r.get::<_, i64>(11)? as u32,
                     is_frozen: false,
                     is_focused: false,
-                    confidence: "modelled".to_string(),
+                    confidence: Confidence::from_str_lossy(&conf_str),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -801,7 +928,7 @@ impl Database {
                 existing.pids_count = live.pids_count;
                 existing.is_frozen = live.is_frozen;
                 existing.is_focused = live.is_focused;
-                existing.confidence = live.confidence.clone();
+                existing.confidence = live.confidence;
                 if live.live_power_w > existing.peak_power_w {
                     existing.peak_power_w = live.live_power_w;
                 }
@@ -824,7 +951,7 @@ impl Database {
                     pids_count: live.pids_count,
                     is_frozen: live.is_frozen,
                     is_focused: live.is_focused,
-                    confidence: live.confidence.clone(),
+                    confidence: live.confidence,
                 });
             }
         }
@@ -856,10 +983,15 @@ impl Database {
         .unwrap_or_default()
     }
 
-    /// Downsamples old raw samples to 1/minute and deletes data past the retention window.
+    /// Downsamples old raw samples to 1/minute and deletes data past the configured retention window.
     pub fn prune(&self, now_ts: i64) -> Result<PruneReport> {
+        let retention_days = crate::autopilot::load_autopilot_config().retention_days;
+        self.prune_with_retention(now_ts, retention_days)
+    }
+
+    pub fn prune_with_retention(&self, now_ts: i64, retention_days: u64) -> Result<PruneReport> {
         let raw_cutoff = now_ts - RAW_RETENTION_SECS;
-        let max_cutoff = now_ts - MAX_RETENTION_SECS;
+        let max_cutoff = now_ts - (retention_days.clamp(7, 365) as i64) * 86_400;
         let mut report = PruneReport::default();
 
         let tx = self.conn.unchecked_transaction()?;
@@ -879,6 +1011,10 @@ impl Database {
         tx.execute("DELETE FROM sleep_sessions WHERE start_ts < ?1", [max_cutoff])?;
         tx.commit()?;
 
+        if let Ok(mut cache) = self.drain_cache.lock() {
+            *cache = None;
+        }
+
         let total = report.downsampled_rows + report.deleted_battery_rows + report.deleted_app_rows;
         if total > 20_000 {
             let _ = self.exec("PRAGMA incremental_vacuum(200);");
@@ -886,6 +1022,29 @@ impl Database {
         }
         self.set_meta("last_prune_ts", &now_ts.to_string())?;
         Ok(report)
+    }
+
+    /// Monotonic cumulative energy (Wh) per application across all retained buckets (used for Prometheus counter `N-10`).
+    pub fn get_cumulative_app_energy(&self, top: usize) -> Vec<(String, String, f64)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT app_name, MAX(category), SUM(energy_wh)
+             FROM app_usage_buckets
+             GROUP BY app_name
+             ORDER BY SUM(energy_wh) DESC
+             LIMIT ?1",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([top.max(1) as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_latest_sample_timestamp(&self) -> Option<i64> {
+        self.conn
+            .query_row("SELECT MAX(timestamp) FROM battery_samples", [], |r| r.get(0))
+            .ok()
+            .flatten()
     }
 
     /// Runs [`Database::prune`] at most once per 24 hours.
@@ -1024,7 +1183,7 @@ mod tests {
             ins(now - 10 * 24 * 3600 + i * 5);
             ins(now - 3600 + i * 5);
         }
-        let rep = db.prune(now).unwrap();
+        let rep = db.prune_with_retention(now, 90).unwrap();
         assert_eq!(rep.deleted_battery_rows, 12);
         assert_eq!(rep.downsampled_rows, 11);
         assert_eq!(db.stats().battery_rows, 13);
@@ -1110,5 +1269,95 @@ mod tests {
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].cycle_count, 142);
         assert!((hist[0].health_pct - 91.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn confidence_persists_and_keeps_worst_in_bucket() {
+        let db = Database::open_in_memory().unwrap();
+        let make_delta = |conf: Confidence| AppDeltaUsage {
+            app_name: "Firefox".to_string(),
+            category: "Browser".to_string(),
+            unit_hint: "firefox.scope".to_string(),
+            battery_pct: 1.0,
+            focused_battery_pct: 0.5,
+            energy_wh: 0.5,
+            cpu_secs: 2.0,
+            active_secs: 5.0,
+            focused_secs: 2.5,
+            live_power_w: 6.0,
+            live_cpu_pct: 20.0,
+            memory_mb: 300.0,
+            pids_count: 8,
+            is_frozen: false,
+            is_focused: true,
+            confidence: conf,
+        };
+
+        db.record_app_deltas_at(1_200, &[make_delta(Confidence::MeasuredTotalModelledSplit)])
+            .unwrap();
+        let rows1 = db.get_app_breakdown(900, &[]).unwrap();
+        assert_eq!(rows1[0].confidence, Confidence::MeasuredTotalModelledSplit);
+
+        db.record_app_deltas_at(1_200, &[make_delta(Confidence::Estimated)])
+            .unwrap();
+        let rows2 = db.get_app_breakdown(900, &[]).unwrap();
+        assert_eq!(rows2[0].confidence, Confidence::Estimated);
+    }
+
+    #[test]
+    fn incremental_drain_stats_matches_full_recompute() {
+        let db = Database::open_in_memory().unwrap();
+        let base = 1_700_000_000 / 300 * 300;
+        let mk_snap = |ts: i64, pct: f64, susp: f64| BatterySnapshot {
+            timestamp: ts,
+            device_name: "BAT0".to_string(),
+            manufacturer: "Test".to_string(),
+            model_name: "Test".to_string(),
+            technology: "Li-ion".to_string(),
+            capacity_pct: pct,
+            capacity_int: pct.round() as u8,
+            status: BatteryStatus::Discharging,
+            power_w: 8.0,
+            energy_now_wh: pct * 0.6,
+            energy_full_wh: 60.0,
+            energy_design_wh: 60.0,
+            health_pct: 100.0,
+            voltage_v: 12.0,
+            cycle_count: 10,
+            ac_online: false,
+            time_remaining_mins: Some(200),
+            screen_on: true,
+            boot_id: "boot-uuid-1234".to_string(),
+            suspended_total_secs: susp,
+            charge_limit_pct: None,
+        };
+
+        db.record_battery_snapshot(&mk_snap(base, 80.0, 0.0)).unwrap();
+        db.record_battery_snapshot(&mk_snap(base + 30, 79.9, 0.0)).unwrap();
+        db.record_battery_snapshot(&mk_snap(base + 60, 79.8, 0.0)).unwrap();
+        let s1 = db.get_period_drain_stats(base).unwrap();
+        assert_eq!(s1.sot_secs, 60);
+
+        // Append awake + suspend samples and test incremental update vs fresh recompute
+        db.record_battery_snapshot(&mk_snap(base + 90, 79.7, 0.0)).unwrap();
+        db.record_battery_snapshot(&mk_snap(base + 3690, 78.7, 3595.0))
+            .unwrap();
+        let s2_inc = db.get_period_drain_stats(base).unwrap();
+
+        let fresh = Database::open_in_memory().unwrap();
+        for s in [
+            mk_snap(base, 80.0, 0.0),
+            mk_snap(base + 30, 79.9, 0.0),
+            mk_snap(base + 60, 79.8, 0.0),
+            mk_snap(base + 90, 79.7, 0.0),
+            mk_snap(base + 3690, 78.7, 3595.0),
+        ] {
+            fresh.record_battery_snapshot(&s).unwrap();
+        }
+        let s2_full = fresh.get_period_drain_stats(base).unwrap();
+        assert_eq!(s2_inc.sot_secs, s2_full.sot_secs);
+        assert_eq!(s2_inc.sleep_secs, s2_full.sleep_secs);
+        assert_eq!(s2_inc.sleep_events, s2_full.sleep_events);
+        assert!((s2_inc.sleep_drain_pct - s2_full.sleep_drain_pct).abs() < 1e-6);
     }
 }

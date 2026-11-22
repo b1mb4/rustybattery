@@ -5,8 +5,8 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-static GUARD_CACHE: Mutex<Option<HashMap<String, (Instant, Option<&'static str>)>>> =
-    Mutex::new(None);
+type GuardCacheMap = HashMap<String, (Instant, Option<&'static str>)>;
+static GUARD_CACHE: Mutex<Option<GuardCacheMap>> = Mutex::new(None);
 const GUARD_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Walks `PPid` from the current process up to PID 1 and returns `true` if any ancestor
@@ -75,12 +75,31 @@ fn has_open_webcam(pids: &HashSet<u32>) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioGuardState {
+    Active,
+    Inactive,
+    Unknown,
+}
+
+fn allow_audio_name_fallback(pids: &HashSet<u32>, cgroup_dirs: &[PathBuf]) -> bool {
+    if pids.is_empty() {
+        return true;
+    }
+    cgroup_dirs.iter().any(|p| {
+        let s = p.to_string_lossy().to_lowercase();
+        s.contains("flatpak") || s.contains("snap")
+    })
+}
+
 /// Parses `pactl list sink-inputs` or `source-outputs` block-by-block and returns `true`
-/// if any uncorked stream block belongs to a PID in `pids` (or matches `app_name`).
+/// if any uncorked stream block belongs to a PID in `pids` (or matches `app_name` when
+/// `allow_name_fallback` is true for sandboxed/empty-PID apps).
 pub fn pactl_output_has_active_stream_for_pids(
     text: &str,
     pids: &HashSet<u32>,
     app_name: &str,
+    allow_name_fallback: bool,
 ) -> bool {
     let lower_app = app_name.trim().to_lowercase();
     for block in text.split("\n\n") {
@@ -88,22 +107,56 @@ pub fn pactl_output_has_active_stream_for_pids(
         if lower_block.contains("corked: yes") {
             continue;
         }
-        let mut pid_matched = false;
         for line in block.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("application.process.id =") {
                 let p_str = rest.trim().trim_matches('"');
                 if let Ok(p) = p_str.parse::<u32>() {
                     if pids.contains(&p) {
-                        pid_matched = true;
-                        break;
+                        return true;
+                    }
+                }
+            }
+            if allow_name_fallback && !lower_app.is_empty() {
+                if let Some(val) = trimmed
+                    .strip_prefix("application.name =")
+                    .or_else(|| trimmed.strip_prefix("application.process.binary ="))
+                {
+                    let lower_val = val.trim().trim_matches('"').to_lowercase();
+                    if !lower_val.is_empty()
+                        && (lower_val.contains(&lower_app)
+                            || (lower_val.len() >= 3 && lower_app.contains(&lower_val))
+                            || lower_app
+                                .split_whitespace()
+                                .any(|tok| tok.len() >= 3 && lower_val.contains(tok)))
+                    {
+                        return true;
                     }
                 }
             }
         }
-        if pid_matched
-            || (!lower_app.is_empty()
-                && lower_block.contains(&format!("application.name = \"{lower_app}")))
+    }
+    false
+}
+
+/// Parses `playerctl -a -f "{{playerName}}\t{{status}}" status` output for an app.
+pub fn parse_playerctl_playing_for_app(output: &str, app_name: &str) -> bool {
+    let lower_app = app_name.trim().to_lowercase();
+    if lower_app.is_empty() {
+        return false;
+    }
+    for line in output.lines() {
+        let Some((player, status)) = line.split_once('\t') else {
+            continue;
+        };
+        if !status.trim().eq_ignore_ascii_case("playing") {
+            continue;
+        }
+        let lower_player = player.trim().to_lowercase();
+        let player_base = lower_player.split('.').next().unwrap_or(&lower_player);
+        if !player_base.is_empty()
+            && (lower_player.contains(&lower_app)
+                || (player_base.len() >= 3 && lower_app.contains(player_base)))
         {
             return true;
         }
@@ -111,7 +164,42 @@ pub fn pactl_output_has_active_stream_for_pids(
     false
 }
 
-fn has_active_alsa_or_pulse_audio(app_name: &str, pids: &HashSet<u32>) -> bool {
+fn has_active_mpris_playback(app_name: &str) -> bool {
+    let Ok(out) = Command::new("playerctl")
+        .args(["-a", "-f", "{{playerName}}\t{{status}}", "status"])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success()
+        && parse_playerctl_playing_for_app(&String::from_utf8_lossy(&out.stdout), app_name)
+}
+
+fn has_desktop_idle_inhibitor() -> bool {
+    let Ok(out) = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.SessionManager",
+            "--object-path",
+            "/org/gnome/SessionManager",
+            "--method",
+            "org.gnome.SessionManager.IsInhibited",
+            "8",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && String::from_utf8_lossy(&out.stdout).contains("true")
+}
+
+fn has_active_alsa_or_pulse_audio(
+    app_name: &str,
+    pids: &HashSet<u32>,
+    allow_name_fallback: bool,
+) -> AudioGuardState {
     // 1. Fast procfs check: `/proc/asound/card*/pcm*/sub*/status` lists `state: RUNNING` and `owner_pid`
     if let Ok(cards) = fs::read_dir("/proc/asound") {
         for card in cards.flatten() {
@@ -136,7 +224,7 @@ fn has_active_alsa_or_pulse_audio(app_name: &str, pids: &HashSet<u32>) -> bool {
                                     let pid_str = rest.trim_start_matches([':', ' ']).trim();
                                     if let Ok(p) = pid_str.parse::<u32>() {
                                         if pids.contains(&p) {
-                                            return true;
+                                            return AudioGuardState::Active;
                                         }
                                     }
                                 }
@@ -149,18 +237,29 @@ fn has_active_alsa_or_pulse_audio(app_name: &str, pids: &HashSet<u32>) -> bool {
     }
 
     // 2. Check PipeWire / PulseAudio sink-inputs & source-outputs per stream block by PID
+    let mut any_pactl_ok = false;
     for kind in ["sink-inputs", "source-outputs"] {
         if let Ok(out) = Command::new("pactl").args(["list", kind]).output() {
             if out.status.success() {
+                any_pactl_ok = true;
                 let text = String::from_utf8_lossy(&out.stdout);
-                if pactl_output_has_active_stream_for_pids(&text, pids, app_name) {
-                    return true;
+                if pactl_output_has_active_stream_for_pids(
+                    &text,
+                    pids,
+                    app_name,
+                    allow_name_fallback,
+                ) {
+                    return AudioGuardState::Active;
                 }
             }
         }
     }
 
-    false
+    if any_pactl_ok {
+        AudioGuardState::Inactive
+    } else {
+        AudioGuardState::Unknown
+    }
 }
 
 fn has_systemd_inhibitor(app_name: &str) -> bool {
@@ -193,14 +292,27 @@ pub fn check_freeze_guards(app_name: &str, cgroup_dirs: &[PathBuf]) -> Option<&'
         Some("hosts current terminal session")
     } else {
         let pids = collect_pids(cgroup_dirs);
+        let fallback = allow_audio_name_fallback(&pids, cgroup_dirs);
         if has_open_webcam(&pids) {
             Some("active camera (/dev/video*) in use")
-        } else if has_active_alsa_or_pulse_audio(app_name, &pids) {
-            Some("active audio playback/recording stream")
-        } else if has_systemd_inhibitor(app_name) {
-            Some("holds active systemd inhibitor lock")
+        } else if has_active_mpris_playback(app_name) {
+            Some("active MPRIS media playback")
         } else {
-            None
+            match has_active_alsa_or_pulse_audio(app_name, &pids, fallback) {
+                AudioGuardState::Active => Some("active audio playback/recording stream"),
+                AudioGuardState::Unknown => {
+                    Some("audio guard unavailable (pactl failed — failing closed)")
+                }
+                AudioGuardState::Inactive => {
+                    if has_systemd_inhibitor(app_name) {
+                        Some("holds active systemd inhibitor lock")
+                    } else if has_desktop_idle_inhibitor() {
+                        Some("holds desktop session idle inhibitor")
+                    } else {
+                        None
+                    }
+                }
+            }
         }
     };
 
@@ -237,7 +349,8 @@ Sink Input #12
         assert!(pactl_output_has_active_stream_for_pids(
             sample,
             &pids,
-            "Zen Browser"
+            "Zen Browser",
+            false
         ));
 
         let mut other_pids = HashSet::new();
@@ -245,7 +358,58 @@ Sink Input #12
         assert!(!pactl_output_has_active_stream_for_pids(
             sample,
             &other_pids,
-            "Firefox"
+            "Firefox",
+            true
         ));
+    }
+
+    #[test]
+    fn pactl_name_fallback_applies_only_when_enabled() {
+        let sample = "\
+Sink Input #77
+\tCorked: no
+\tProperties:
+\t\tapplication.name = \"Firefox\"
+\t\tapplication.process.binary = \"firefox-bin\"
+\t\tapplication.process.id = \"9999\"
+";
+        let mut wrong_pids = HashSet::new();
+        wrong_pids.insert(1234);
+
+        // Regular app with known PIDs does not false-match by name alone
+        assert!(!pactl_output_has_active_stream_for_pids(
+            sample,
+            &wrong_pids,
+            "Firefox",
+            false
+        ));
+        // Sandboxed Flatpak/Snap app (or empty PID set) falls back to name/binary matching
+        assert!(pactl_output_has_active_stream_for_pids(
+            sample,
+            &wrong_pids,
+            "Firefox",
+            true
+        ));
+        assert!(allow_audio_name_fallback(
+            &wrong_pids,
+            &[PathBuf::from(
+                "/sys/fs/cgroup/user.slice/app-flatpak-org.mozilla.firefox-1.scope"
+            )]
+        ));
+        assert!(!allow_audio_name_fallback(
+            &wrong_pids,
+            &[PathBuf::from(
+                "/sys/fs/cgroup/user.slice/app-firefox.slice"
+            )]
+        ));
+    }
+
+    #[test]
+    fn playerctl_parser_matches_playing_app_only() {
+        let output = "spotify\tPaused\nzen\tPlaying\nfirefox.instance42\tPlaying\n";
+        assert!(!parse_playerctl_playing_for_app(output, "Spotify"));
+        assert!(parse_playerctl_playing_for_app(output, "Zen Browser"));
+        assert!(parse_playerctl_playing_for_app(output, "Firefox"));
+        assert!(!parse_playerctl_playing_for_app(output, "Discord"));
     }
 }

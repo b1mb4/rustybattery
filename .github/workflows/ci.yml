@@ -10,16 +10,30 @@ on:
 
 jobs:
   test:
-    name: Format, Clippy & Test
+    name: Clippy & Test (x86_64)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Run unit tests
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --release --locked
+
+  test-aarch64:
+    name: Test (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit tests (aarch64)
+        run: cargo test --locked
 
   msrv:
     name: MSRV (1.88)
@@ -30,3 +44,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV build
         run: cargo check --all-targets --locked
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

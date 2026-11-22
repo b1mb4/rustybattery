@@ -309,13 +309,19 @@ impl AppUi {
         self.service_installed = is_service_file_installed();
         self.autopilot_enabled = is_autopilot_enabled(&self.db);
         self.autopilot_config = load_autopilot_config();
-        if let Some(cfg_err) = last_config_error() {
-            if self.status_message.is_none() {
-                self.status_message = Some((
-                    format!("⚠ config.toml error (safe mode): {cfg_err}"),
-                    Instant::now(),
-                ));
-            }
+        if let Some(cfg_err) = last_config_error().filter(|_| self.status_message.is_none()) {
+            self.status_message = Some((
+                format!("⚠ config.toml error (safe mode): {cfg_err}"),
+                Instant::now(),
+            ));
+        }
+        if let Some(rules_err) =
+            crate::apps::last_apps_rules_error().filter(|_| self.status_message.is_none())
+        {
+            self.status_message = Some((
+                format!("⚠ apps.toml error (using last good rules): {rules_err}"),
+                Instant::now(),
+            ));
         }
 
         if sample_live_tick {

@@ -1,3 +1,4 @@
+use crate::paths::Paths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -143,19 +144,48 @@ pub fn estimate_display_power_w_with(screen_on: bool) -> f64 {
     mid_w
 }
 
-/// Reads cumulative hardware CPU package energy in microjoules (`energy_uj`) from Intel/AMD RAPL if readable.
-pub fn read_rapl_package_energy_uj() -> Option<u64> {
-    for path in [
-        "/sys/class/powercap/intel-rapl:0/energy_uj",
-        "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
-    ] {
-        if let Some(v) = read_u64(Path::new(path)) {
-            if v > 0 {
-                return Some(v);
+fn scan_powercap_dir_packages(dir: &Path) -> Option<u64> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut total_uj = 0u64;
+    let mut found = false;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(name) = read_trimmed(&p.join("name")) else {
+            continue;
+        };
+        if name.starts_with("package-") {
+            if let Some(v) = read_u64(&p.join("energy_uj")) {
+                if v > 0 {
+                    total_uj = total_uj.saturating_add(v);
+                    found = true;
+                }
             }
         }
     }
+    if found {
+        Some(total_uj)
+    } else {
+        None
+    }
+}
+
+/// Reads cumulative hardware CPU package energy (`package-*` domains) in microjoules (`energy_uj`)
+/// from `/sys/class/powercap` if readable, summing across multi-package systems (`N-7`, `E-4`).
+pub fn read_rapl_package_energy_uj_in(paths: &Paths) -> Option<u64> {
+    let powercap = paths.powercap();
+    if let Some(v) = scan_powercap_dir_packages(&powercap) {
+        return Some(v);
+    }
+    let nested = powercap.join("intel-rapl");
+    if nested.is_dir() {
+        return scan_powercap_dir_packages(&nested);
+    }
     None
+}
+
+/// Reads cumulative hardware CPU package energy in microjoules (`energy_uj`) from Intel/AMD RAPL if readable.
+pub fn read_rapl_package_energy_uj() -> Option<u64> {
+    read_rapl_package_energy_uj_in(&Paths::real())
 }
 
 pub fn is_screen_on() -> bool {
@@ -210,12 +240,8 @@ fn read_u64(path: &Path) -> Option<u64> {
     read_i64(path).map(|v| v.unsigned_abs())
 }
 
-/// Finds all system laptop battery directories in `/sys/class/power_supply/`
-/// across all Linux hardware platforms (x86_64 ACPI `BAT0`/`BAT1`/`CMB0`, ThinkPad dual batteries,
-/// Apple Silicon `macsmc-battery`, ARM/Chromebook `sbs-*`, etc.), while filtering out peripheral
-/// HID/Bluetooth batteries (mice, keyboards, headphones, controllers where `scope == "Device"`).
-pub fn find_battery_dirs() -> Vec<PathBuf> {
-    let base = Path::new("/sys/class/power_supply");
+pub fn find_battery_dirs_in(paths: &Paths) -> Vec<PathBuf> {
+    let base = paths.power_supply();
     let Ok(entries) = fs::read_dir(base) else {
         return Vec::new();
     };
@@ -245,19 +271,26 @@ pub fn find_battery_dirs() -> Vec<PathBuf> {
     candidates
 }
 
-pub fn is_ac_online() -> bool {
-    let base = Path::new("/sys/class/power_supply");
+/// Finds all system laptop battery directories in `/sys/class/power_supply/`
+/// across all Linux hardware platforms (x86_64 ACPI `BAT0`/`BAT1`/`CMB0`, ThinkPad dual batteries,
+/// Apple Silicon `macsmc-battery`, ARM/Chromebook `sbs-*`, etc.), while filtering out peripheral
+/// HID/Bluetooth batteries (mice, keyboards, headphones, controllers where `scope == "Device"`).
+pub fn find_battery_dirs() -> Vec<PathBuf> {
+    find_battery_dirs_in(&Paths::real())
+}
+
+pub fn is_ac_online_in(paths: &Paths) -> bool {
+    let base = paths.power_supply();
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(dev_type) = read_trimmed(&path.join("type")) {
-                if dev_type.eq_ignore_ascii_case("Mains")
+                if (dev_type.eq_ignore_ascii_case("Mains")
                     || dev_type.eq_ignore_ascii_case("USB")
-                    || dev_type.eq_ignore_ascii_case("USB_PD")
+                    || dev_type.eq_ignore_ascii_case("USB_PD"))
+                    && read_u64(&path.join("online")) == Some(1)
                 {
-                    if read_u64(&path.join("online")) == Some(1) {
-                        return true;
-                    }
+                    return true;
                 }
             }
         }
@@ -265,8 +298,16 @@ pub fn is_ac_online() -> bool {
     false
 }
 
+pub fn is_ac_online() -> bool {
+    is_ac_online_in(&Paths::real())
+}
+
 pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
-    let bat_dirs = find_battery_dirs();
+    read_battery_snapshot_with_paths(&Paths::real())
+}
+
+pub fn read_battery_snapshot_with_paths(paths: &Paths) -> Result<BatterySnapshot> {
+    let bat_dirs = find_battery_dirs_in(paths);
     let first_dir = bat_dirs
         .first()
         .context("No system battery found in /sys/class/power_supply/")?;
@@ -383,7 +424,7 @@ pub fn read_battery_snapshot() -> Result<BatterySnapshot> {
         100.0
     };
 
-    let ac_online = is_ac_online();
+    let ac_online = is_ac_online_in(paths);
 
     let time_remaining_mins = if total_power_w > 0.25 {
         match overall_status {

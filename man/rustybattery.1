@@ -1,4 +1,4 @@
-.TH RUSTYBATTERY 1 "November 2026" "RustyBattery 0.11.0" "User Commands"
+.TH RUSTYBATTERY 1 "November 2026" "RustyBattery 0.14.0" "User Commands"
 .SH NAME
 rustybattery, battery \- Per-app power tracker, battery optimizer, and Smart Saver for Linux
 .SH SYNOPSIS
@@ -11,8 +11,8 @@ rustybattery, battery \- Per-app power tracker, battery optimizer, and Smart Sav
 [\fICOMMAND\fR]
 .SH DESCRIPTION
 .B RustyBattery
-is a lightweight, zero-dependency Linux battery & per-app power monitor written in Rust.
-It tracks per-application energy drain (\fB%\fR, \fBFocused %\fR, \fBWh\fR, \fBW\fR),
+is a lightweight Linux battery & per-app power monitor written in Rust.
+It tracks per-application energy drain (\fB%\fR, \fBFocused %\fR, \fBWh\fR, \fBW\fR, and confidence levels),
 Screen-On Time (\fBSoT\fR), Sleep/Suspend drain (\fB%/hr\fR), and battery health in a local
 SQLite database, and provides both an interactive terminal UI and a 24/7 systemd user daemon.
 .SH COMMANDS
@@ -24,27 +24,56 @@ Launch the interactive TUI dashboard.
 Print a CLI power summary, Screen-On Time, Sleep/Suspend drain, and top draining apps.
 Pass \fB\-\-hours 0\fR (default) for since last full charge, or \fB\-\-json\fR for JSON output.
 .TP
-.B optimize [\-\-dry\-run]
+.B optimize [\-\-dry\-run] [\-\-yes]
 Scan and interactively optimize background hogs and system power tunables.
 .TP
-.B sleep [\-\-fix]
+.B sleep [\-\-fix] [\-\-undo]
 Audit \fBs2idle\fR sleep mode, lid state, noisy ACPI USB/PCI wakeup triggers, Bluetooth status,
-and 24h sleep drain rate. Pass \fB\-\-fix\fR to immediately apply \fBs2idle\fR optimizations.
+and 24h sleep drain rate. Pass \fB\-\-fix\fR to apply or \fB\-\-undo\fR to revert \fBs2idle\fR optimizations.
 .TP
 .B autopilot [status|on|off|whitelist APP|unwhitelist APP|config]
 View or configure Smart Battery Saver rules, thresholds, and protected app whitelist.
+Pass \fBconfig \-\-check\fR or \fBconfig \-\-init\fR to validate or initialize \fIconfig.toml\fR.
 .TP
-.B freeze APP \fR/\fB resume [APP | \-\-all] \fR/\fB stop APP
-Freeze (\fBcgroup.freeze = 1\fR or \fBSIGSTOP\fR), resume (pass \fB\-\-all\fR to thaw all frozen user cgroups), or gracefully stop a running application.
+.B freeze APP \fR/\fB resume [APP | \-\-all | \-\-force\-all] \fR/\fB stop APP
+Freeze (\fBcgroup.freeze = 1\fR or \fBSIGSTOP\fR), resume (\fB\-\-all\fR thaws RustyBattery-frozen apps;
+\fB\-\-force\-all\fR thaws all frozen user cgroups), or gracefully stop a running application.
 .TP
 .B doctor
-Inspect cgroup v2 availability, active window focus method, RAPL access, power-profile backend, charge limits, and database health.
+Inspect cgroup v2 availability, active window focus method, multi-package RAPL access, power-profile
+backend, \fIconfig.toml\fR / \fIapps.toml\fR validation, calibration status, and database health.
 .TP
-.B service [install|uninstall|status]
-Manage the 24/7 systemd user background collector (\fBrustybattery.service\fR).
+.B calibrate [\-\-idle\-secs N] [\-\-load\-secs N] [\-\-reset]
+Run a 3-phase on-battery power model calibration (idle + 1-core + all-core load) to fit baseline
+and W/core slopes (plus RAPL idle floor when readable). Pass \fB\-\-reset\fR to restore defaults.
 .TP
-.B statusbar [\-\-format waybar|polybar|i3|plain] [\-\-top N] [\-\-print\-config]
-Output compact JSON/text status for Waybar, Polybar, or i3status.
+.B report [\-\-days N] [\-\-format markdown|json] [\-\-top N] [\-\-output FILE]
+Generate a Markdown or JSON battery health and top consumer report (written atomically with
+\fB0600\fR permissions when \fB\-\-output\fR is specified).
+.TP
+.B export [\-\-format csv|prometheus] [\-\-hours N] [\-\-per\-app] [\-\-top N] [\-\-output FILE]
+Export battery history CSV, per-app CSV breakdown (\fB\-\-per\-app\fR), or Prometheus textfile
+collector metrics (including cumulative \fBrustybattery_app_energy_wh_total\fR counters).
+.TP
+.B wakeups [\-\-top N]
+Inspect active kernel wakeup sources (\fI/sys/class/wakeup\fR / \fI/sys/kernel/debug/wakeup_sources\fR)
+and print the battery charge-limit helper.
+.TP
+.B charge\-limit [\-\-set N]
+Inspect \fIcharge_control_end_threshold\fR, apply a limit (\fB20..=100\fR), or print a targeted
+\fBKERNEL==\fR udev rule and resume hook note.
+.TP
+.B record\-trace [\-\-seconds N] [\-\-interval N] \-\-output FILE
+Capture live battery, RAPL, and per-app cgroup counters into a JSONL trace file for offline replay.
+.TP
+.B completions bash|zsh|fish
+Generate shell completion scripts dynamically from the CLI definition.
+.TP
+.B service [install|uninstall|status|prune|reset\-stats]
+Manage the 24/7 systemd user background collector (\fBrustybattery.service\fR), prune history, or reset app buckets.
+.TP
+.B statusbar [\-\-format waybar|polybar|tmux|plain] [\-\-top N] [\-\-print\-config]
+Output compact JSON/text status for Waybar, Polybar, or Tmux.
 .TP
 .B notify
 Send a desktop notification with current battery status and top draining apps.
@@ -86,10 +115,13 @@ Quit the TUI.
 .SH FILES
 .TP
 .I ~/.config/rustybattery/config.toml
-Persistent Smart Battery Saver rules, thresholds, and protected app whitelist.
+Persistent Smart Battery Saver rules, thresholds, budgets, and protected app whitelist.
 .TP
-.I ~/.local/share/rustybattery/history.db
-SQLite database storing battery samples, Screen-On Time, and per-app energy buckets.
+.I ~/.config/rustybattery/apps.toml
+Custom application grouping and category mapping rules (\fBmatch_mode\fR: \fBtoken\fR|\fBexact\fR|\fBsubstring\fR).
+.TP
+.I ~/.local/share/rustybattery/rustybattery.db
+SQLite database (\fB0600\fR) storing battery samples, Screen-On Time, boots, and per-app energy buckets.
 .TP
 .I ~/.config/systemd/user/rustybattery.service
 Systemd user unit for the 24/7 background collector and Smart Saver daemon.

@@ -2,21 +2,24 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.13.0** *(Latest)*
-- **📊 Daily/Weekly Reports & Telemetry Exporters:**
-  - Added **`battery report [--days 7] [--format markdown|json]`** to generate full battery health, screen-on time, sleep drain, and top consumer summaries.
-  - Added **`battery export --format csv|prometheus`** for spreadsheet analysis or Prometheus `node_exporter` textfile scraping.
-  - Added daily battery health & cycle-count tracking (`battery_health_daily`, SQLite schema v3) to monitor battery degradation over time.
-- **⏰ Kernel Wakeup Audit & 80% Charge-Limit Helper:**
-  - Added **`battery wakeups`** to inspect `/sys/power/wakeup_sources` (ranked by total active wake time) and display your laptop's `charge_control_end_threshold` along with a ready-to-paste `udev` rule for an 80% charge limit.
-- **✨ Improved User Experience:**
-  - Added an **Alert Notifications** toggle in the `Shift+A` Smart Saver menu (`notifications_enabled` in `config.toml`) to silence background desktop alerts whenever you want.
-  - Added configurable **per-app hourly battery budget alerts** (`app_hourly_budget_pct` in `config.toml`) to notify you if an app exceeds its hourly drain budget.
-  - Added **`battery completions bash|zsh|fish`** (auto-installed by `install.sh`).
-  - Fixed SQL-bucketed battery history status to pick the **mode** (most frequent status per bucket) instead of lexicographical `MAX(status)`.
+### **Version 0.14.0** *(Latest)*
+- **📊 More Accurate Power Attribution & Trace Replay:**
+  - Clearer confidence labels showing whether app power is hardware-backed, modelled, or estimated, along with multi-package CPU energy support, idle power floor calibration, and tighter bounds during idle periods.
+  - Added live telemetry trace recording and offline replay for validating attribution accuracy, backed by an expanded automated test suite.
+- **🛡 Stronger Safety Guards, Exports & Privacy:**
+  - Restricted all local history, configuration, state, and exported report files to owner-only permissions.
+  - Improved freeze protection with fail-safe audio checks, media playback and desktop idle-inhibitor detection, and safer sandboxed app matching.
+  - Added per-app hourly battery budgets with persistent alert cooldowns, typo warnings for configuration errors, improved custom app matching rules, per-app CSV and cumulative Prometheus exports, a dedicated charge-limit command, and automatic shell completions.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.12.0)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.13.1)</b></summary>
+
+- **Version 0.13.1:**
+  - Restored full graceful shutdown timeouts when stopping apps, moved critical-battery cleanup off the main background tick loop, and unified tracking of frozen apps so every paused app resumes reliably.
+  - Upgraded power calibration to a three-phase on-battery measurement, improved unprivileged kernel wakeup reporting, enforced release checksum verification in the installer, and added stricter automated quality checks.
+
+- **Version 0.13.0:**
+  - Added `battery report [--days 7]`, `battery export --format csv|prometheus`, `battery wakeups` + 80% charge-limit helper, `battery completions bash|zsh|fish`, `Shift+A` Alert Notifications toggle, per-app hourly budget alerts (`app_hourly_budget_pct`), daily `battery_health_daily` tracking, and mode-based history status aggregation.
 
 - **Version 0.12.0:**
   - Added `battery calibrate`, hardware RAPL (`measured`) and confidence tags (`measured`/`modelled`/`estimated`), `~/.config/rustybattery/apps.toml` custom app rules, unbiased rolling-window power estimator, strict `config.toml` validation with safe-mode fallback & atomic saves, ownership-tracked `battery resume --all` (`--force-all`), per-PID audio guards, non-blocking stops (`--no-block`), SQLite incremental `auto_vacuum`, hardened systemd unit, and `SHA256SUMS` + `aarch64` releases.
@@ -99,10 +102,11 @@ cargo install rustybattery
 ```
 *(Installs both `rustybattery` and the `battery` command directly into `~/.cargo/bin`.)*
 
-### Option 2: One-Command Shell Installer (Pre-Built Binary)
+### Option 2: One-Command Shell Installer (Pre-Built Binary, SHA256 Verified)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/b1mb4/rustybattery/main/install.sh | bash
 ```
+*(Verifies `SHA256SUMS` automatically for both `x86_64` and `aarch64` releases. To verify manually or check GitHub build provenance: `sha256sum -c SHA256SUMS` or `gh attestation verify rustybattery-linux-x86_64.tar.gz -R b1mb4/rustybattery`.)*
 
 ### Option 3: Build from Source
 ```bash
@@ -238,6 +242,19 @@ battery service uninstall
 3. **Safety Guards & Instant Recovery (`battery resume --all` / `battery doctor`)**:
    - Auto-freeze (`auto_freeze_enabled`) is **opt-in (`false` by default)**, skips apps playing/recording audio, using a webcam (`/dev/video*`), holding a systemd inhibitor, or hosting your current terminal, and automatically thaws frozen apps on daemon/TUI exit (`ExecStopPost=rustybattery resume --all`).
    - Run `battery doctor` at any time to inspect cgroup v2 support, window focus method, RAPL permissions, power-profile backend, and database health.
+
+---
+
+## 📊 Accuracy, Confidence & Privacy
+
+- **Confidence Labels (`MeasuredTotalModelledSplit` / `Modelled` / `Estimated`):**
+  - When multi-package Linux `intel-rapl` (`package-*`) energy counters are readable, package CPU energy is measured in hardware (after subtracting `calibrated_rapl_idle_w`) and split proportionally across active apps by per-unit CPU delta (`measured total, modelled split`).
+  - When RAPL is restricted (kernel default since **`CVE-2020-8694`** mitigates unprivileged RAPL power side-channels) or unavailable, active CPU draw is estimated from `calibrated_cpu_w_per_core` (`modelled`), while **Display & Backlight (est.)** and **Unattributed / Hardware & Idle** carry `estimated`.
+  - If you want hardware-measured package totals on a trusted single-user laptop, create a dedicated `power` group and grant group-only read access to `energy_uj` via a targeted udev rule (rather than world-readable `0444`). Check status anytime with `battery doctor`.
+- **Trace Capture & Offline Replay (`battery record-trace`):**
+  - Capture real sysfs/RAPL/cgroup snapshots with `battery record-trace --seconds 30 --interval 2 --output trace.jsonl` and replay them deterministically via `rustybattery::trace::replay_trace_str`.
+- **Owner-Only State & Config Privacy (`0600` / `0700`):**
+  - RustyBattery enforces `0700` directories and `0600` files for `rustybattery.db`, `config.toml`, `rb_frozen_units.json`, `status.json`, trace recordings, and `--output` report/export files so other local users cannot read per-app activity history.
 
 ---
 

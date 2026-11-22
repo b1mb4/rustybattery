@@ -3,8 +3,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    #[default]
+    Token,
+    Exact,
+    Substring,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -12,6 +21,8 @@ pub struct UserAppRule {
     pub pattern: String,
     pub name: String,
     pub category: String,
+    #[serde(rename = "match", default)]
+    pub match_mode: MatchMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -20,7 +31,13 @@ struct UserAppsFile {
     pub rules: Vec<UserAppRule>,
 }
 
-static USER_APPS_CACHE: Mutex<Option<(Option<SystemTime>, Vec<UserAppRule>)>> = Mutex::new(None);
+type UserAppsCacheEntry = (Instant, Option<SystemTime>, Arc<Vec<UserAppRule>>);
+static USER_APPS_CACHE: Mutex<Option<UserAppsCacheEntry>> = Mutex::new(None);
+static APPS_RULES_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn last_apps_rules_error() -> Option<String> {
+    APPS_RULES_ERROR.lock().ok().and_then(|g| g.clone())
+}
 
 pub fn user_apps_file_path() -> PathBuf {
     let dir = dirs::config_dir()
@@ -33,29 +50,125 @@ pub fn user_apps_file_path() -> PathBuf {
     dir.join("apps.toml")
 }
 
-pub fn load_user_app_rules() -> Vec<UserAppRule> {
-    let path = user_apps_file_path();
-    let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+pub fn parse_user_app_rules_str(content: &str) -> anyhow::Result<Vec<UserAppRule>> {
+    let parsed: UserAppsFile = toml::from_str(content)?;
+    Ok(parsed.rules)
+}
+
+pub fn load_user_app_rules() -> Arc<Vec<UserAppRule>> {
+    let now = Instant::now();
     if let Ok(guard) = USER_APPS_CACHE.lock() {
-        if let Some((cached_mtime, rules)) = &*guard {
-            if *cached_mtime == mtime {
-                return rules.clone();
+        if let Some((last_checked, _, rules)) = &*guard {
+            if last_checked.elapsed() < Duration::from_secs(2) {
+                return Arc::clone(rules);
             }
         }
     }
-    let rules = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| toml::from_str::<UserAppsFile>(&s).ok())
-        .map(|f| f.rules)
-        .unwrap_or_default();
+
+    let path = user_apps_file_path();
+    let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
     if let Ok(mut guard) = USER_APPS_CACHE.lock() {
-        *guard = Some((mtime, rules.clone()));
+        if let Some((last_checked, cached_mtime, rules)) = &mut *guard {
+            if *cached_mtime == mtime {
+                *last_checked = now;
+                return Arc::clone(rules);
+            }
+        }
+    }
+
+    let prev_rules = USER_APPS_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, _, r)| Arc::clone(r)))
+        .unwrap_or_else(|| Arc::new(Vec::new()));
+
+    let rules = match fs::read_to_string(path) {
+        Ok(content) => match parse_user_app_rules_str(&content) {
+            Ok(parsed) => {
+                if let Ok(mut err_g) = APPS_RULES_ERROR.lock() {
+                    *err_g = None;
+                }
+                Arc::new(parsed)
+            }
+            Err(e) => {
+                if let Ok(mut err_g) = APPS_RULES_ERROR.lock() {
+                    *err_g = Some(format!("{e:#}"));
+                }
+                prev_rules
+            }
+        },
+        Err(_) => {
+            if let Ok(mut err_g) = APPS_RULES_ERROR.lock() {
+                *err_g = None;
+            }
+            Arc::new(Vec::new())
+        }
+    };
+
+    if let Ok(mut guard) = USER_APPS_CACHE.lock() {
+        *guard = Some((now, mtime, Arc::clone(&rules)));
     }
     rules
 }
 
-fn default_confidence() -> String {
-    "modelled".to_string()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// Hardware RAPL package energy measured; per-app split modelled by cgroup CPU share.
+    MeasuredTotalModelledSplit,
+    /// Software CPU-share model using calibrated or default Watts-per-core.
+    #[default]
+    Modelled,
+    /// Heuristic estimate (display backlight or unattributed idle/hardware floor).
+    Estimated,
+}
+
+impl Confidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Confidence::MeasuredTotalModelledSplit => "measured_total_modelled_split",
+            Confidence::Modelled => "modelled",
+            Confidence::Estimated => "estimated",
+        }
+    }
+
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Confidence::MeasuredTotalModelledSplit => "measured total, modelled split",
+            Confidence::Modelled => "modelled",
+            Confidence::Estimated => "estimated",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "measured_total_modelled_split" | "measured" => Self::MeasuredTotalModelledSplit,
+            "estimated" => Self::Estimated,
+            _ => Self::Modelled,
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Estimated => 0,
+            Self::Modelled => 1,
+            Self::MeasuredTotalModelledSplit => 2,
+        }
+    }
+
+    pub fn worst(self, other: Self) -> Self {
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_label())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,9 +237,9 @@ pub struct AppDeltaUsage {
     pub is_frozen: bool,
     /// Whether this app's window is currently focused
     pub is_focused: bool,
-    /// Attribution confidence level: `"measured"` (RAPL hardware counter), `"modelled"` (cgroup CPU model), or `"estimated"` (backlight/idle heuristic)
-    #[serde(default = "default_confidence")]
-    pub confidence: String,
+    /// Attribution confidence level (`MeasuredTotalModelledSplit`, `Modelled`, or `Estimated`)
+    #[serde(default)]
+    pub confidence: Confidence,
 }
 
 fn strip_systemd_launcher_prefixes(raw: &str) -> String {
@@ -171,13 +284,22 @@ fn strip_systemd_launcher_prefixes(raw: &str) -> String {
 }
 
 fn has_token(tokens: &[&str], target: &str) -> bool {
-    tokens.iter().any(|&t| t == target)
+    tokens.contains(&target)
 }
 
 /// Converts a raw systemd unit name, Snap scope, Flatpak scope, or process command across any Linux
 /// distribution (Ubuntu, Fedora, Arch, Debian, openSUSE, NixOS, Alpine, Void, etc.) into a
 /// human-friendly `(AppName, Category)` pair.
 pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String, String)> {
+    let user_rules = load_user_app_rules();
+    normalize_cgroup_unit_with_rules(unit_raw, slice_type, &user_rules)
+}
+
+pub fn normalize_cgroup_unit_with_rules(
+    unit_raw: &str,
+    slice_type: &str,
+    user_rules: &[UserAppRule],
+) -> Option<(String, String)> {
     let unit = unit_raw.trim();
     if unit.is_empty()
         || unit.starts_with("cgroup.")
@@ -205,10 +327,18 @@ pub fn normalize_cgroup_unit(unit_raw: &str, slice_type: &str) -> Option<(String
         .collect();
 
     // 0. User-configured override rules from `~/.config/rustybattery/apps.toml`
-    for rule in load_user_app_rules() {
+    for rule in user_rules {
         let pat = rule.pattern.trim().to_lowercase();
-        if !pat.is_empty() && (lower == pat || has_token(&tokens, &pat) || lower.contains(&pat)) {
-            return Some((rule.name, rule.category));
+        if pat.is_empty() {
+            continue;
+        }
+        let matched = match rule.match_mode {
+            MatchMode::Exact => lower == pat,
+            MatchMode::Token => lower == pat || has_token(&tokens, &pat),
+            MatchMode::Substring => lower.contains(&pat),
+        };
+        if matched {
+            return Some((rule.name.clone(), rule.category.clone()));
         }
     }
 
@@ -1104,6 +1234,7 @@ pub struct SampleInput {
     pub rapl_power_w: Option<f64>,
     pub cpu_w_per_core: f64,
     pub baseline_max_w: f64,
+    pub rapl_idle_floor_w: f64,
 }
 
 /// Stateful tracker that computes per-tick deltas between snapshots and attributes battery drain.
@@ -1137,6 +1268,18 @@ impl AppEnergyTracker {
         let mut t = Self::new();
         t.max_dt_secs = (interval_secs.saturating_mul(3).max(15)) as f64;
         t
+    }
+
+    /// Constructs a tracker directly from an initial counter snapshot (used by offline trace replay
+    /// and deterministic unit/integration tests without reading host `/sys/fs/cgroup`).
+    pub fn from_initial(prev_counters: HashMap<String, RawAppCounter>, max_dt_secs: f64) -> Self {
+        Self {
+            prev_counters,
+            prev_monotonic_s: 0.0,
+            prev_suspended_s: 0.0,
+            prev_rapl_uj: None,
+            max_dt_secs: max_dt_secs.max(1.0),
+        }
     }
 
     /// Samples current app counters, computes per-unit CPU delta over monotonic `dt_secs`,
@@ -1184,6 +1327,7 @@ impl AppEnergyTracker {
                 rapl_power_w,
                 cpu_w_per_core: cfg.calibrated_cpu_w_per_core,
                 baseline_max_w: cfg.calibrated_baseline_w,
+                rapl_idle_floor_w: cfg.calibrated_rapl_idle_w,
             },
         )
     }
@@ -1216,10 +1360,8 @@ impl AppEnergyTracker {
                         sum = sum.saturating_add(d);
                     }
                     sum
-                } else if curr.usage_usec >= prev.usage_usec {
-                    curr.usage_usec - prev.usage_usec
                 } else {
-                    0
+                    curr.usage_usec.saturating_sub(prev.usage_usec)
                 }
             } else {
                 curr.usage_usec.min(new_unit_cap)
@@ -1259,12 +1401,18 @@ impl AppEnergyTracker {
         };
         let (attributed_app_w, app_confidence) = if inp.is_discharging {
             if let Some(rapl_w) = inp.rapl_power_w {
-                (app_pool_w.min(rapl_w), "measured")
+                let rapl_active_w = (rapl_w - inp.rapl_idle_floor_w.max(0.0)).max(0.0);
+                let bounded = if cpu_cores_used < 0.05 {
+                    app_pool_w.min(rapl_active_w).min(cpu_cores_used * w_per_core)
+                } else {
+                    app_pool_w.min(rapl_active_w)
+                };
+                (bounded, Confidence::MeasuredTotalModelledSplit)
             } else {
-                (app_pool_w.min(cpu_cores_used * w_per_core), "modelled")
+                (app_pool_w.min(cpu_cores_used * w_per_core), Confidence::Modelled)
             }
         } else {
-            (0.0, "modelled")
+            (0.0, Confidence::Modelled)
         };
         let unattributed_w = if inp.is_discharging {
             (app_pool_w - attributed_app_w).max(0.0)
@@ -1312,7 +1460,7 @@ impl AppEnergyTracker {
                 pids_count: curr.pids_count,
                 is_frozen: curr.is_frozen,
                 is_focused: curr.is_focused,
-                confidence: app_confidence.to_string(),
+                confidence: app_confidence,
             });
         }
 
@@ -1334,7 +1482,7 @@ impl AppEnergyTracker {
                 pids_count: 0,
                 is_frozen: false,
                 is_focused: false,
-                confidence: "estimated".to_string(),
+                confidence: Confidence::Estimated,
             });
         }
 
@@ -1357,7 +1505,7 @@ impl AppEnergyTracker {
                 pids_count: 0,
                 is_frozen: false,
                 is_focused: false,
-                confidence: "estimated".to_string(),
+                confidence: Confidence::Estimated,
             });
         }
 
@@ -1419,6 +1567,7 @@ mod tests {
                 rapl_power_w: None,
                 cpu_w_per_core: 12.0,
                 baseline_max_w: 1.0,
+                rapl_idle_floor_w: 0.0,
             },
         );
         assert!(deltas.is_empty());
@@ -1450,6 +1599,7 @@ mod tests {
                 rapl_power_w: None,
                 cpu_w_per_core: 12.0,
                 baseline_max_w: 1.0,
+                rapl_idle_floor_w: 0.0,
             },
         );
         assert!((dt - 30.0).abs() < 1e-6);
@@ -1499,6 +1649,7 @@ mod tests {
                 rapl_power_w: None,
                 cpu_w_per_core: 12.0,
                 baseline_max_w: 1.0,
+                rapl_idle_floor_w: 0.0,
             },
         );
         let docker = deltas.iter().find(|d| d.app_name == "Docker / Containers").unwrap();
@@ -1534,6 +1685,7 @@ mod tests {
                 rapl_power_w: None,
                 cpu_w_per_core: 12.0,
                 baseline_max_w: 1.0,
+                rapl_idle_floor_w: 0.0,
             },
         );
         let daemon = deltas.iter().find(|d| d.app_name == "TinyDaemon").unwrap();
@@ -1574,6 +1726,43 @@ mod tests {
     }
 
     #[test]
+    fn user_app_rules_support_token_exact_substring_and_reject_invalid_toml() {
+        let valid_toml = r#"
+[[rules]]
+pattern = "code"
+name = "My Editor"
+category = "Development"
+
+[[rules]]
+pattern = "coder"
+name = "Coder Sub"
+category = "App"
+match = "substring"
+"#;
+        let rules = parse_user_app_rules_str(valid_toml).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].match_mode, MatchMode::Token);
+        assert_eq!(rules[1].match_mode, MatchMode::Substring);
+
+        // `decoder` must NOT match `pattern = "code"` when match mode defaults to Token (`N-9`)
+        let (dec_name, _) =
+            normalize_cgroup_unit_with_rules("media-decoder.service", "app", &rules).unwrap();
+        assert_ne!(dec_name, "My Editor");
+
+        let (ed_name, _) =
+            normalize_cgroup_unit_with_rules("app-code-123.scope", "app", &rules).unwrap();
+        assert_eq!(ed_name, "My Editor");
+
+        let (sub_name, _) =
+            normalize_cgroup_unit_with_rules("my-opencoder.service", "app", &rules).unwrap();
+        assert_eq!(sub_name, "Coder Sub");
+
+        // Unknown key in `apps.toml` must return Err
+        let invalid_toml = "[[rules]]\npatttern = 'code'\nname = 'X'\ncategory = 'App'\n";
+        assert!(parse_user_app_rules_str(invalid_toml).is_err());
+    }
+
+    #[test]
     fn attributed_energy_never_exceeds_total_battery_energy() {
         for power_w in [2.5, 8.0, 15.0, 35.0] {
             for cpu_ms in [0u64, 50, 500, 5_000, 40_000] {
@@ -1608,6 +1797,7 @@ mod tests {
                         rapl_power_w: None,
                         cpu_w_per_core: 12.0,
                         baseline_max_w: 1.0,
+                        rapl_idle_floor_w: 0.0,
                     },
                 );
                 let sum_wh: f64 = deltas.iter().map(|d| d.energy_wh).sum();

@@ -19,11 +19,15 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 NO_SERVICE=0
 NO_PATH=0
 FROM_SOURCE=0
+SKIP_VERIFY=0
+ASSUME_YES=0
 for arg in "$@"; do
     case "$arg" in
         --no-service) NO_SERVICE=1 ;;
         --no-path) NO_PATH=1 ;;
         --from-source) FROM_SOURCE=1 ;;
+        --skip-verify) SKIP_VERIFY=1 ;;
+        -y|--yes) ASSUME_YES=1 ;;
     esac
 done
 
@@ -32,13 +36,35 @@ if [ "$FROM_SOURCE" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     printf "Checking for pre-built binary (%s)...\n" "$ARCH"
     TARBALL_NAME="rustybattery-linux-${ARCH}.tar.gz"
     if curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/$TARBALL_NAME" 2>/dev/null; then
-        SUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
-        if curl -fsSL "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS" 2>/dev/null && command -v sha256sum >/dev/null 2>&1; then
-            if grep -q "$TARBALL_NAME" "$TMP_DIR/SHA256SUMS"; then
-                (cd "$TMP_DIR" && grep "$TARBALL_NAME" SHA256SUMS | sha256sum -c - >/dev/null)
-                printf "\033[1;32m✔ Verified SHA256 checksum.\033[0m\n"
+        if [ "$SKIP_VERIFY" -eq 0 ]; then
+            if command -v sha256sum >/dev/null 2>&1; then
+                SUM_CMD="sha256sum -c -"
+            elif command -v shasum >/dev/null 2>&1; then
+                SUM_CMD="shasum -a 256 -c -"
+            else
+                printf "\033[1;31m✖ Cannot verify release checksum (sha256sum/shasum not found). Re-run with --skip-verify or --from-source.\033[0m\n" >&2
+                exit 1
             fi
+
+            SUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
+            if ! curl -fsSL "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS" 2>/dev/null; then
+                printf "\033[1;31m✖ Failed to download SHA256SUMS; refusing unverified binary (use --skip-verify to bypass).\033[0m\n" >&2
+                exit 1
+            fi
+            MATCHED_LINE="$(grep -E "[ *]${TARBALL_NAME}$" "$TMP_DIR/SHA256SUMS" | head -n1 || true)"
+            if [ -z "$MATCHED_LINE" ]; then
+                printf "\033[1;31m✖ Checksum entry for %s missing from SHA256SUMS (use --skip-verify or --from-source).\033[0m\n" "$TARBALL_NAME" >&2
+                exit 1
+            fi
+            if ! (cd "$TMP_DIR" && printf '%s\n' "$MATCHED_LINE" | $SUM_CMD >/dev/null); then
+                printf "\033[1;31m✖ SHA256 verification FAILED for %s; aborting installation.\033[0m\n" "$TARBALL_NAME" >&2
+                exit 1
+            fi
+            printf "\033[1;32m✔ Verified SHA256 checksum.\033[0m\n"
+        else
+            printf "\033[1;33m⚠ Skipping checksum verification (--skip-verify).\033[0m\n"
         fi
+
         tar -xzf "$TMP_DIR/$TARBALL_NAME" -C "$TMP_DIR"
         if [ -f "$TMP_DIR/rustybattery" ]; then
             chmod +x "$TMP_DIR/rustybattery"
@@ -53,7 +79,24 @@ fi
 if [ "$INSTALLED_PREBUILT" -eq 0 ]; then
     printf "Building RustyBattery from source with Cargo...\n"
     if ! command -v cargo >/dev/null 2>&1; then
-        printf "\033[1;33mRust/Cargo not found. Installing via rustup...\033[0m\n"
+        if [ "$ASSUME_YES" -eq 0 ]; then
+            if [ -t 0 ]; then
+                printf "Rust/Cargo not found. Install Rust toolchain via https://sh.rustup.rs? [y/N]: "
+                read -r reply
+                case "$reply" in
+                    y|Y|yes|YES) ;;
+                    *)
+                        printf "Aborted. Install Rust/Cargo manually or re-run with --yes.\n" >&2
+                        exit 1
+                        ;;
+                esac
+            else
+                printf "\033[1;31m✖ Rust/Cargo not found and stdin is non-interactive; refusing unattended rustup install.\033[0m\n" >&2
+                printf "Install Rust/Cargo first or re-run with '--yes' to consent to rustup.\n" >&2
+                exit 1
+            fi
+        fi
+        printf "\033[1;33mInstalling Rust/Cargo via rustup...\033[0m\n"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         # shellcheck disable=SC1091
         source "$HOME/.cargo/env"

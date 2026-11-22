@@ -1,5 +1,5 @@
 use crate::apps::{AppDeltaUsage, AppEnergyTracker};
-use crate::autopilot::load_autopilot_config;
+use crate::autopilot::{is_app_whitelisted, load_autopilot_config};
 use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
 use crate::db::{default_db_path, AppSummaryRow, Database};
 use anyhow::Result;
@@ -29,6 +29,9 @@ pub fn write_cached_status(bat: &BatterySnapshot, deltas: &[AppDeltaUsage]) -> R
     let Some(path) = runtime_status_path() else {
         return Ok(());
     };
+    if let Some(parent) = path.parent() {
+        crate::paths::set_private_dir_mode(parent);
+    }
     let tmp = path.with_extension("json.tmp");
     let payload = CachedStatus {
         timestamp: chrono::Utc::now().timestamp(),
@@ -36,13 +39,14 @@ pub fn write_cached_status(bat: &BatterySnapshot, deltas: &[AppDeltaUsage]) -> R
         live_deltas: deltas.to_vec(),
     };
     fs::write(&tmp, serde_json::to_vec(&payload)?)?;
-    fs::rename(&tmp, &path)?;
+    crate::paths::set_private_file_mode(&tmp);
+    fs::rename(tmp, path)?;
     Ok(())
 }
 
 fn read_cached_status(max_age_secs: i64) -> Option<(BatterySnapshot, Vec<AppDeltaUsage>)> {
     let path = runtime_status_path()?;
-    let bytes = fs::read(&path).ok()?;
+    let bytes = fs::read(path).ok()?;
     let cached: CachedStatus = serde_json::from_slice(&bytes).ok()?;
     let now = chrono::Utc::now().timestamp();
     if (now - cached.timestamp).abs() <= max_age_secs {
@@ -118,8 +122,7 @@ pub fn run_statusbar(format: &str, top_n: usize, config_snippet: Option<&str>) -
 
     let icon = match bat.status {
         BatteryStatus::Charging => "⚡",
-        BatteryStatus::Full => "🔌",
-        BatteryStatus::NotCharging => "🔌",
+        BatteryStatus::Full | BatteryStatus::NotCharging => "🔌",
         BatteryStatus::Discharging => {
             if bat.capacity_pct <= 15.0 {
                 "🪫"
@@ -313,7 +316,9 @@ pub struct NotificationMonitor {
     last_high_drain_alert: Option<Instant>,
     alerted_20_pct: bool,
     alerted_10_pct: bool,
-    last_budget_alerts: std::collections::HashMap<String, Instant>,
+    last_budget_alerts: std::collections::HashMap<String, i64>,
+    last_budget_check: Option<Instant>,
+    budgets_hydrated: bool,
 }
 
 impl NotificationMonitor {
@@ -325,6 +330,8 @@ impl NotificationMonitor {
             alerted_20_pct: false,
             alerted_10_pct: false,
             last_budget_alerts: std::collections::HashMap::new(),
+            last_budget_check: None,
+            budgets_hydrated: false,
         }
     }
 
@@ -332,30 +339,61 @@ impl NotificationMonitor {
         if !bat.status.is_discharging() {
             return;
         }
+        if self
+            .last_budget_check
+            .is_some_and(|prev| prev.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.last_budget_check = Some(Instant::now());
+
         let cfg = load_autopilot_config();
-        if !cfg.notifications_enabled {
+        if !cfg.notifications_enabled
+            || (cfg.app_hourly_budget_pct <= 0.1 && cfg.app_budgets.is_empty())
+        {
             return;
         }
-        let budget = cfg.app_hourly_budget_pct;
-        if budget <= 0.1 {
-            return;
+
+        let now = chrono::Utc::now().timestamp();
+        if !self.budgets_hydrated {
+            self.budgets_hydrated = true;
+            if let Some(map) = db.get_meta("budget_alert_cooldowns").and_then(|raw| {
+                serde_json::from_str::<std::collections::HashMap<String, i64>>(&raw).ok()
+            }) {
+                self.last_budget_alerts = map;
+            }
         }
-        let since_1h = chrono::Utc::now().timestamp() - 3600;
+
+        let before_len = self.last_budget_alerts.len();
+        self.last_budget_alerts
+            .retain(|_, ts| now.saturating_sub(*ts) < 7200);
+        let mut changed = self.last_budget_alerts.len() != before_len;
+
+        let since_1h = now - 3600;
         let Ok(rows) = db.get_app_breakdown(since_1h, &[]) else {
             return;
         };
         for row in rows {
-            if row.category == "System" || row.battery_pct < budget {
+            if row.category == "System" || is_app_whitelisted(&cfg, &row.app_name) {
+                continue;
+            }
+            let budget = cfg
+                .app_budgets
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&row.app_name))
+                .map(|(_, v)| *v)
+                .unwrap_or(cfg.app_hourly_budget_pct);
+            if budget <= 0.1 || row.battery_pct < budget {
                 continue;
             }
             let cooled = self
                 .last_budget_alerts
                 .get(&row.app_name)
-                .map(|t| t.elapsed() >= Duration::from_secs(1800))
+                .map(|&ts| now.saturating_sub(ts) >= 1800)
                 .unwrap_or(true);
             if cooled {
-                self.last_budget_alerts
-                    .insert(row.app_name.clone(), Instant::now());
+                self.last_budget_alerts.insert(row.app_name.clone(), now);
+                changed = true;
                 let _ = send_desktop_notification(
                     &format!("⚠️ Battery Budget Exceeded: {}", row.app_name),
                     &format!(
@@ -366,6 +404,13 @@ impl NotificationMonitor {
                     "battery-caution",
                 );
             }
+        }
+
+        let serialized = changed
+            .then(|| serde_json::to_string(&self.last_budget_alerts).ok())
+            .flatten();
+        if let Some(json) = serialized {
+            let _ = db.set_meta("budget_alert_cooldowns", &json);
         }
     }
 

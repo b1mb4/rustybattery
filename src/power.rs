@@ -78,7 +78,7 @@ pub fn restore_saved_power_profile(db: &Database) -> Option<String> {
         "tuned-adm" => vec!["profile", prof],
         _ => return None,
     };
-    if let Ok(out) = Command::new(backend).args(&args).output() {
+    if let Ok(out) = Command::new(backend).args(args).output() {
         if out.status.success() {
             return Some(format!("{backend}={prof}"));
         }

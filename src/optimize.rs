@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,7 +80,7 @@ pub fn set_acpi_wakeups_state(devices: &[String], target_enabled: bool) -> Resul
     }
     .into_iter()
     .map(|(d, _)| d)
-    .filter(|d| devices.iter().any(|req| req == d))
+    .filter(|d| devices.contains(d))
     .collect();
 
     if current_matching.is_empty() {
@@ -246,56 +247,144 @@ fn find_matching_proc_pids(target_app_name: &str) -> Vec<i32> {
     pids
 }
 
-fn owned_frozen_units_path() -> PathBuf {
-    let base = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("rustybattery");
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrozenPidEntry {
+    pub pid: i32,
+    pub starttime: u64,
+    pub app_name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OwnedFrozenState {
+    pub cgroups: Vec<PathBuf>,
+    pub pids: Vec<FrozenPidEntry>,
+}
+
+fn owned_frozen_units_path() -> Option<PathBuf> {
+    let base = dirs::data_local_dir()?.join("rustybattery");
     let _ = fs::create_dir_all(&base);
-    base.join("rb_frozen_units.json")
+    Some(base.join("rb_frozen_units.json"))
 }
 
-fn load_owned_frozen_units() -> std::collections::HashSet<PathBuf> {
-    let path = owned_frozen_units_path();
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
+pub fn load_owned_frozen_state_from(path: &Path) -> OwnedFrozenState {
+    let Ok(s) = fs::read_to_string(path) else {
+        return OwnedFrozenState::default();
+    };
+    if let Ok(state) = serde_json::from_str::<OwnedFrozenState>(&s) {
+        return state;
+    }
+    if let Ok(cgroups) = serde_json::from_str::<Vec<PathBuf>>(&s) {
+        return OwnedFrozenState {
+            cgroups,
+            pids: Vec::new(),
+        };
+    }
+    OwnedFrozenState::default()
 }
 
-fn save_owned_frozen_units(set: &std::collections::HashSet<PathBuf>) {
-    let path = owned_frozen_units_path();
-    if set.is_empty() {
-        let _ = fs::remove_file(&path);
-    } else {
-        let list: Vec<&PathBuf> = set.iter().collect();
-        if let Ok(json) = serde_json::to_string(&list) {
-            let tmp = path.with_extension("json.tmp");
-            if fs::write(&tmp, json).is_ok() {
-                let _ = fs::rename(&tmp, &path);
+fn save_owned_frozen_state_to(path: &Path, state: &OwnedFrozenState) {
+    if state.cgroups.is_empty() && state.pids.is_empty() {
+        let _ = fs::remove_file(path);
+    } else if let Ok(json) = serde_json::to_string(state) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+            crate::paths::set_private_dir_mode(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, json).is_ok() {
+            crate::paths::set_private_file_mode(&tmp);
+            let _ = fs::rename(tmp, path);
+        }
+    }
+}
+
+fn read_proc_starttime(pid: i32) -> Option<u64> {
+    if pid <= 1 {
+        return None;
+    }
+    let stat_str = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close_paren = stat_str.rfind(')')?;
+    let rest = stat_str.get(close_paren + 2..)?;
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+fn is_pid_alive(pid: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let Ok(stat_str) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(close_paren) = stat_str.rfind(')') else {
+        return false;
+    };
+    let Some(rest) = stat_str.get(close_paren + 2..) else {
+        return false;
+    };
+    let Some(state) = rest.split_whitespace().next() else {
+        return false;
+    };
+    state != "Z" && state != "X"
+}
+
+/// Thaws only the cgroup directories and SIGSTOP fallback PIDs recorded in `state_path`,
+/// keeping any unit whose `cgroup.freeze` write failed so ownership is never lost (`N-6`).
+pub fn thaw_owned_state_at(state_path: &Path) -> Vec<String> {
+    let state = load_owned_frozen_state_from(state_path);
+    if state.cgroups.is_empty() && state.pids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut thawed = Vec::new();
+    let mut remaining_cgroups = Vec::new();
+    for dir in state.cgroups {
+        let freeze_file = dir.join("cgroup.freeze");
+        if !dir.exists() || !freeze_file.exists() {
+            continue;
+        }
+        if read_u64_file(&freeze_file) == 0 {
+            continue;
+        }
+        match fs::write(freeze_file, "0") {
+            Ok(_) => {
+                let name = dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| dir.display().to_string());
+                thawed.push(name);
+            }
+            Err(_) => remaining_cgroups.push(dir),
+        }
+    }
+
+    let mut remaining_pids = Vec::new();
+    for entry in state.pids {
+        if read_proc_starttime(entry.pid) == Some(entry.starttime) {
+            if unsafe { libc::kill(entry.pid, libc::SIGCONT) } == 0 {
+                thawed.push(format!("{} (pid {})", entry.app_name, entry.pid));
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                remaining_pids.push(entry);
             }
         }
     }
+
+    save_owned_frozen_state_to(
+        state_path,
+        &OwnedFrozenState {
+            cgroups: remaining_cgroups,
+            pids: remaining_pids,
+        },
+    );
+    thawed
 }
 
-/// Thaws only the cgroup directories that RustyBattery itself froze (`rb_frozen_units.json`),
-/// leaving any cgroups frozen by the user or container tools untouched (`F-3`).
+/// Thaws only the cgroup directories and PIDs that RustyBattery itself froze (`rb_frozen_units.json`),
+/// leaving any cgroups frozen by the user or container tools untouched (`F-3`, `N-6`).
 pub fn thaw_owned_user_cgroups() -> Vec<String> {
-    let owned = load_owned_frozen_units();
-    let mut thawed = Vec::new();
-    for dir in owned {
-        let freeze_file = dir.join("cgroup.freeze");
-        if read_u64_file(&freeze_file) == 1 && fs::write(&freeze_file, "0").is_ok() {
-            let name = dir
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| dir.display().to_string());
-            thawed.push(name);
-        }
-    }
-    save_owned_frozen_units(&std::collections::HashSet::new());
-    thawed
+    owned_frozen_units_path()
+        .map(|p| thaw_owned_state_at(&p))
+        .unwrap_or_default()
 }
 
 fn thaw_slice_recursive(dir: &Path) -> usize {
@@ -314,7 +403,7 @@ fn thaw_slice_recursive(dir: &Path) -> usize {
             continue;
         }
         let freeze_file = path.join("cgroup.freeze");
-        if read_u64_file(&freeze_file) == 1 && fs::write(&freeze_file, "0").is_ok() {
+        if read_u64_file(&freeze_file) == 1 && fs::write(freeze_file, "0").is_ok() {
             count += 1;
         }
     }
@@ -324,12 +413,12 @@ fn thaw_slice_recursive(dir: &Path) -> usize {
 /// Force-thaws every frozen cgroup (`cgroup.freeze == 1`) under the current user's systemd slice tree
 /// (`battery resume --force-all`).
 pub fn thaw_all_user_cgroups() -> usize {
-    let _ = thaw_owned_user_cgroups();
+    let owned_count = thaw_owned_user_cgroups().len();
     let uid = unsafe { libc::getuid() };
     let user_base = PathBuf::from(format!(
         "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
     ));
-    let mut total = 0usize;
+    let mut total = owned_count;
     for sub in ["app.slice", "session.slice", "background.slice"] {
         total += thaw_slice_recursive(&user_base.join(sub));
     }
@@ -349,27 +438,35 @@ pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
     let val = if freeze { "1" } else { "0" };
     let mut count = 0usize;
     let mut last_err = None;
-    let mut owned = load_owned_frozen_units();
+    let state_path = owned_frozen_units_path();
+    let mut state = state_path
+        .as_deref()
+        .map(load_owned_frozen_state_from)
+        .unwrap_or_default();
 
     for dir in &dirs {
         let freeze_file = dir.join("cgroup.freeze");
         if freeze_file.exists() {
-            match fs::write(&freeze_file, val) {
+            match fs::write(freeze_file, val) {
                 Ok(_) => {
                     count += 1;
                     if freeze {
-                        owned.insert(dir.clone());
+                        if !state.cgroups.iter().any(|p| p == dir) {
+                            state.cgroups.push(dir.clone());
+                        }
                     } else {
-                        owned.remove(dir);
+                        state.cgroups.retain(|p| p != dir);
                     }
                 }
                 Err(e) => last_err = Some(e),
             }
         }
     }
-    save_owned_frozen_units(&owned);
 
     if count > 0 {
+        if let Some(ref p) = state_path {
+            save_owned_frozen_state_to(p, &state);
+        }
         let action = if freeze {
             "❄ Frozen (0% CPU Deep Sleep)"
         } else {
@@ -386,9 +483,29 @@ pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
         for pid in pids {
             if unsafe { libc::kill(pid, sig) } == 0 {
                 sig_count += 1;
+                if freeze {
+                    if let Some(starttime) = read_proc_starttime(pid) {
+                        if !state
+                            .pids
+                            .iter()
+                            .any(|e| e.pid == pid && e.starttime == starttime)
+                        {
+                            state.pids.push(FrozenPidEntry {
+                                pid,
+                                starttime,
+                                app_name: app_name.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    state.pids.retain(|e| e.pid != pid);
+                }
             }
         }
         if sig_count > 0 {
+            if let Some(ref p) = state_path {
+                save_owned_frozen_state_to(p, &state);
+            }
             let action = if freeze {
                 "❄ Frozen (SIGSTOP 0% CPU)"
             } else {
@@ -405,10 +522,84 @@ pub fn set_app_frozen(app_name: &str, freeze: bool) -> Result<String> {
     }
 }
 
-/// Gracefully stops a user cgroup unit without blocking the daemon thread for 90s (`F-6`):
-/// sends `systemctl --user stop --no-block` (or `SIGTERM` to PIDs), waits up to `grace_ms`
-/// for processes to exit, and falls back to `cgroup.kill` only if still alive.
-fn graceful_stop_user_cgroup(dir: &Path, unit_name: &str, grace_ms: u64) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    NotRunning,
+    StoppedCleanly,
+    ForcedKill { waited_secs: u64 },
+    Failed,
+}
+
+/// Parses systemd timespan strings such as `"1min 30s"`, `"15s"`, `"500ms"`, `"250us"`, `"infinity"`.
+pub fn parse_systemd_duration_ms(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("infinity") {
+        return None;
+    }
+    let mut total_ms = 0.0_f64;
+    let mut parsed_any = false;
+    for tok in trimmed.split_whitespace() {
+        let split_at = tok
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(tok.len());
+        let (num_str, unit) = tok.split_at(split_at);
+        let Ok(val) = num_str.parse::<f64>() else {
+            return None;
+        };
+        let mult = match unit {
+            "us" => 0.001,
+            "ms" => 1.0,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1000.0,
+            "min" | "m" | "mins" | "minute" | "minutes" => 60_000.0,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000.0,
+            "d" | "day" | "days" => 86_400_000.0,
+            "" => return None,
+            _ => return None,
+        };
+        total_ms += val * mult;
+        parsed_any = true;
+    }
+    if !parsed_any || total_ms <= 0.0 {
+        None
+    } else {
+        Some(total_ms.round() as u64)
+    }
+}
+
+fn read_unit_timeout_stop_ms(unit_name: &str) -> Option<u64> {
+    let out = Command::new("systemctl")
+        .args(["--user", "show", "-p", "TimeoutStopUSec", "--value", unit_name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_systemd_duration_ms(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Gracefully stops a user cgroup unit without blocking PID 1 / daemon shutdown (`N-1`):
+/// sends `systemctl --user stop --no-block` (or `SIGTERM` to PIDs), polls `pids.current`
+/// up to `TimeoutStopUSec` or `default_grace_ms`, and forces `cgroup.kill`/`SIGKILL` only after timeout.
+fn graceful_stop_user_cgroup(
+    dir: &Path,
+    unit_name: &str,
+    default_grace_ms: u64,
+    use_unit_timeout: bool,
+) -> StopOutcome {
+    if read_u64_file(&dir.join("pids.current")) == 0 {
+        return StopOutcome::NotRunning;
+    }
+    let effective_grace_ms = if use_unit_timeout
+        && (unit_name.ends_with(".service") || unit_name.ends_with(".scope"))
+    {
+        read_unit_timeout_stop_ms(unit_name)
+            .unwrap_or(default_grace_ms)
+            .clamp(2_000, 90_000)
+    } else {
+        default_grace_ms.max(2_000)
+    };
+
+    let pids_file = dir.join("cgroup.procs");
     let mut initiated = false;
     if unit_name.ends_with(".service") || unit_name.ends_with(".scope") {
         if let Ok(out) = Command::new("systemctl")
@@ -421,7 +612,7 @@ fn graceful_stop_user_cgroup(dir: &Path, unit_name: &str, grace_ms: u64) -> bool
         }
     }
     if !initiated {
-        if let Ok(procs) = fs::read_to_string(dir.join("cgroup.procs")) {
+        if let Ok(procs) = fs::read_to_string(&pids_file) {
             for line in procs.lines() {
                 if let Ok(pid) = line.trim().parse::<i32>() {
                     if pid > 1 && unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
@@ -431,23 +622,77 @@ fn graceful_stop_user_cgroup(dir: &Path, unit_name: &str, grace_ms: u64) -> bool
             }
         }
     }
+    if !initiated {
+        return StopOutcome::Failed;
+    }
 
     let step_ms = 100u64;
-    let steps = (grace_ms / step_ms).max(1);
+    let steps = (effective_grace_ms / step_ms).max(1);
     for _ in 0..steps {
         if read_u64_file(&dir.join("pids.current")) == 0 {
-            return true;
+            return StopOutcome::StoppedCleanly;
+        }
+        if crate::service::is_stop_requested() {
+            return StopOutcome::StoppedCleanly;
         }
         std::thread::sleep(std::time::Duration::from_millis(step_ms));
     }
 
     if read_u64_file(&dir.join("pids.current")) > 0 {
         let kill_file = dir.join("cgroup.kill");
-        if fs::write(&kill_file, "1").is_ok() {
-            initiated = true;
+        if fs::write(kill_file, "1").is_err() {
+            if let Ok(procs) = fs::read_to_string(pids_file) {
+                for line in procs.lines() {
+                    if let Ok(pid) = line.trim().parse::<i32>() {
+                        if pid > 1 {
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                        }
+                    }
+                }
+            }
+        }
+        return StopOutcome::ForcedKill {
+            waited_secs: (effective_grace_ms + 500) / 1000,
+        };
+    }
+    StopOutcome::StoppedCleanly
+}
+
+/// Gracefully stops standalone PIDs with `SIGTERM`, waits up to `grace_ms`, and falls back to `SIGKILL`.
+pub fn graceful_stop_pids(pids: &[i32], grace_ms: u64) -> StopOutcome {
+    let mut live = Vec::new();
+    for &pid in pids {
+        if pid > 1 && unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+            live.push(pid);
         }
     }
-    initiated
+    if live.is_empty() {
+        return StopOutcome::Failed;
+    }
+
+    let step_ms = 100u64;
+    let steps = (grace_ms / step_ms).max(1);
+    for _ in 0..steps {
+        if !live.iter().any(|&p| is_pid_alive(p)) {
+            return StopOutcome::StoppedCleanly;
+        }
+        if crate::service::is_stop_requested() {
+            return StopOutcome::StoppedCleanly;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step_ms));
+    }
+
+    if live.iter().any(|&p| is_pid_alive(p)) {
+        for &pid in &live {
+            if is_pid_alive(pid) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        return StopOutcome::ForcedKill {
+            waited_secs: (grace_ms + 500) / 1000,
+        };
+    }
+    StopOutcome::StoppedCleanly
 }
 
 /// Stops / terminates all processes and units belonging to an application across any Linux distro.
@@ -475,8 +720,10 @@ pub fn stop_or_kill_app(app_name: &str) -> Result<String> {
         ));
     }
 
+    let grace_ms = crate::autopilot::load_autopilot_config().stop_grace_secs * 1000;
     let dirs = find_app_cgroup_dirs(app_name);
     let mut killed_units = 0usize;
+    let mut max_forced_secs: Option<u64> = None;
     let mut system_units_to_stop = Vec::new();
 
     for dir in &dirs {
@@ -487,8 +734,13 @@ pub fn stop_or_kill_app(app_name: &str) -> Result<String> {
         let dir_str = dir.to_string_lossy();
 
         if dir_str.contains("/user.slice/") {
-            if graceful_stop_user_cgroup(dir, &unit_name, 1500) {
-                killed_units += 1;
+            match graceful_stop_user_cgroup(dir, &unit_name, grace_ms, true) {
+                StopOutcome::StoppedCleanly => killed_units += 1,
+                StopOutcome::ForcedKill { waited_secs } => {
+                    killed_units += 1;
+                    max_forced_secs = Some(max_forced_secs.unwrap_or(0).max(waited_secs));
+                }
+                StopOutcome::NotRunning | StopOutcome::Failed => {}
             }
         } else if dir_str.contains("/system.slice/") {
             system_units_to_stop.push(unit_name);
@@ -509,20 +761,29 @@ pub fn stop_or_kill_app(app_name: &str) -> Result<String> {
     }
 
     if killed_units > 0 {
+        if let Some(secs) = max_forced_secs {
+            return Ok(format!("Stopped '{app_name}' (forced after {secs}s)"));
+        }
         return Ok(format!("Stopped '{app_name}'"));
     }
 
-    // Fallback: POSIX SIGTERM via `/proc` for non-systemd distros or standalone window manager processes
+    // Fallback: POSIX SIGTERM -> grace -> SIGKILL via `/proc` for non-systemd distros or standalone WMs
     let pids = find_matching_proc_pids(app_name);
     if !pids.is_empty() {
-        let mut term_count = 0usize;
-        for pid in pids {
-            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
-                term_count += 1;
+        match graceful_stop_pids(&pids, grace_ms) {
+            StopOutcome::StoppedCleanly => {
+                return Ok(format!(
+                    "Stopped '{app_name}' ({} process(es))",
+                    pids.len()
+                ));
             }
-        }
-        if term_count > 0 {
-            return Ok(format!("Stopped '{app_name}' ({term_count} process(es))"));
+            StopOutcome::ForcedKill { waited_secs } => {
+                return Ok(format!(
+                    "Stopped '{app_name}' ({} process(es), forced after {waited_secs}s)",
+                    pids.len()
+                ));
+            }
+            StopOutcome::NotRunning | StopOutcome::Failed => {}
         }
     }
 
@@ -982,6 +1243,7 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
     let mut freed_memory_mb = 0.0;
     let mut stopped_pids = 0u32;
     let mut estimated_watts_saved = 0.0;
+    let grace_ms = crate::autopilot::load_autopilot_config().stop_grace_secs * 1000;
 
     let mut system_units_to_stop: Vec<String> = Vec::new();
     let mut system_targets_meta: Vec<&OptimizationTarget> = Vec::new();
@@ -990,31 +1252,43 @@ pub fn execute_optimizations(targets: &[OptimizationTarget]) -> OptimizationRepo
         match t.kind {
             TargetKind::UserUnit => {
                 let mut ok = false;
-                for unit in &t.unit_names {
-                    if let Ok(out) = Command::new("systemctl")
-                        .args(["--user", "stop", "--no-block", unit])
-                        .output()
-                    {
-                        if out.status.success() {
-                            ok = true;
+                let mut forced_secs: Option<u64> = None;
+                if t.cgroup_paths.is_empty() {
+                    for unit in &t.unit_names {
+                        if let Ok(out) = Command::new("systemctl")
+                            .args(["--user", "stop", "--no-block", unit])
+                            .output()
+                        {
+                            if out.status.success() {
+                                ok = true;
+                            }
                         }
                     }
-                }
-                for path in &t.cgroup_paths {
-                    let uname = path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if graceful_stop_user_cgroup(path, &uname, 1000) {
-                        ok = true;
+                } else {
+                    for path in &t.cgroup_paths {
+                        let uname = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        match graceful_stop_user_cgroup(path, &uname, grace_ms, false) {
+                            StopOutcome::StoppedCleanly => ok = true,
+                            StopOutcome::ForcedKill { waited_secs } => {
+                                ok = true;
+                                forced_secs = Some(forced_secs.unwrap_or(0).max(waited_secs));
+                            }
+                            StopOutcome::NotRunning | StopOutcome::Failed => {}
+                        }
                     }
                 }
                 if ok {
                     freed_memory_mb += t.memory_mb;
                     stopped_pids += t.pids_count;
                     estimated_watts_saved += t.estimated_watts;
+                    let forced_note = forced_secs
+                        .map(|s| format!(" (forced after {s}s)"))
+                        .unwrap_or_default();
                     actions_taken.push(format!(
-                        "Stopped {} ({:.0} MB RAM, {} threads)",
+                        "Stopped {} ({:.0} MB RAM, {} threads){forced_note}",
                         t.display_name, t.memory_mb, t.pids_count
                     ));
                 } else {
@@ -1159,5 +1433,88 @@ NHI1\t  S0\t*enabled   pci:0000:74:00.6
             disabled,
             vec![("XHC1".to_string(), "pci:0000:73:00.4".to_string())]
         );
+    }
+
+    #[test]
+    fn parses_systemd_duration_strings() {
+        assert_eq!(parse_systemd_duration_ms("1min 30s"), Some(90_000));
+        assert_eq!(parse_systemd_duration_ms("15s"), Some(15_000));
+        assert_eq!(parse_systemd_duration_ms("500ms"), Some(500));
+        assert_eq!(parse_systemd_duration_ms("1h 2min"), Some(3_720_000));
+        assert_eq!(parse_systemd_duration_ms("infinity"), None);
+        assert_eq!(parse_systemd_duration_ms(""), None);
+    }
+
+    #[test]
+    fn graceful_stop_allows_3s_sigterm_handler_to_exit_cleanly() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "trap 'sleep 3; exit 0' TERM; while true; do sleep 0.1; done",
+            ])
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let outcome = graceful_stop_pids(&[pid], 6_000);
+        let _ = child.wait();
+        assert_eq!(outcome, StopOutcome::StoppedCleanly);
+    }
+
+    #[test]
+    fn graceful_stop_forces_sigkill_when_sigterm_ignored() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; while true; do sleep 0.2; done"])
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let outcome = graceful_stop_pids(&[pid], 500);
+        let _ = child.wait();
+        assert!(matches!(outcome, StopOutcome::ForcedKill { .. }));
+    }
+
+    #[test]
+    fn failed_cgroup_thaw_keeps_unit_in_ownership_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let uniq = format!(
+            "rb_thaw_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(uniq);
+        let writable = root.join("writable.scope");
+        let readonly = root.join("readonly.scope");
+        let vanished = root.join("vanished.scope");
+        fs::create_dir_all(&writable).unwrap();
+        fs::create_dir_all(&readonly).unwrap();
+        fs::write(writable.join("cgroup.freeze"), "1").unwrap();
+        let ro_file = readonly.join("cgroup.freeze");
+        fs::write(&ro_file, "1").unwrap();
+        fs::set_permissions(&ro_file, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let json_path = root.join("rb_frozen_units.json");
+        save_owned_frozen_state_to(
+            &json_path,
+            &OwnedFrozenState {
+                cgroups: vec![writable.clone(), readonly.clone(), vanished.clone()],
+                pids: Vec::new(),
+            },
+        );
+
+        let thawed = thaw_owned_state_at(&json_path);
+        assert!(thawed.contains(&"writable.scope".to_string()));
+        assert_eq!(fs::read_to_string(writable.join("cgroup.freeze")).unwrap(), "0");
+
+        let remaining = load_owned_frozen_state_from(&json_path);
+        assert!(!remaining.cgroups.contains(&writable));
+        assert!(!remaining.cgroups.contains(&vanished));
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(remaining.cgroups.contains(&readonly));
+        }
+
+        let _ = fs::set_permissions(&ro_file, fs::Permissions::from_mode(0o644));
+        let _ = fs::remove_dir_all(root);
     }
 }

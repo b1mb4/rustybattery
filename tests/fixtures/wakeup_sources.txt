@@ -1,0 +1,5 @@
+name		active_count	event_count	wakeup_count	expire_count	active_since	total_time	max_time	last_change	prevent_suspend_time
+iwlwifi     	120		135		5		0		0		4500		120		1000		0
+Power Button	3		3		1		0		0		42		15		2000		0
+xhci_hcd    	50		64		2		0		0		12000		300		3000		0
+idle_dev    	0		0		0		0		0		0		0		0		0

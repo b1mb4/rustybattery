@@ -4,10 +4,12 @@ pub mod battery;
 pub mod db;
 pub mod guards;
 pub mod optimize;
+pub mod paths;
 pub mod power;
 pub mod report;
 pub mod service;
 pub mod statusbar;
+pub mod trace;
 pub mod tui;
 
 use crate::apps::{detect_focused_apps, AppEnergyTracker, Focus};
@@ -24,7 +26,7 @@ use crate::optimize::{
     set_app_frozen, stop_or_kill_app, thaw_all_user_cgroups, thaw_owned_user_cgroups,
 };
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::thread;
 use std::time::Duration;
 
@@ -159,11 +161,19 @@ enum Commands {
     /// Check system capabilities (cgroup v2, focus detection, RAPL, power profiles, logind, config)
     Doctor,
 
-    /// Calibrate baseline idle draw and CPU Watts-per-core for your laptop and save to config.toml
+    /// Calibrate baseline idle draw and CPU Watts-per-core on battery (idle + 1-core + all-core)
     Calibrate {
-        /// Calibration duration in seconds (default: 4 seconds)
-        #[arg(short, long, default_value_t = 4)]
-        seconds: u64,
+        /// Idle phase duration in seconds (default: 60)
+        #[arg(long, default_value_t = 60)]
+        idle_secs: u64,
+
+        /// Duration of each CPU load phase (1-core and all-core) in seconds (default: 45)
+        #[arg(long, default_value_t = 45)]
+        load_secs: u64,
+
+        /// Reset calibration parameters back to factory defaults
+        #[arg(long)]
+        reset: bool,
     },
 
     /// Generate a daily or weekly battery health & app usage report (Markdown or JSON)
@@ -173,36 +183,75 @@ enum Commands {
         days: u64,
 
         /// Output format: "markdown" or "json"
-        #[arg(short, long, default_value = "markdown")]
-        format: String,
+        #[arg(short, long, value_enum, default_value_t = report::ReportFormat::Markdown)]
+        format: report::ReportFormat,
 
         /// Maximum number of top apps to include
         #[arg(short, long, default_value_t = 10)]
         top: usize,
+
+        /// Write report atomically to a file instead of stdout
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
 
     /// Export battery telemetry as CSV or Prometheus textfile metrics
     Export {
         /// Output format: "csv" or "prometheus"
-        #[arg(short, long, default_value = "csv")]
-        format: String,
+        #[arg(short, long, value_enum, default_value_t = report::ExportFormat::Csv)]
+        format: report::ExportFormat,
 
         /// Hours of history to export (0 = since last full charge)
         #[arg(long, default_value_t = 24)]
         hours: u64,
+
+        /// Export per-application CSV breakdown instead of battery history
+        #[arg(long)]
+        per_app: bool,
+
+        /// Maximum number of top apps to include (0 = all)
+        #[arg(short, long, default_value_t = 20)]
+        top: usize,
+
+        /// Write export atomically to a file (0600) instead of stdout
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
 
-    /// Show kernel wakeup sources (/sys/power/wakeup_sources) and 80% battery charge-limit helper
+    /// Show kernel wakeup sources (/sys/class/wakeup) and 80% battery charge-limit helper
     Wakeups {
         /// Maximum number of wakeup sources to display
         #[arg(short, long, default_value_t = 15)]
         top: usize,
     },
 
+    /// Inspect or apply battery charge-limit threshold (`--set 80`) and show targeted udev rule
+    ChargeLimit {
+        /// Set charge_control_end_threshold percentage (20..=100)
+        #[arg(long)]
+        set: Option<u8>,
+    },
+
+    /// Record live sysfs/RAPL/cgroup snapshots to a JSONL trace file for offline replay
+    RecordTrace {
+        /// Total capture duration in seconds
+        #[arg(short, long, default_value_t = 30)]
+        seconds: u64,
+
+        /// Sampling interval in seconds
+        #[arg(short, long, default_value_t = 2)]
+        interval: u64,
+
+        /// Destination JSONL trace file path
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+    },
+
     /// Generate shell completion scripts for bash, zsh, or fish
     Completions {
         /// Target shell: "bash", "zsh", or "fish"
-        shell: String,
+        #[arg(value_enum)]
+        shell: report::CompletionShell,
     },
 
     /// View the manual page or install it for `man battery` / `man rustybattery`
@@ -445,7 +494,7 @@ pub fn run() -> Result<()> {
                         return Ok(());
                     }
                     println!("Config Path: {}", path.display());
-                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                    if let Ok(raw) = std::fs::read_to_string(path) {
                         println!("\n{raw}");
                     } else {
                         println!("(not created yet — run `battery autopilot config --init` to create)");
@@ -490,6 +539,7 @@ pub fn run() -> Result<()> {
                         "  • Alert Notifications:         {}",
                         if cfg.notifications_enabled { "ON" } else { "OFF" }
                     );
+                    println!("  • Stop Grace Period:           {} s", cfg.stop_grace_secs);
                     println!();
                     println!(
                         "Protected Whitelist ({}): {}",
@@ -664,19 +714,40 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::Doctor => run_doctor(),
-        Commands::Calibrate { seconds } => run_calibrate(seconds),
-        Commands::Report { days, format, top } => {
+        Commands::Calibrate {
+            idle_secs,
+            load_secs,
+            reset,
+        } => run_calibrate(idle_secs, load_secs, reset),
+        Commands::Report {
+            days,
+            format,
+            top,
+            output,
+        } => {
             let db = Database::open(&default_db_path())?;
-            report::print_report(&db, days, &format, top)
+            report::print_report(&db, days, format, top, output.as_deref())
         }
-        Commands::Export { format, hours } => {
+        Commands::Export {
+            format,
+            hours,
+            per_app,
+            top,
+            output,
+        } => {
             let db = Database::open(&default_db_path())?;
-            report::print_export(&db, &format, hours)
+            report::print_export(&db, format, hours, per_app, top, output.as_deref())
         }
         Commands::Wakeups { top } => report::print_wakeup_report(top),
+        Commands::ChargeLimit { set } => report::run_charge_limit(set),
+        Commands::RecordTrace {
+            seconds,
+            interval,
+            output,
+        } => trace::record_trace(seconds, interval, &output),
         Commands::Completions { shell } => {
-            let script = report::generate_shell_completions(&shell)?;
-            print!("{script}");
+            let cmd = Cli::command();
+            print!("{}", report::generate_shell_completions(shell, &cmd));
             Ok(())
         }
         Commands::Man { install } => {
@@ -693,7 +764,7 @@ pub fn run() -> Result<()> {
                 let existing = std::fs::read_to_string(&manpath_cfg).unwrap_or_default();
                 if !existing.contains(&man_root.display().to_string()) {
                     let updated = format!("{existing}{man_line}");
-                    let _ = std::fs::write(&manpath_cfg, updated);
+                    let _ = std::fs::write(manpath_cfg, updated);
                 }
                 println!("✔ Installed manual pages to {}", man_dir.display());
                 println!("  Try: `man battery` or `man rustybattery`");
@@ -763,7 +834,7 @@ fn print_summary(hours: u64, top: usize, json: bool) -> Result<()> {
                 "cpu_secs": a.cpu_secs,
                 "memory_mb": a.memory_mb,
                 "pids_count": a.pids_count,
-                "confidence": a.confidence,
+                "confidence": a.confidence.as_str(),
             })).collect::<Vec<_>>()
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -1014,11 +1085,14 @@ fn run_doctor() -> Result<()> {
         }
     }
 
-    let rapl_path = std::path::Path::new("/sys/class/powercap/intel-rapl:0/energy_uj");
-    if std::fs::read_to_string(rapl_path).is_ok() {
-        println!("✔ Hardware RAPL:        readable ({})", rapl_path.display());
-    } else if rapl_path.exists() {
-        println!("ℹ Hardware RAPL:        present but root-only ({})", rapl_path.display());
+    if crate::battery::read_rapl_package_energy_uj().is_some() {
+        println!("✔ Hardware RAPL:        readable (multi-package energy_uj active)");
+    } else if std::path::Path::new("/sys/class/powercap/intel-rapl:0/energy_uj").exists()
+        || std::path::Path::new("/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj").exists()
+    {
+        println!(
+            "ℹ Hardware RAPL:        present but root-only (kernel default due to CVE-2020-8694; on single-user laptops you may optionally restrict read access to a dedicated 'power' group via udev)"
+        );
     } else {
         println!("ℹ Hardware RAPL:        not exposed on this platform");
     }
@@ -1044,7 +1118,7 @@ fn run_doctor() -> Result<()> {
     let _ = load_autopilot_config();
     if let Some(err) = last_config_error() {
         println!(
-            "✖ Config validation:    {} (SAFE MODE — autopilot disabled: {err})",
+            "✖ Config validation:    {} (SAFE MODE — auto_freeze disabled: {err})",
             cfg_path.display()
         );
     } else if cfg_path.exists() {
@@ -1052,14 +1126,54 @@ fn run_doctor() -> Result<()> {
             try_parse_config_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         }) {
             Ok(cfg) => println!(
-                "✔ Config validation:    {} (valid, auto_freeze={})",
+                "✔ Config validation:    {} (valid, config_version={}, retention={}d, auto_freeze={})",
                 cfg_path.display(),
+                cfg.config_version,
+                cfg.retention_days,
                 cfg.auto_freeze_enabled
             ),
             Err(e) => println!("✖ Config validation:    {} ({e})", cfg_path.display()),
         }
     } else {
         println!("✔ Config validation:    using defaults ({} not created yet)", cfg_path.display());
+    }
+
+    let rules = crate::apps::load_user_app_rules();
+    if let Some(err) = crate::apps::last_apps_rules_error() {
+        println!("✖ Custom App Rules:     apps.toml error ({err})");
+    } else {
+        println!(
+            "✔ Custom App Rules:     {} rule(s) active (apps.toml)",
+            rules.len()
+        );
+    }
+
+    let cfg = load_autopilot_config();
+    match cfg.calibrated_at {
+        None => println!(
+            "ℹ Power Model:          not calibrated (defaults: baseline={:.2} W, cpu={:.2} W/core, rapl_idle={:.2} W; run `battery calibrate`)",
+            cfg.calibrated_baseline_w, cfg.calibrated_cpu_w_per_core, cfg.calibrated_rapl_idle_w
+        ),
+        Some(ts) => {
+            let hit_clamp = cfg.calibrated_baseline_w <= 0.31
+                || cfg.calibrated_baseline_w >= 14.99
+                || cfg.calibrated_cpu_w_per_core <= 1.01
+                || cfg.calibrated_cpu_w_per_core >= 44.99;
+            let date = chrono::DateTime::from_timestamp(ts, 0)
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| ts.to_string());
+            if hit_clamp {
+                println!(
+                    "⚠ Power Model:          calibrated on {date}, value hit clamp (baseline={:.2} W, cpu={:.2} W/core, rapl_idle={:.2} W) — re-run `battery calibrate` or `battery calibrate --reset`",
+                    cfg.calibrated_baseline_w, cfg.calibrated_cpu_w_per_core, cfg.calibrated_rapl_idle_w
+                );
+            } else {
+                println!(
+                    "✔ Power Model:          calibrated on {date} (baseline={:.2} W, cpu={:.2} W/core, rapl_idle={:.2} W)",
+                    cfg.calibrated_baseline_w, cfg.calibrated_cpu_w_per_core, cfg.calibrated_rapl_idle_w
+                );
+            }
+        }
     }
 
     let db = Database::open(&default_db_path())?;
@@ -1077,50 +1191,255 @@ fn run_doctor() -> Result<()> {
     Ok(())
 }
 
-fn run_calibrate(seconds: u64) -> Result<()> {
-    let dur_secs = seconds.clamp(2, 30);
-    println!("🔬 RustyBattery — Hardware Power Model Calibration ({dur_secs}s)");
-    println!("──────────────────────────────────────────────────────────────────────");
-    let bat_start = read_battery_snapshot()?;
-    let disp_w = crate::battery::estimate_display_power_w();
-    let mut tracker = AppEnergyTracker::new();
+/// Fits `(baseline_w, w_per_core)` via ordinary least squares over `(cores_busy, total_power_w)` points (`N-2`).
+pub fn fit_power_model(points: &[(f64, f64)], display_w: f64) -> Result<(f64, f64)> {
+    if points.len() < 2 {
+        anyhow::bail!("Calibration requires at least 2 measurement phases");
+    }
+    let n = points.len() as f64;
+    let ys: Vec<f64> = points.iter().map(|(_, p)| p - display_w).collect();
+    let mean_x = points.iter().map(|(c, _)| *c).sum::<f64>() / n;
+    let mean_y = ys.iter().sum::<f64>() / n;
 
-    let mut power_samples = Vec::new();
-    for _ in 0..dur_secs {
-        thread::sleep(Duration::from_secs(1));
-        if let Ok(snap) = read_battery_snapshot() {
-            if snap.power_w > 0.1 {
-                power_samples.push(snap.power_w);
-            }
+    let mut var_x = 0.0;
+    let mut cov_xy = 0.0;
+    for ((x, _), y) in points.iter().zip(ys.iter()) {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        var_x += dx * dx;
+        cov_xy += dx * dy;
+    }
+    if var_x < 1e-4 {
+        anyhow::bail!("CPU load did not vary enough across calibration phases");
+    }
+    let slope = cov_xy / var_x;
+    if slope <= 0.1 {
+        anyhow::bail!("Measured power did not rise with CPU load; calibration aborted");
+    }
+    let intercept = mean_y - slope * mean_x;
+    Ok((intercept.clamp(0.3, 15.0), slope.clamp(1.0, 45.0)))
+}
+
+struct CalibrationLoadGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl Drop for CalibrationLoadGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        for h in self.handles.drain(..) {
+            let _ = h.join();
         }
     }
+}
 
-    let avg_power_w = if power_samples.is_empty() {
-        bat_start.power_w.max(6.0)
-    } else {
-        power_samples.iter().sum::<f64>() / (power_samples.len() as f64)
+fn measure_calibration_phase(
+    label: &str,
+    secs: u64,
+    load_threads: usize,
+    estimator: &mut service::RollingEnergyEstimator,
+) -> Result<(f64, f64, Option<f64>)> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    println!("  ▸ Phase `{label}` ({secs}s, {load_threads} worker thread(s))...");
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut guard = CalibrationLoadGuard {
+        stop: Arc::clone(&stop),
+        handles: Vec::with_capacity(load_threads),
     };
-    let (deltas, dt) = tracker.sample_delta(avg_power_w, bat_start.energy_full_wh, true);
-    let total_cpu_secs: f64 = deltas.iter().map(|d| d.cpu_secs).sum();
-    let cores_busy = (total_cpu_secs / dt.max(0.5)).max(0.05);
+    for _ in 0..load_threads {
+        let s = Arc::clone(&stop);
+        guard.handles.push(thread::spawn(move || {
+            let mut acc = 1.0001_f64;
+            while !s.load(Ordering::Relaxed) {
+                for _ in 0..50_000 {
+                    acc = std::hint::black_box(acc.mul_add(1.0000001, 0.0000003));
+                    if acc > 1e9 {
+                        acc = 1.0001;
+                    }
+                }
+            }
+        }));
+    }
 
-    let non_display_w = (avg_power_w - disp_w).max(1.0);
-    let baseline_w = (non_display_w * 0.25).clamp(0.5, 4.0);
-    let est_w_per_core = ((non_display_w - baseline_w).max(1.0) / cores_busy).clamp(4.0, 28.0);
+    let start_snap = read_battery_snapshot()?;
+    if start_snap.ac_online || !start_snap.status.is_discharging() {
+        anyhow::bail!("AC adapter connected or battery stopped discharging during calibration");
+    }
+    let start_rapl_uj = crate::battery::read_rapl_package_energy_uj();
+    let mut tracker = AppEnergyTracker::with_interval(secs);
+    let mut prev_wh = start_snap.energy_now_wh;
+    let mut min_step_wh: Option<f64> = None;
+    let mut power_now_samples = Vec::new();
+    let mut rolling_samples = Vec::new();
+    let mut last_snap = start_snap.clone();
+
+    for _ in 0..secs {
+        thread::sleep(Duration::from_secs(1));
+        if service::is_stop_requested() {
+            anyhow::bail!("Calibration interrupted by signal");
+        }
+        let snap = read_battery_snapshot()?;
+        if snap.ac_online || !snap.status.is_discharging() {
+            anyhow::bail!("AC adapter connected or battery stopped discharging during calibration");
+        }
+        let step = (prev_wh - snap.energy_now_wh).abs();
+        if step > 1e-5 {
+            min_step_wh = Some(match min_step_wh {
+                Some(cur) => cur.min(step),
+                None => step,
+            });
+        }
+        prev_wh = snap.energy_now_wh;
+        let rolled = estimator.observe(snap.timestamp, snap.energy_now_wh, snap.power_w, true);
+        if rolled > 0.1 {
+            rolling_samples.push(rolled);
+        }
+        if snap.power_w > 0.1 {
+            power_now_samples.push(snap.power_w);
+        }
+        last_snap = snap;
+    }
+
+    // Stop worker threads immediately before sampling final deltas
+    drop(guard);
+    let end_rapl_uj = crate::battery::read_rapl_package_energy_uj();
+
+    let dt = (last_snap.timestamp - start_snap.timestamp).max(1) as f64;
+    let de = (start_snap.energy_now_wh - last_snap.energy_now_wh).max(0.0);
+    let rapl_w = match (start_rapl_uj, end_rapl_uj) {
+        (Some(start), Some(end)) if end >= start && dt >= 1.0 => {
+            let w = ((end - start) as f64 / 1_000_000.0) / dt;
+            (0.05..100.0).contains(&w).then_some(w)
+        }
+        _ => None,
+    };
+    let gauge_step = min_step_wh.unwrap_or(0.01);
+    let mean_power_now = if power_now_samples.is_empty() {
+        None
+    } else {
+        Some(power_now_samples.iter().sum::<f64>() / power_now_samples.len() as f64)
+    };
+
+    let phase_power_w = if de >= 3.0 * gauge_step {
+        let p_energy = (de * 3600.0) / dt;
+        match mean_power_now {
+            Some(p_now) => 0.5 * p_now + 0.5 * p_energy,
+            None => p_energy,
+        }
+    } else if let Some(p_now) = mean_power_now {
+        p_now
+    } else if let Some(&rolled_last) = rolling_samples.last() {
+        rolled_last
+    } else {
+        anyhow::bail!(
+            "Insufficient battery telemetry during '{label}' phase (no power_now readings and energy drop {de:.4} Wh < 3x gauge step {gauge_step:.4} Wh). Try longer --idle-secs / --load-secs."
+        );
+    };
+
+    let (deltas, tracker_dt) = tracker.sample_delta(phase_power_w, last_snap.energy_full_wh, true);
+    let total_cpu_secs: f64 = deltas.iter().map(|d| d.cpu_secs).sum();
+    let cores_busy = (total_cpu_secs / tracker_dt.max(0.5)).max(0.01);
+    println!(
+        "    → {:.2} W @ {:.2} core(s) busy (ΔE={:.3} Wh, dt={:.0}s{})",
+        phase_power_w,
+        cores_busy,
+        de,
+        dt,
+        rapl_w.map(|r| format!(", RAPL={r:.2} W")).unwrap_or_default()
+    );
+    Ok((cores_busy, phase_power_w, rapl_w))
+}
+
+fn run_calibrate(idle_secs: u64, load_secs: u64, reset: bool) -> Result<()> {
+    if reset {
+        let mut cfg = load_autopilot_config();
+        cfg.calibrated_baseline_w = 1.0;
+        cfg.calibrated_cpu_w_per_core = 12.0;
+        cfg.calibrated_rapl_idle_w = 0.0;
+        cfg.calibrated_at = None;
+        save_autopilot_config(&cfg)?;
+        println!(
+            "✔ Reset calibration parameters to defaults (baseline=1.00 W, cpu=12.00 W/core, rapl_idle=0.00 W) in {}",
+            config_file_path().display()
+        );
+        return Ok(());
+    }
+
+    service::install_signal_handlers();
+    let bat = read_battery_snapshot()?;
+    if bat.ac_online || !bat.status.is_discharging() {
+        anyhow::bail!(
+            "Calibration requires running on battery (discharging). Unplug AC power, keep screen brightness steady, and re-run `battery calibrate`."
+        );
+    }
+
+    let idle_dur = idle_secs.clamp(10, 120);
+    let load_dur = load_secs.clamp(10, 120);
+    let all_cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 16);
+    let disp_w = crate::battery::estimate_display_power_w();
+
+    println!("🔬 RustyBattery — 3-Phase Hardware Power Model Calibration");
+    println!("──────────────────────────────────────────────────────────────────────");
+    println!("Please keep your screen brightness steady and avoid heavy background apps.");
+    println!(
+        "Phases: Idle ({idle_dur}s) → 1-Core Load ({load_dur}s) → {all_cores}-Core Load ({load_dur}s)"
+    );
+    println!();
+
+    let mut estimator = service::RollingEnergyEstimator::new();
+    let (c1, w1, idle_rapl_w) = measure_calibration_phase("idle", idle_dur, 0, &mut estimator)?;
+    let (c2, w2, _) = measure_calibration_phase("1-core", load_dur, 1, &mut estimator)?;
+    let (c3, w3, _) = measure_calibration_phase("all-core", load_dur, all_cores, &mut estimator)?;
+
+    let (baseline_w, w_per_core) = fit_power_model(&[(c1, w1), (c2, w2), (c3, w3)], disp_w)?;
 
     let mut cfg = load_autopilot_config();
     cfg.calibrated_baseline_w = (baseline_w * 100.0).round() / 100.0;
-    cfg.calibrated_cpu_w_per_core = (est_w_per_core * 100.0).round() / 100.0;
+    cfg.calibrated_cpu_w_per_core = (w_per_core * 100.0).round() / 100.0;
+    if let Some(rw) = idle_rapl_w {
+        cfg.calibrated_rapl_idle_w = (rw.clamp(0.0, 15.0) * 100.0).round() / 100.0;
+    }
+    cfg.calibrated_at = Some(chrono::Utc::now().timestamp());
     save_autopilot_config(&cfg)?;
 
-    println!("  • Average System Draw:       {:.2} W", avg_power_w);
+    println!();
     println!("  • Estimated Display Draw:    {:.2} W", disp_w);
-    println!("  • Active CPU Load Observed:  {:.2} core(s)", cores_busy);
     println!(
-        "  ✔ Saved calibrated_baseline_w = {:.2} W, calibrated_cpu_w_per_core = {:.2} W/core to {}",
+        "  ✔ Saved calibrated_baseline_w = {:.2} W, calibrated_cpu_w_per_core = {:.2} W/core, calibrated_rapl_idle_w = {:.2} W to {}",
         cfg.calibrated_baseline_w,
         cfg.calibrated_cpu_w_per_core,
+        cfg.calibrated_rapl_idle_w,
         config_file_path().display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_power_model_recovers_linear_baseline_and_watts_per_core() {
+        // True model: display = 2.0 W, baseline = 1.5 W, slope = 7.5 W/core
+        let points = vec![
+            (0.1, 2.0 + 1.5 + 0.1 * 7.5),
+            (1.0, 2.0 + 1.5 + 1.0 * 7.5),
+            (4.0, 2.0 + 1.5 + 4.0 * 7.5),
+        ];
+        let (baseline, slope) = fit_power_model(&points, 2.0).unwrap();
+        assert!((baseline - 1.5).abs() < 1e-6);
+        assert!((slope - 7.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fit_power_model_rejects_flat_or_negative_slope() {
+        assert!(fit_power_model(&[(0.2, 8.0), (0.2, 8.2)], 2.0).is_err());
+        assert!(fit_power_model(&[(0.2, 10.0), (2.0, 9.0)], 2.0).is_err());
+    }
 }
