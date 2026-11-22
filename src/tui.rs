@@ -876,25 +876,23 @@ fn run_tui_loop(
                                 }
                             }
                         }
-                        MouseEventKind::Down(MouseButton::Right) => {
-                            if in_rect(app.table_area) {
-                                let header_end = app.table_area.y.saturating_add(2);
-                                let bottom_edge = app
-                                    .table_area
-                                    .y
-                                    .saturating_add(app.table_area.height.saturating_sub(1));
-                                if (header_end..bottom_edge).contains(&row) {
-                                    let clicked = app.table_state.offset()
-                                        + row.saturating_sub(header_end) as usize;
-                                    if clicked < app.apps.len() {
-                                        app.table_state.select(Some(clicked));
-                                        app.update_selected_app_buckets();
-                                        let term_size = terminal.size().unwrap_or_default();
-                                        let term_rect =
-                                            Rect::new(0, 0, term_size.width, term_size.height);
-                                        if !should_show_details_panel(app, term_rect) {
-                                            app.details_modal_open = true;
-                                        }
+                        MouseEventKind::Down(MouseButton::Right) if in_rect(app.table_area) => {
+                            let header_end = app.table_area.y.saturating_add(2);
+                            let bottom_edge = app
+                                .table_area
+                                .y
+                                .saturating_add(app.table_area.height.saturating_sub(1));
+                            if (header_end..bottom_edge).contains(&row) {
+                                let clicked = app.table_state.offset()
+                                    + row.saturating_sub(header_end) as usize;
+                                if clicked < app.apps.len() {
+                                    app.table_state.select(Some(clicked));
+                                    app.update_selected_app_buckets();
+                                    let term_size = terminal.size().unwrap_or_default();
+                                    let term_rect =
+                                        Rect::new(0, 0, term_size.width, term_size.height);
+                                    if !should_show_details_panel(app, term_rect) {
+                                        app.details_modal_open = true;
                                     }
                                 }
                             }
