@@ -144,11 +144,19 @@ struct DrainCacheState {
     stats: PeriodDrainStats,
 }
 
+#[derive(Default)]
+struct MetaWriteCache {
+    last_full_threshold: Option<String>,
+    last_sample_discharging: Option<bool>,
+}
+
 pub struct Database {
     conn: Connection,
     pub path: PathBuf,
-    drain_cache: std::sync::Mutex<Option<DrainCacheState>>,
+    drain_cache: std::sync::Mutex<Vec<DrainCacheState>>,
     last_health_write: std::sync::Mutex<Option<(i64, f64, u32)>>,
+    cached_boot_ref: std::sync::Mutex<Option<(String, i64)>>,
+    meta_write_cache: std::sync::Mutex<MetaWriteCache>,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -261,8 +269,10 @@ impl Database {
         let instance = Self {
             conn,
             path: path.to_path_buf(),
-            drain_cache: std::sync::Mutex::new(None),
+            drain_cache: std::sync::Mutex::new(Vec::new()),
             last_health_write: std::sync::Mutex::new(None),
+            cached_boot_ref: std::sync::Mutex::new(None),
+            meta_write_cache: std::sync::Mutex::new(MetaWriteCache::default()),
         };
         instance.init_schema()?;
         if path != Path::new(":memory:") {
@@ -277,8 +287,10 @@ impl Database {
         let instance = Self {
             conn,
             path: PathBuf::from(":memory:"),
-            drain_cache: std::sync::Mutex::new(None),
+            drain_cache: std::sync::Mutex::new(Vec::new()),
             last_health_write: std::sync::Mutex::new(None),
+            cached_boot_ref: std::sync::Mutex::new(None),
+            meta_write_cache: std::sync::Mutex::new(MetaWriteCache::default()),
         };
         instance.init_schema()?;
         Ok(instance)
@@ -290,6 +302,20 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<()> {
+        let user_ver: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if user_ver >= 5 {
+            self.exec(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 CREATE INDEX IF NOT EXISTS idx_app_usage_name_ts
+                     ON app_usage_buckets(app_name, bucket_ts);",
+            )?;
+            return Ok(());
+        }
+
         self.exec(
             "PRAGMA auto_vacuum = INCREMENTAL;
              PRAGMA journal_mode=WAL;
@@ -329,6 +355,7 @@ impl Database {
                  PRIMARY KEY (bucket_ts, app_name)
              );
              CREATE INDEX IF NOT EXISTS idx_app_usage_ts ON app_usage_buckets(bucket_ts);
+             CREATE INDEX IF NOT EXISTS idx_app_usage_name_ts ON app_usage_buckets(app_name, bucket_ts);
              CREATE TABLE IF NOT EXISTS sleep_sessions (
                  start_ts INTEGER PRIMARY KEY,
                  end_ts INTEGER NOT NULL,
@@ -400,6 +427,10 @@ impl Database {
                  PRAGMA user_version = 4;",
             );
         }
+        if user_ver < 5 {
+            let _ = self.deduplicate_sleep_sessions();
+            let _ = self.conn.execute_batch("PRAGMA user_version = 5;");
+        }
         Ok(())
     }
 
@@ -407,15 +438,29 @@ impl Database {
         if boot_id.is_empty() {
             return 0;
         }
+        if let Ok(guard) = self.cached_boot_ref.lock() {
+            if let Some((ref cached_id, id)) = *guard {
+                if cached_id == boot_id {
+                    return id;
+                }
+            }
+        }
         let _ = self.conn.execute(
             "INSERT OR IGNORE INTO boots (boot_id) VALUES (?1)",
             [boot_id],
         );
-        self.conn
+        let id = self
+            .conn
             .query_row("SELECT id FROM boots WHERE boot_id = ?1", [boot_id], |r| {
                 r.get(0)
             })
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if id > 0 {
+            if let Ok(mut guard) = self.cached_boot_ref.lock() {
+                *guard = Some((boot_id.to_string(), id));
+            }
+        }
+        id
     }
 
     pub fn get_meta(&self, key: &str) -> Option<String> {
@@ -474,19 +519,37 @@ impl Database {
     }
 
     pub fn record_battery_snapshot(&self, snap: &BatterySnapshot) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         let full_threshold = snap
             .charge_limit_pct
             .unwrap_or(95)
             .saturating_sub(2)
             .max(50) as f64;
-        let _ = self.set_meta("last_full_threshold", &format!("{:.1}", full_threshold));
+        let full_threshold_str = format!("{full_threshold:.1}");
+        let need_threshold_write = self
+            .meta_write_cache
+            .lock()
+            .ok()
+            .map(|g| g.last_full_threshold.as_deref() != Some(full_threshold_str.as_str()))
+            .unwrap_or(true);
+        if need_threshold_write {
+            let _ = self.set_meta("last_full_threshold", &full_threshold_str);
+            if let Ok(mut g) = self.meta_write_cache.lock() {
+                g.last_full_threshold = Some(full_threshold_str);
+            }
+        }
         if (snap.capacity_pct >= full_threshold && !snap.status.is_discharging())
             || snap.status == BatteryStatus::Full
         {
             let _ = self.set_meta("last_full_charge_ts", &snap.timestamp.to_string());
         }
 
-        let prev_discharging = self.get_meta("last_sample_discharging").as_deref() == Some("1");
+        let prev_discharging = self
+            .meta_write_cache
+            .lock()
+            .ok()
+            .and_then(|g| g.last_sample_discharging)
+            .unwrap_or_else(|| self.get_meta("last_sample_discharging").as_deref() == Some("1"));
         let now_discharging = snap.status.is_discharging();
         if now_discharging && !prev_discharging {
             let prev_unplug_ts = self
@@ -499,13 +562,24 @@ impl Database {
                 let _ = self.set_meta("last_unplug_ts", &snap.timestamp.to_string());
             }
         }
-        let _ = self.set_meta(
-            "last_sample_discharging",
-            if now_discharging { "1" } else { "0" },
-        );
+        let need_discharging_write = self
+            .meta_write_cache
+            .lock()
+            .ok()
+            .map(|g| g.last_sample_discharging != Some(now_discharging))
+            .unwrap_or(true);
+        if need_discharging_write {
+            let _ = self.set_meta(
+                "last_sample_discharging",
+                if now_discharging { "1" } else { "0" },
+            );
+            if let Ok(mut g) = self.meta_write_cache.lock() {
+                g.last_sample_discharging = Some(now_discharging);
+            }
+        }
 
         let boot_ref = self.intern_boot_id(&snap.boot_id);
-        self.conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO battery_samples
              (timestamp, capacity_pct, status, power_w, energy_now_wh, energy_full_wh, voltage_v,
               screen_on, boot_id, suspended_secs, boot_ref)
@@ -537,10 +611,8 @@ impl Database {
             } else {
                 true
             };
-            if should_write {
-                let day_ts = (snap.timestamp / 86_400) * 86_400;
-                if self
-                    .conn
+            if should_write
+                && tx
                     .execute(
                         "INSERT INTO battery_health_daily
                          (day_ts, energy_full_wh, energy_design_wh, health_pct, cycle_count)
@@ -551,7 +623,7 @@ impl Database {
                              health_pct = MAX(health_pct, excluded.health_pct),
                              cycle_count = MAX(cycle_count, excluded.cycle_count)",
                         params![
-                            day_ts,
+                            (snap.timestamp / 86_400) * 86_400,
                             snap.energy_full_wh,
                             snap.energy_design_wh,
                             snap.health_pct,
@@ -559,13 +631,13 @@ impl Database {
                         ],
                     )
                     .is_ok()
-                {
-                    if let Ok(mut guard) = self.last_health_write.lock() {
-                        *guard = Some((snap.timestamp, snap.energy_full_wh, snap.cycle_count));
-                    }
+            {
+                if let Ok(mut guard) = self.last_health_write.lock() {
+                    *guard = Some((snap.timestamp, snap.energy_full_wh, snap.cycle_count));
                 }
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -760,40 +832,38 @@ impl Database {
         };
 
         if let Ok(mut cache) = self.drain_cache.lock() {
-            if let Some(ref mut state) = *cache {
-                if state.since_bucket == since_bucket {
-                    if let Some(ref last_row) = state.last_row {
-                        let mut stmt = self.conn.prepare_cached(
-                            "SELECT s.timestamp, s.capacity_pct, s.status, s.energy_now_wh, s.screen_on,
-                                    COALESCE(NULLIF(s.boot_id, ''), b.boot_id, ''), s.suspended_secs
-                             FROM battery_samples s
-                             LEFT JOIN boots b ON b.id = s.boot_ref
-                             WHERE s.timestamp > ?1
-                             ORDER BY s.timestamp ASC",
-                        )?;
-                        let new_rows: Vec<DrainRow> = stmt
-                            .query_map([last_row.ts], |r| {
-                                Ok(DrainRow {
-                                    ts: r.get(0)?,
-                                    pct: r.get(1)?,
-                                    status: r.get(2)?,
-                                    wh: r.get(3)?,
-                                    screen_on: r.get::<_, i64>(4)? != 0,
-                                    boot_id: r.get(5)?,
-                                    suspended: r.get(6)?,
-                                })
-                            })?
-                            .filter_map(|r| r.ok())
-                            .collect();
-                        if !new_rows.is_empty() {
-                            let mut chunk = Vec::with_capacity(new_rows.len() + 1);
-                            chunk.push(last_row.clone());
-                            chunk.extend(new_rows);
-                            fold_drain_rows(&mut state.stats, &chunk);
-                            state.last_row = chunk.pop();
-                        }
-                        return Ok(state.stats.clone());
+            if let Some(state) = cache.iter_mut().find(|s| s.since_bucket == since_bucket) {
+                if let Some(ref last_row) = state.last_row {
+                    let mut stmt = self.conn.prepare_cached(
+                        "SELECT s.timestamp, s.capacity_pct, s.status, s.energy_now_wh, s.screen_on,
+                                COALESCE(NULLIF(s.boot_id, ''), b.boot_id, ''), s.suspended_secs
+                         FROM battery_samples s
+                         LEFT JOIN boots b ON b.id = s.boot_ref
+                         WHERE s.timestamp > ?1
+                         ORDER BY s.timestamp ASC",
+                    )?;
+                    let new_rows: Vec<DrainRow> = stmt
+                        .query_map([last_row.ts], |r| {
+                            Ok(DrainRow {
+                                ts: r.get(0)?,
+                                pct: r.get(1)?,
+                                status: r.get(2)?,
+                                wh: r.get(3)?,
+                                screen_on: r.get::<_, i64>(4)? != 0,
+                                boot_id: r.get(5)?,
+                                suspended: r.get(6)?,
+                            })
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    if !new_rows.is_empty() {
+                        let mut chunk = Vec::with_capacity(new_rows.len() + 1);
+                        chunk.push(last_row.clone());
+                        chunk.extend(new_rows);
+                        fold_drain_rows(&mut state.stats, &chunk);
+                        state.last_row = chunk.pop();
                     }
+                    return Ok(state.stats.clone());
                 }
             }
         }
@@ -822,7 +892,12 @@ impl Database {
             .collect();
         let stats = analyze_drain_rows(&rows);
         if let Ok(mut cache) = self.drain_cache.lock() {
-            *cache = Some(DrainCacheState {
+            if let Some(pos) = cache.iter().position(|s| s.since_bucket == since_bucket) {
+                cache.remove(pos);
+            } else if cache.len() >= 6 {
+                cache.remove(0);
+            }
+            cache.push(DrainCacheState {
                 since_bucket,
                 last_row: rows.into_iter().last(),
                 stats: stats.clone(),
@@ -831,8 +906,17 @@ impl Database {
         Ok(stats)
     }
 
+    /// Records a sleep session atomically, deduplicating against any existing session within ±65s
+    /// on both `start_ts` and `end_ts` (covering up to the max 60s daemon interval so the
+    /// `PrepareForSleep` listener and the daemon tick loop never create duplicate rows).
     pub fn record_sleep_session(&self, s: &SleepSession) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM sleep_sessions
+             WHERE ABS(start_ts - ?1) <= 65 AND ABS(end_ts - ?2) <= 65",
+            params![s.start_ts, s.end_ts],
+        )?;
+        tx.execute(
             "INSERT OR REPLACE INTO sleep_sessions
              (start_ts, end_ts, start_pct, end_pct, start_wh, end_wh, on_battery)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -846,7 +930,40 @@ impl Database {
                 s.on_battery as i64
             ],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Removes near-duplicate rows in `sleep_sessions` (same sleep cycle recorded by both
+    /// `PrepareForSleep` and the monotonic daemon tick loop within ±30s).
+    pub fn deduplicate_sleep_sessions(&self) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT start_ts, end_ts FROM sleep_sessions ORDER BY start_ts ASC",
+        )?;
+        let rows: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let mut to_delete = Vec::new();
+        let mut prev: Option<(i64, i64)> = None;
+        for (start_ts, end_ts) in rows {
+            if prev.is_some_and(|(ps, pe)| (start_ts - ps).abs() <= 30 && (end_ts - pe).abs() <= 30)
+            {
+                to_delete.push(start_ts);
+                continue;
+            }
+            prev = Some((start_ts, end_ts));
+        }
+
+        let mut removed = 0usize;
+        for ts in to_delete {
+            removed += self
+                .conn
+                .execute("DELETE FROM sleep_sessions WHERE start_ts = ?1", [ts])?;
+        }
+        Ok(removed)
     }
 
     pub fn get_sleep_sessions(&self, limit: usize) -> Vec<SleepSession> {
@@ -928,7 +1045,7 @@ impl Database {
                 existing.pids_count = live.pids_count;
                 existing.is_frozen = live.is_frozen;
                 existing.is_focused = live.is_focused;
-                existing.confidence = live.confidence;
+                existing.confidence = existing.confidence.worst(live.confidence);
                 if live.live_power_w > existing.peak_power_w {
                     existing.peak_power_w = live.live_power_w;
                 }
@@ -1012,14 +1129,20 @@ impl Database {
         tx.commit()?;
 
         if let Ok(mut cache) = self.drain_cache.lock() {
-            *cache = None;
+            cache.clear();
         }
 
         let total = report.downsampled_rows + report.deleted_battery_rows + report.deleted_app_rows;
-        if total > 20_000 {
-            let _ = self.exec("PRAGMA incremental_vacuum(200);");
+        let freelist_pages: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        if total >= 1_000 || freelist_pages >= 50 {
+            let pages_to_reclaim = freelist_pages.clamp(200, 2_000);
+            let _ = self.exec(&format!("PRAGMA incremental_vacuum({pages_to_reclaim});"));
             report.vacuumed = true;
         }
+        let _ = self.exec("PRAGMA wal_checkpoint(TRUNCATE);");
         self.set_meta("last_prune_ts", &now_ts.to_string())?;
         Ok(report)
     }
@@ -1302,6 +1425,12 @@ mod tests {
             .unwrap();
         let rows2 = db.get_app_breakdown(900, &[]).unwrap();
         assert_eq!(rows2[0].confidence, Confidence::Estimated);
+
+        // Live overlay with higher confidence must NOT upgrade historical Estimated confidence
+        let rows3 = db
+            .get_app_breakdown(900, &[make_delta(Confidence::MeasuredTotalModelledSplit)])
+            .unwrap();
+        assert_eq!(rows3[0].confidence, Confidence::Estimated);
     }
 
     #[test]
@@ -1359,5 +1488,45 @@ mod tests {
         assert_eq!(s2_inc.sleep_secs, s2_full.sleep_secs);
         assert_eq!(s2_inc.sleep_events, s2_full.sleep_events);
         assert!((s2_inc.sleep_drain_pct - s2_full.sleep_drain_pct).abs() < 1e-6);
+    }
+
+    #[test]
+    fn record_sleep_session_deduplicates_overlapping_writers() {
+        let db = Database::open_in_memory().unwrap();
+        let s1 = SleepSession {
+            start_ts: 1_700_000_000,
+            end_ts: 1_700_040_000,
+            start_pct: 96.56,
+            end_pct: 82.25,
+            start_wh: 58.65,
+            end_wh: 49.96,
+            on_battery: true,
+        };
+        let s2 = SleepSession {
+            start_ts: 1_700_000_002,
+            end_ts: 1_700_039_999,
+            start_pct: 96.53,
+            end_pct: 82.25,
+            start_wh: 58.63,
+            end_wh: 49.96,
+            on_battery: true,
+        };
+        let s3 = SleepSession {
+            start_ts: 1_700_045_000,
+            end_ts: 1_700_048_000,
+            start_pct: 82.10,
+            end_pct: 81.86,
+            start_wh: 49.86,
+            end_wh: 49.72,
+            on_battery: true,
+        };
+        db.record_sleep_session(&s1).unwrap();
+        db.record_sleep_session(&s2).unwrap();
+        db.record_sleep_session(&s3).unwrap();
+
+        let sessions = db.get_sleep_sessions(10);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].start_ts, 1_700_045_000);
+        assert_eq!(sessions[1].start_ts, 1_700_000_002);
     }
 }

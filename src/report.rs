@@ -55,23 +55,16 @@ pub fn escape_csv_field(s: &str) -> String {
     }
 }
 
-/// Writes `content` to `path` atomically via a temporary sibling file with `0700`/`0600` permissions.
+/// Writes `content` to `path` atomically via a temporary sibling file with `0600` permissions.
+/// Never alters permissions on pre-existing parent directories (such as `/tmp` or `~/Downloads`).
 pub fn write_atomic_text(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
             fs::create_dir_all(parent)?;
             crate::paths::set_private_dir_mode(parent);
         }
     }
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    let tmp_name = format!(".{file_name}.tmp.{}", std::process::id());
-    let tmp_path = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
-        _ => std::path::PathBuf::from(tmp_name),
-    };
+    let tmp_path = crate::paths::unique_temp_sibling(path);
     fs::write(&tmp_path, content)?;
     crate::paths::set_private_file_mode(&tmp_path);
     if let Err(e) = fs::rename(&tmp_path, path) {
@@ -792,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_sets_0600_mode() {
+    fn atomic_write_sets_0600_mode_without_chmodding_existing_parent() {
         use std::os::unix::fs::PermissionsExt;
         let uniq = format!(
             "rb_atomic_{}_{}",
@@ -800,6 +793,18 @@ mod tests {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         );
         let dir = std::env::temp_dir().join(uniq);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Pre-existing parent dir must keep its permissions (0o755), while file is 0o600
+        let direct_target = dir.join("direct.csv");
+        write_atomic_text(&direct_target, "x\n").unwrap();
+        let direct_file_mode = fs::metadata(&direct_target).unwrap().permissions().mode() & 0o777;
+        let existing_dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(direct_file_mode, 0o600);
+        assert_eq!(existing_dir_mode, 0o755);
+
+        // Newly created nested subdir gets 0o700 and file gets 0o600
         let target = dir.join("nested").join("export.csv");
         write_atomic_text(&target, "a,b\n1,2\n").unwrap();
         let file_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;

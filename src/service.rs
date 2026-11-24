@@ -48,6 +48,12 @@ impl RollingEnergyEstimator {
         Self::default()
     }
 
+    pub fn reset(&mut self) {
+        self.window.clear();
+        self.min_step_wh = None;
+        self.smoothed_w = None;
+    }
+
     pub fn observe(&mut self, ts: i64, energy_now_wh: f64, power_now_w: f64, discharging: bool) -> f64 {
         if !discharging {
             self.window.clear();
@@ -128,7 +134,10 @@ pub fn is_daemon_active(db: &Database) -> bool {
         .get_meta("daemon_interval_secs")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(5);
-    let max_age = (interval * 3 + 5).max(20);
+    let max_age = (interval * 3 + 20).max(35);
+    if crate::statusbar::read_cached_status(max_age).is_some() {
+        return true;
+    }
     if let Some(hb_str) = db.get_meta("daemon_heartbeat_ts") {
         if let Ok(hb) = hb_str.parse::<i64>() {
             if (now - hb).abs() <= max_age {
@@ -180,6 +189,7 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
     let mut energy_estimator = RollingEnergyEstimator::new();
     let sleep_dur = Duration::from_secs(effective_interval);
     let mut prev_snap = read_battery_snapshot().ok();
+    let mut last_hb_write_ts: i64 = 0;
 
     println!(
         "rustybattery daemon started (sampling every {}s -> {})",
@@ -194,7 +204,11 @@ pub fn run_daemon(interval_secs: u64) -> Result<()> {
         }
 
         let now = chrono::Utc::now().timestamp();
-        let _ = db.set_meta("daemon_heartbeat_ts", &now.to_string());
+        if now - last_hb_write_ts >= 15
+            && db.set_meta("daemon_heartbeat_ts", &now.to_string()).is_ok()
+        {
+            last_hb_write_ts = now;
+        }
         let _ = db.prune_if_due(now);
 
         if let Ok(snap) = read_battery_snapshot() {
@@ -264,16 +278,19 @@ fn spawn_logind_sleep_monitor(db_path: PathBuf) {
             };
 
             let Some(stdout) = child.stdout.take() else {
-                return;
-            };
-            let Ok(db) = Database::open(&db_path) else {
+                let _ = child.kill();
+                let _ = child.wait();
                 return;
             };
             let mut pre_sleep_snap: Option<crate::battery::BatterySnapshot> = None;
 
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if STOP_REQUESTED.load(Ordering::SeqCst) {
+                    let _ = child.kill();
+                    break;
+                }
                 if line.contains("PrepareForSleep (true,)") || line.contains("PrepareForSleep (true)") {
-                    if let Ok(snap) = read_battery_snapshot() {
+                    if let (Ok(snap), Ok(db)) = (read_battery_snapshot(), Database::open(&db_path)) {
                         let on_bat = !snap.ac_online && snap.status.is_discharging();
                         crate::autopilot::handle_sleep_transition(&db, true, on_bat);
                         let _ = db.record_battery_snapshot(&snap);
@@ -282,7 +299,7 @@ fn spawn_logind_sleep_monitor(db_path: PathBuf) {
                 } else if line.contains("PrepareForSleep (false,)")
                     || line.contains("PrepareForSleep (false)")
                 {
-                    if let Ok(snap) = read_battery_snapshot() {
+                    if let (Ok(snap), Ok(db)) = (read_battery_snapshot(), Database::open(&db_path)) {
                         let on_bat = !snap.ac_online && snap.status.is_discharging();
                         crate::autopilot::handle_sleep_transition(&db, false, on_bat);
                         let _ = db.record_battery_snapshot(&snap);

@@ -44,7 +44,7 @@ pub fn write_cached_status(bat: &BatterySnapshot, deltas: &[AppDeltaUsage]) -> R
     Ok(())
 }
 
-fn read_cached_status(max_age_secs: i64) -> Option<(BatterySnapshot, Vec<AppDeltaUsage>)> {
+pub fn read_cached_status(max_age_secs: i64) -> Option<(BatterySnapshot, Vec<AppDeltaUsage>)> {
     let path = runtime_status_path()?;
     let bytes = fs::read(path).ok()?;
     let cached: CachedStatus = serde_json::from_slice(&bytes).ok()?;
@@ -66,7 +66,7 @@ type = custom/script
 exec = battery statusbar --format polybar
 interval = 5
 click-left = xdg-terminal-exec battery || ghostty -e battery || kitty -e battery &
-click-middle = battery optimize &"#
+click-middle = battery optimize --yes &"#
             );
         }
         "tmux" => {
@@ -85,7 +85,7 @@ set -g status-right "#(battery statusbar --format tmux) | %H:%M""##
     "interval": 5,
     "format": "{{}}",
     "on-click": "xdg-terminal-exec battery || ghostty -e battery || kitty -e battery || gnome-terminal -- battery",
-    "on-click-middle": "battery optimize",
+    "on-click-middle": "battery optimize --yes",
     "tooltip": true
 }}"#
             );
@@ -415,16 +415,17 @@ impl NotificationMonitor {
     }
 
     pub fn evaluate(&mut self, bat: &BatterySnapshot, deltas: &[AppDeltaUsage]) {
+        let cfg = load_autopilot_config();
+        let reset_pct = (cfg.low_battery_pct + 5.0).min(95.0);
         if !bat.status.is_discharging() {
             self.consecutive_high_drain_ticks = 0;
-            if bat.capacity_pct > 25.0 {
+            if bat.capacity_pct > reset_pct {
                 self.alerted_20_pct = false;
                 self.alerted_10_pct = false;
             }
             return;
         }
 
-        let cfg = load_autopilot_config();
         if !cfg.notifications_enabled {
             return;
         }

@@ -7,8 +7,8 @@ use crate::optimize::{
     TargetKind,
 };
 use crate::power::{
-    dim_and_save_kbd_backlight, restore_saved_kbd_backlight, restore_saved_power_profile,
-    save_and_switch_powersave, should_skip_bluetooth_block,
+    dim_and_save_kbd_backlight, restore_or_balanced_on_ac, restore_saved_kbd_backlight,
+    restore_saved_power_profile, save_and_switch_powersave, should_skip_bluetooth_block,
 };
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -24,6 +24,7 @@ const META_LAST_AUTOPILOT_ACTION: &str = "autopilot_last_action";
 const META_AUTOPILOT_LOG: &str = "autopilot_action_log";
 const META_BT_BLOCKED_BY_SLEEP: &str = "autopilot_bt_blocked_for_sleep";
 const META_FROZEN_APPS: &str = "autopilot_frozen_apps";
+const META_LAST_SLEEP_ENTER_TS: &str = "autopilot_last_sleep_enter_ts";
 
 const KNOWN_CONFIG_KEYS: &[&str] = &[
     "config_version",
@@ -137,8 +138,6 @@ pub fn config_file_path() -> PathBuf {
                 .join(".config")
         })
         .join("rustybattery");
-    let _ = fs::create_dir_all(&dir);
-    crate::paths::set_private_dir_mode(&dir);
     dir.join("config.toml")
 }
 
@@ -347,14 +346,10 @@ pub fn load_autopilot_config() -> AutopilotConfig {
                         &format!("config.toml error ({err_msg}); Smart Saver paused in safe mode."),
                     );
                 }
-                let fallback = if let Ok(guard) = CONFIG_CACHE.lock() {
-                    guard
-                        .as_ref()
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_else(safe_fallback_config)
-                } else {
-                    safe_fallback_config()
-                };
+                // Always fail closed into safe mode (enabled=false, auto_freeze_enabled=false)
+                // on broken TOML so a syntax error while disabling autopilot or adding a whitelist
+                // entry never continues running stale auto-freeze rules.
+                let fallback = safe_fallback_config();
                 if let Ok(mut guard) = CONFIG_CACHE.lock() {
                     *guard = Some((mtime, fallback.clone()));
                 }
@@ -378,15 +373,21 @@ pub fn load_autopilot_config() -> AutopilotConfig {
 pub fn save_autopilot_config(cfg: &AutopilotConfig) -> Result<()> {
     let path = config_file_path();
     if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create config dir at {}", parent.display()))?;
         crate::paths::set_private_dir_mode(parent);
     }
+    let _lock = crate::paths::AdvisoryLock::acquire(&path.with_extension("toml.lock"));
     let clean = sanitize_config(cfg.clone());
     let content = format_config_str(&clean);
-    let tmp = path.with_extension("toml.tmp");
+    let tmp = crate::paths::unique_temp_sibling(&path);
     fs::write(&tmp, content)
         .with_context(|| format!("Failed to write temp config at {}", tmp.display()))?;
     crate::paths::set_private_file_mode(&tmp);
-    fs::rename(tmp, &path)
+    fs::rename(&tmp, &path)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
         .with_context(|| format!("Failed to rename config into {}", path.display()))?;
     let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
     if let Ok(mut guard) = CONFIG_CACHE.lock() {
@@ -521,6 +522,9 @@ pub trait SystemActions {
     fn check_freeze_guards(&self, app_name: &str) -> Option<&'static str>;
     fn save_and_switch_powersave(&self, db: &Database) -> Result<String>;
     fn restore_saved_power_profile(&self, db: &Database) -> Option<String>;
+    fn restore_ac_power_profile(&self, db: &Database) -> Option<String> {
+        self.restore_saved_power_profile(db)
+    }
     fn dim_and_save_kbd_backlight(&self, db: &Database) -> bool;
     fn restore_saved_kbd_backlight(&self, db: &Database) -> bool;
     fn is_lid_closed(&self) -> bool;
@@ -549,6 +553,9 @@ impl SystemActions for RealSystemActions {
     }
     fn restore_saved_power_profile(&self, db: &Database) -> Option<String> {
         restore_saved_power_profile(db)
+    }
+    fn restore_ac_power_profile(&self, db: &Database) -> Option<String> {
+        restore_or_balanced_on_ac(db)
     }
     fn dim_and_save_kbd_backlight(&self, db: &Database) -> bool {
         dim_and_save_kbd_backlight(db)
@@ -691,7 +698,7 @@ impl SmartAutopilot {
             } else if !prev_ac && snap.ac_online {
                 let profile_note = if cfg.auto_switch_power_profile {
                     actions
-                        .restore_saved_power_profile(db)
+                        .restore_ac_power_profile(db)
                         .unwrap_or_else(|| "AC mode".to_string())
                 } else {
                     "AC mode".to_string()
@@ -832,26 +839,33 @@ impl SmartAutopilot {
         let lid_closed = actions.is_lid_closed();
         if cfg.s2idle_sleep_saver {
             if lid_closed && self.last_lid_closed != Some(true) && on_battery {
-                let _ = actions.save_and_switch_powersave(db);
-                let _ = actions.dim_and_save_kbd_backlight(db);
-                let mut bt_note = "";
-                if !actions.should_skip_bluetooth_block()
-                    && actions.is_bluetooth_unblocked()
-                    && actions.set_bluetooth_blocked(true)
-                {
-                    self.bt_blocked_for_sleep = true;
-                    let _ = db.set_meta(META_BT_BLOCKED_BY_SLEEP, "1");
-                    bt_note = " & soft-blocked Bluetooth";
+                if !sleep_enter_recently_handled(db) {
+                    mark_sleep_enter_handled(db);
+                    let _ = actions.save_and_switch_powersave(db);
+                    let _ = actions.dim_and_save_kbd_backlight(db);
+                    let mut bt_note = "";
+                    if !actions.should_skip_bluetooth_block()
+                        && actions.is_bluetooth_unblocked()
+                        && actions.set_bluetooth_blocked(true)
+                    {
+                        self.bt_blocked_for_sleep = true;
+                        let _ = db.set_meta(META_BT_BLOCKED_BY_SLEEP, "1");
+                        bt_note = " & soft-blocked Bluetooth";
+                    }
+                    record_autopilot_action(
+                        db,
+                        &format!("🌙 Lid closed on battery (s2idle) → power-saver{bt_note}"),
+                    );
                 }
-                record_autopilot_action(
-                    db,
-                    &format!("🌙 Lid closed on battery (s2idle) → power-saver{bt_note}"),
-                );
             } else if !lid_closed && self.last_lid_closed == Some(true) {
-                if on_battery {
+                let _ = db.delete_meta(META_LAST_SLEEP_ENTER_TS);
+                if !on_battery {
+                    let _ = actions.restore_ac_power_profile(db);
                     let _ = actions.restore_saved_kbd_backlight(db);
                 } else {
-                    let _ = actions.restore_saved_power_profile(db);
+                    if !cfg.auto_switch_power_profile {
+                        let _ = actions.restore_saved_power_profile(db);
+                    }
                     let _ = actions.restore_saved_kbd_backlight(db);
                 }
                 if self.bt_blocked_for_sleep
@@ -949,18 +963,24 @@ fn send_autopilot_notification(summary: &str, body: &str) {
     if !load_autopilot_config().notifications_enabled {
         return;
     }
-    let _ = Command::new("notify-send")
-        .args([
-            "-a",
-            "RustyBattery Smart Saver",
-            "-u",
-            "normal",
-            "-i",
-            "battery-good-symbolic",
-            summary,
-            body,
-        ])
-        .status();
+    let _ = crate::statusbar::send_desktop_notification(
+        summary,
+        body,
+        "normal",
+        "battery-good-symbolic",
+    );
+}
+
+fn sleep_enter_recently_handled(db: &Database) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    db.get_meta(META_LAST_SLEEP_ENTER_TS)
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some_and(|ts| (now - ts).abs() < 60)
+}
+
+fn mark_sleep_enter_handled(db: &Database) {
+    let now = chrono::Utc::now().timestamp();
+    let _ = db.set_meta(META_LAST_SLEEP_ENTER_TS, &now.to_string());
 }
 
 /// Invoked immediately by the logind `PrepareForSleep` D-Bus listener when entering or waking from sleep.
@@ -970,9 +990,10 @@ pub fn handle_sleep_transition(db: &Database, entering_sleep: bool, on_battery: 
         return;
     }
     if entering_sleep {
-        if !on_battery {
+        if !on_battery || sleep_enter_recently_handled(db) {
             return;
         }
+        mark_sleep_enter_handled(db);
         let _ = save_and_switch_powersave(db);
         let _ = dim_and_save_kbd_backlight(db);
         let mut bt_note = "";
@@ -988,7 +1009,10 @@ pub fn handle_sleep_transition(db: &Database, entering_sleep: bool, on_battery: 
             &format!("🌙 Entering s2idle sleep on battery → power-saver{bt_note}"),
         );
     } else {
+        let _ = db.delete_meta(META_LAST_SLEEP_ENTER_TS);
         if !on_battery {
+            let _ = restore_or_balanced_on_ac(db);
+        } else if !cfg.auto_switch_power_profile {
             let _ = restore_saved_power_profile(db);
         }
         let _ = restore_saved_kbd_backlight(db);

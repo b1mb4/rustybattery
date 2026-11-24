@@ -71,3 +71,55 @@ pub fn set_private_dir_mode(path: &Path) {
     #[cfg(not(unix))]
     let _ = path;
 }
+
+/// Advisory exclusive file lock (`flock`) used to serialize cross-process read-modify-write
+/// updates on RustyBattery state files (`rb_frozen_units.json`, `config.toml`).
+pub struct AdvisoryLock {
+    #[cfg(unix)]
+    _file: fs::File,
+}
+
+impl AdvisoryLock {
+    pub fn acquire(lock_path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Some(parent) = lock_path.parent() {
+                let _ = fs::create_dir_all(parent);
+                set_private_dir_mode(parent);
+            }
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(lock_path)
+                .ok()?;
+            set_private_file_mode(lock_path);
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return None;
+            }
+            Some(Self { _file: file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock_path;
+            Some(Self {})
+        }
+    }
+}
+
+/// Generates a process- and timestamp-scoped temporary sibling path to avoid concurrent `.tmp` collisions.
+pub fn unique_temp_sibling(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("state");
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let tmp_name = format!(".{file_name}.tmp.{}.{nanos}", std::process::id());
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    }
+}

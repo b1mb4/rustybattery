@@ -24,6 +24,7 @@ use crate::optimize::{
     disable_noisy_acpi_wakeups, execute_optimizations, inspect_s2idle_status,
     scan_disabled_noisy_acpi_wakeups, scan_optimization_targets, set_acpi_wakeups_state,
     set_app_frozen, stop_or_kill_app, thaw_all_user_cgroups, thaw_owned_user_cgroups,
+    write_system_sleep_fix_script,
 };
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -156,6 +157,12 @@ enum Commands {
         /// Revert s2idle optimizations (re-enable ACPI wakeups & unblock Bluetooth)
         #[arg(long)]
         undo: bool,
+        /// Generate a persistent root setup script for USB/PCIe port power-gating and suspend-then-hibernate
+        #[arg(long)]
+        setup_script: bool,
+        /// Delay before lid-closed s2idle transitions into 0W hibernation (used with `--setup-script`, default: 2h)
+        #[arg(long, default_value = "2h")]
+        hibernate_delay: String,
     },
 
     /// Check system capabilities (cgroup v2, focus detection, RAPL, power profiles, logind, config)
@@ -306,7 +313,6 @@ pub fn run() -> Result<()> {
         } => {
             if force_all {
                 let db = Database::open(&default_db_path())?;
-                let _ = thaw_owned_user_cgroups();
                 let n = thaw_all_user_cgroups() + thaw_persisted_frozen_apps(&db);
                 println!("▶ Force-resumed all frozen user cgroups ({n} unit(s) thawed).");
                 Ok(())
@@ -567,7 +573,12 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Sleep { fix, undo } => {
+        Commands::Sleep {
+            fix,
+            undo,
+            setup_script,
+            hibernate_delay,
+        } => {
             let db = Database::open(&default_db_path())?;
             let since_24h = chrono::Utc::now().timestamp() - 24 * 3600;
             let drain = db.get_period_drain_stats(since_24h).unwrap_or_default();
@@ -629,6 +640,24 @@ pub fn run() -> Result<()> {
             }
 
             let st = inspect_s2idle_status();
+            let generated_script = if setup_script {
+                Some(write_system_sleep_fix_script(&hibernate_delay)?)
+            } else if fix
+                && (!st.persistent_port_fix_installed
+                    || !st.hibernate_delay_configured
+                    || !st.lid_switch_hibernate)
+            {
+                match write_system_sleep_fix_script(&hibernate_delay) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("  ⚠ Could not write persistent sleep setup script: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             println!("🌙 RustyBattery — s2idle & Lid-Closed Sleep Drain Audit");
             println!("──────────────────────────────────────────────────────────────────────");
             println!("Kernel Sleep Mode:    {}", st.mem_sleep);
@@ -676,22 +705,83 @@ pub fn run() -> Result<()> {
                     st.noisy_wakeups.len(),
                     list.join(", ")
                 );
-                let devs: Vec<String> = st.noisy_wakeups.iter().map(|(d, _)| d.clone()).collect();
-                let script = devs
-                    .iter()
-                    .map(|d| format!("echo {d} > /proc/acpi/wakeup"))
-                    .collect::<Vec<_>>()
-                    .join(" && ");
-                println!("  → Fix command:      sudo sh -c '{script}'");
             }
             println!(
-                "Hibernate Delay:      {}",
-                if st.hibernate_delay_configured {
-                    "✔ Configured in /etc/systemd/sleep.conf"
+                "Persistent Port Fix:  {}",
+                if st.persistent_port_fix_installed {
+                    "✔ Installed (udev port power-gating + boot/pre-suspend hook)"
                 } else {
-                    "ℹ Not set (optional: set `HibernateDelaySec=2h` in /etc/systemd/sleep.conf)"
+                    "⚠ Not installed (USB/ACPI wakeups reset on every reboot)"
                 }
             );
+            if st.external_usb_devices.is_empty() {
+                println!("External USB Ports:   ✔ No external USB peripherals attached");
+            } else {
+                println!(
+                    "External USB Ports:   ⚠ {} attached (can draw 0.5–1.0W in s2idle): {}",
+                    st.external_usb_devices.len(),
+                    st.external_usb_devices.join(", ")
+                );
+            }
+            if st.pcie_pm_on_count > 0 {
+                println!(
+                    "PCIe Runtime PM:      ⚠ {} device(s) set to 'on' instead of 'auto'",
+                    st.pcie_pm_on_count
+                );
+            } else {
+                println!("PCIe Runtime PM:      ✔ All relevant PCIe endpoints set to 'auto'");
+            }
+            println!(
+                "Lid Switch Action:    {}",
+                if st.lid_switch_hibernate {
+                    "✔ suspend-then-hibernate (lid close transitions to 0W deep sleep)"
+                } else {
+                    "⚠ Default suspend only (never enters 0W hibernation on lid close)"
+                }
+            );
+            println!(
+                "Hibernate Delay:      {}",
+                if let Some(ref val) = st.hibernate_delay_value {
+                    format!("✔ Configured (`HibernateDelaySec={val}`)")
+                } else {
+                    "⚠ Not set (recommended: `HibernateDelaySec=2h`)"
+                        .to_string()
+                }
+            );
+            println!(
+                "Hibernate Disk Swap:  {}",
+                if st.disk_swap_gb >= st.ram_gb && st.resume_param_configured {
+                    format!(
+                        "✔ Ready ({:.1} GiB disk swap >= {:.1} GiB RAM, kernel `resume=` set)",
+                        st.disk_swap_gb, st.ram_gb
+                    )
+                } else if st.disk_swap_gb >= st.ram_gb {
+                    format!(
+                        "⚠ {:.1} GiB disk swap present, but kernel `resume=` cmdline parameter missing",
+                        st.disk_swap_gb
+                    )
+                } else {
+                    format!(
+                        "⚠ {:.1} GiB disk swap (need >= {:.1} GiB RAM; zram cannot hibernate)",
+                        st.disk_swap_gb, st.ram_gb
+                    )
+                }
+            );
+            if let Some(script_path) = generated_script {
+                println!();
+                println!("Persistent System Setup Script Written:");
+                println!("  Path:     {}", script_path.display());
+                println!("  Install:  sudo bash {}", script_path.display());
+                println!("  Revert:   sudo bash {} --uninstall", script_path.display());
+            } else if !st.persistent_port_fix_installed
+                || !st.hibernate_delay_configured
+                || !st.lid_switch_hibernate
+                || st.disk_swap_gb < st.ram_gb
+            {
+                println!();
+                println!("  → Persistent port-power + 2h lid hibernate setup:");
+                println!("    battery sleep --setup-script");
+            }
             let sessions = db.get_sleep_sessions(5);
             if !sessions.is_empty() {
                 println!();
@@ -710,7 +800,7 @@ pub fn run() -> Result<()> {
                 }
             }
             println!();
-            println!("Tip: Run `battery sleep --fix` (or `--undo` to revert), or press `o` in TUI (`battery`).");
+            println!("Tip: Run `battery sleep --fix` / `--setup-script` (or `--undo` to revert), or press `o` in TUI (`battery`).");
             Ok(())
         }
         Commands::Doctor => run_doctor(),
@@ -995,9 +1085,17 @@ fn run_cli_optimize(dry_run: bool, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    if !yes && unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
+    if !yes {
+        if unsafe { libc::isatty(libc::STDIN_FILENO) != 1 } {
+            anyhow::bail!(
+                "Non-interactive stdin detected; re-run with `--yes` to apply optimizations (or `--dry-run` to preview)."
+            );
+        }
         use std::io::{self, Write};
-        print!("\n  Proceed with applying {} selected optimization(s)? [y/N]: ", selected_targets.len());
+        print!(
+            "\n  Proceed with applying {} selected optimization(s)? [y/N]: ",
+            selected_targets.len()
+        );
         let _ = io::stdout().flush();
         let mut input = String::new();
         let _ = io::stdin().read_line(&mut input);
@@ -1188,22 +1286,60 @@ fn run_doctor() -> Result<()> {
         service::is_daemon_active(&db)
     );
 
+    let unit_path = service::systemd_unit_path();
+    if unit_path.exists() {
+        let unit_text = std::fs::read_to_string(&unit_path).unwrap_or_default();
+        if !unit_text.contains("ExecStopPost=") || !unit_text.contains("NoNewPrivileges=yes") {
+            println!(
+                "⚠ Systemd Unit:         {} is outdated (missing ExecStopPost / hardening) — run `battery service install` to refresh",
+                unit_path.display()
+            );
+        } else {
+            println!("✔ Systemd Unit:         {} (up-to-date & hardened)", unit_path.display());
+        }
+    }
+
     Ok(())
 }
 
-/// Fits `(baseline_w, w_per_core)` via ordinary least squares over `(cores_busy, total_power_w)` points (`N-2`).
+/// Fits `(baseline_w, w_per_core)` over `(cores_busy, total_power_w)` points (`N-2`).
+/// Uses ordinary least squares on linear regimes, and automatically detects TDP-saturated
+/// multi-core laptops (where all-core marginal W/thread drops far below 1-core W/core) so
+/// interactive 1–2 core workloads are not severely under-attributed.
 pub fn fit_power_model(points: &[(f64, f64)], display_w: f64) -> Result<(f64, f64)> {
     if points.len() < 2 {
         anyhow::bail!("Calibration requires at least 2 measurement phases");
     }
-    let n = points.len() as f64;
-    let ys: Vec<f64> = points.iter().map(|(_, p)| p - display_w).collect();
-    let mean_x = points.iter().map(|(c, _)| *c).sum::<f64>() / n;
+    let mut sorted = points.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let ys: Vec<f64> = sorted.iter().map(|(_, p)| p - display_w).collect();
+
+    // Detect battery TDP saturation when 3+ phases are provided (idle, 1-core, all-core):
+    // if all-core marginal W/thread is < 65% of the idle->1-core marginal slope, prefer the
+    // interactive idle->1-core slope so typical desktop apps aren't collapsed into Unattributed.
+    if sorted.len() >= 3 {
+        let (x0, y0) = (sorted[0].0, ys[0]);
+        let (x1, y1) = (sorted[1].0, ys[1]);
+        let (xn, yn) = (sorted[sorted.len() - 1].0, ys[ys.len() - 1]);
+        let dx_low = x1 - x0;
+        let dx_all = xn - x0;
+        if dx_low >= 0.3 && dx_all > dx_low * 1.5 {
+            let slope_low = (y1 - y0) / dx_low;
+            let slope_all = (yn - y0) / dx_all;
+            if slope_low > 0.5 && slope_all > 0.1 && slope_all < slope_low * 0.65 {
+                let intercept = y0 - slope_low * x0;
+                return Ok((intercept.clamp(0.3, 15.0), slope_low.clamp(1.0, 45.0)));
+            }
+        }
+    }
+
+    let n = sorted.len() as f64;
+    let mean_x = sorted.iter().map(|(c, _)| *c).sum::<f64>() / n;
     let mean_y = ys.iter().sum::<f64>() / n;
 
     let mut var_x = 0.0;
     let mut cov_xy = 0.0;
-    for ((x, _), y) in points.iter().zip(ys.iter()) {
+    for ((x, _), y) in sorted.iter().zip(ys.iter()) {
         let dx = x - mean_x;
         let dy = y - mean_y;
         var_x += dx * dx;
@@ -1244,6 +1380,7 @@ fn measure_calibration_phase(
     use std::sync::Arc;
 
     println!("  ▸ Phase `{label}` ({secs}s, {load_threads} worker thread(s))...");
+    estimator.reset();
     let stop = Arc::new(AtomicBool::new(false));
     let mut guard = CalibrationLoadGuard {
         stop: Arc::clone(&stop),
@@ -1262,6 +1399,16 @@ fn measure_calibration_phase(
                 }
             }
         }));
+    }
+
+    // Brief warm-up before taking start snapshot so EC power telemetry reflects the new load phase.
+    if load_threads > 0 {
+        for _ in 0..3 {
+            if service::is_stop_requested() {
+                anyhow::bail!("Calibration interrupted by signal");
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 
     let start_snap = read_battery_snapshot()?;
@@ -1441,5 +1588,23 @@ mod tests {
     fn fit_power_model_rejects_flat_or_negative_slope() {
         assert!(fit_power_model(&[(0.2, 8.0), (0.2, 8.2)], 2.0).is_err());
         assert!(fit_power_model(&[(0.2, 10.0), (2.0, 9.0)], 2.0).is_err());
+    }
+
+    #[test]
+    fn fit_power_model_handles_tdp_saturated_all_core_laptop() {
+        // Realistic 16-thread thin-and-light on battery:
+        // display = 2.0 W, idle (0.1c) = 6.0 W, 1-core (1.1c) = 12.5 W (+6.5 W/core),
+        // 16-thread all-core hits 26 W TDP ceiling (+1.25 W/thread average).
+        // Linear OLS across all 3 points would collapse to ~1.3 W/core; TDP-aware fit recovers ~6.5 W/core.
+        let points = vec![(0.1, 6.0), (1.1, 12.5), (16.0, 26.0)];
+        let (baseline, slope) = fit_power_model(&points, 2.0).unwrap();
+        assert!(
+            (slope - 6.5).abs() < 0.1,
+            "expected interactive ~6.5 W/core, got {slope}"
+        );
+        assert!(
+            (baseline - 3.35).abs() < 0.1,
+            "expected idle baseline ~3.35 W, got {baseline}"
+        );
     }
 }

@@ -998,6 +998,7 @@ fn scan_slice_dir(
     slice_type: &str,
     map: &mut HashMap<String, RawAppCounter>,
     focused_set: &Focus,
+    user_rules: &[UserAppRule],
 ) {
     let Ok(entries) = fs::read_dir(slice_dir) else {
         return;
@@ -1010,14 +1011,16 @@ fn scan_slice_dir(
         }
         let unit_name = entry.file_name().to_string_lossy().to_string();
         if unit_name.ends_with(".slice") {
-            scan_slice_dir(&path, slice_type, map, focused_set);
+            scan_slice_dir(&path, slice_type, map, focused_set, user_rules);
             continue;
         }
         if unit_name.starts_with("session-") && unit_name.ends_with(".scope") {
             continue;
         }
 
-        let Some((app_name, category)) = normalize_cgroup_unit(&unit_name, slice_type) else {
+        let Some((app_name, category)) =
+            normalize_cgroup_unit_with_rules(&unit_name, slice_type, user_rules)
+        else {
             continue;
         };
         let Some((usage_usec, user_usec, system_usec)) = read_cgroup_cpu_stat(&path) else {
@@ -1061,6 +1064,7 @@ fn scan_slice_dir(
 pub fn read_all_app_counters() -> HashMap<String, RawAppCounter> {
     let mut map = HashMap::new();
     let focused_set = detect_focused_apps();
+    let user_rules = load_user_app_rules();
 
     let uid = unsafe { libc::getuid() };
     let user_slice_dir = format!("/sys/fs/cgroup/user.slice/user-{uid}.slice");
@@ -1071,7 +1075,7 @@ pub fn read_all_app_counters() -> HashMap<String, RawAppCounter> {
     if user_base.exists() {
         let app_slice = user_base.join("app.slice");
         if app_slice.exists() {
-            scan_slice_dir(&app_slice, "app", &mut map, &focused_set);
+            scan_slice_dir(&app_slice, "app", &mut map, &focused_set, &user_rules);
             had_user_app_slice = !map.is_empty();
         }
         scan_slice_dir(
@@ -1079,18 +1083,20 @@ pub fn read_all_app_counters() -> HashMap<String, RawAppCounter> {
             "session",
             &mut map,
             &focused_set,
+            &user_rules,
         );
         scan_slice_dir(
             &user_base.join("background.slice"),
             "background",
             &mut map,
             &focused_set,
+            &user_rules,
         );
     }
 
     let system_slice = Path::new("/sys/fs/cgroup/system.slice");
     if system_slice.exists() {
-        scan_slice_dir(system_slice, "system", &mut map, &focused_set);
+        scan_slice_dir(system_slice, "system", &mut map, &focused_set, &user_rules);
     }
 
     if !had_user_app_slice || map.is_empty() {
@@ -1354,7 +1360,7 @@ impl AppEnergyTracker {
                     for (ukey, &u_curr) in &curr.unit_usage {
                         let d = match prev.unit_usage.get(ukey) {
                             Some(&u_prev) if u_curr >= u_prev => u_curr - u_prev,
-                            Some(_) => u_curr,
+                            Some(_) => u_curr.min(new_unit_cap),
                             None => u_curr.min(new_unit_cap),
                         };
                         sum = sum.saturating_add(d);
@@ -1385,7 +1391,7 @@ impl AppEnergyTracker {
             1.0
         };
         let baseline_w = if inp.is_discharging {
-            base_cap.min((effective_power_w - display_w).max(0.0) * 0.30)
+            base_cap.min((effective_power_w - display_w).max(0.0) * 0.45)
         } else {
             0.0
         };
@@ -1402,12 +1408,16 @@ impl AppEnergyTracker {
         let (attributed_app_w, app_confidence) = if inp.is_discharging {
             if let Some(rapl_w) = inp.rapl_power_w {
                 let rapl_active_w = (rapl_w - inp.rapl_idle_floor_w.max(0.0)).max(0.0);
-                let bounded = if cpu_cores_used < 0.05 {
-                    app_pool_w.min(rapl_active_w).min(cpu_cores_used * w_per_core)
-                } else {
-                    app_pool_w.min(rapl_active_w)
-                };
-                (bounded, Confidence::MeasuredTotalModelledSplit)
+                // Smooth ramp across 0..0.10 cores avoids a sharp cliff at low CPU while still
+                // preventing idle background daemons from absorbing full RAPL package draw.
+                let ramp = (cpu_cores_used / 0.10).clamp(0.0, 1.0);
+                let model_cap = cpu_cores_used * w_per_core;
+                let rapl_blended =
+                    rapl_active_w * ramp + rapl_active_w.min(model_cap) * (1.0 - ramp);
+                (
+                    app_pool_w.min(rapl_blended),
+                    Confidence::MeasuredTotalModelledSplit,
+                )
             } else {
                 (app_pool_w.min(cpu_cores_used * w_per_core), Confidence::Modelled)
             }
@@ -1695,6 +1705,47 @@ mod tests {
             .unwrap();
         assert!(daemon.live_power_w < 0.05);
         assert!(unattr.live_power_w > 6.5);
+    }
+
+    #[test]
+    fn rapl_low_cpu_ramp_has_no_cliff_at_five_percent() {
+        let eval = |cpu_ms: u64| -> f64 {
+            let mut init = HashMap::new();
+            init.insert("App".to_string(), fake_counter("App", 1_000_000, true));
+            let mut tracker = AppEnergyTracker::from_initial(init, 45.0);
+            let mut next = HashMap::new();
+            next.insert(
+                "App".to_string(),
+                fake_counter("App", 1_000_000 + cpu_ms * 1_000, true),
+            );
+            let (deltas, _) = tracker.compute_delta_from_snapshots(
+                next,
+                SampleInput {
+                    raw_dt_secs: 5.0,
+                    slept_delta_secs: 0.0,
+                    power_w: 12.0,
+                    energy_full_wh: 60.0,
+                    is_discharging: true,
+                    raw_display_w: 2.0,
+                    rapl_power_w: Some(4.0),
+                    cpu_w_per_core: 2.0,
+                    baseline_max_w: 1.0,
+                    rapl_idle_floor_w: 0.0,
+                },
+            );
+            deltas
+                .iter()
+                .find(|d| d.app_name == "App")
+                .map(|d| d.live_power_w)
+                .unwrap_or(0.0)
+        };
+        let w_49 = eval(245); // 4.9% of 1 core over 5s
+        let w_51 = eval(255); // 5.1% of 1 core over 5s
+        assert!(w_51 >= w_49);
+        assert!(
+            (w_51 - w_49) < 0.3,
+            "unexpected discontinuity across 5% CPU: w_49={w_49}, w_51={w_51}"
+        );
     }
 
     #[test]

@@ -2,17 +2,26 @@
 
 ## 📋 Patch Notes
 
-### **Version 0.14.0** *(Latest)*
-- **📊 More Accurate Power Attribution & Trace Replay:**
-  - Clearer confidence labels showing whether app power is hardware-backed, modelled, or estimated, along with multi-package CPU energy support, idle power floor calibration, and tighter bounds during idle periods.
-  - Added live telemetry trace recording and offline replay for validating attribution accuracy, backed by an expanded automated test suite.
-- **🛡 Stronger Safety Guards, Exports & Privacy:**
-  - Restricted all local history, configuration, state, and exported report files to owner-only permissions.
-  - Improved freeze protection with fail-safe audio checks, media playback and desktop idle-inhibitor detection, and safer sandboxed app matching.
-  - Added per-app hourly battery budgets with persistent alert cooldowns, typo warnings for configuration errors, improved custom app matching rules, per-app CSV and cumulative Prometheus exports, a dedicated charge-limit command, and automatic shell completions.
+### **Version 0.14.1** *(Latest)*
+- **🔒 Security, Safe-Mode & Concurrency Hardening:**
+  - Exported files (`report`, `export`, `record-trace`) now stay `0600` without changing permissions on existing parent folders like `/tmp` or `~/Downloads`.
+  - Validated `--hibernate-delay` in `battery sleep --setup-script`, prevented hibernate swapfile creation on removable USB drives, and required `--yes` for non-interactive `battery optimize`.
+  - Broken `config.toml` files now strictly fall back to safe mode (`enabled = false`, `auto_freeze_enabled = false`), and state/config writes now use file locking (`flock`) with unique temp files.
+  - Added core desktop/terminal protections to `battery stop`, honored `stop_grace_secs` during batch optimization, and fixed `battery resume --force-all` thaw counts.
+- **⚡ Power Profiles, Keyboard Backlight & Calibration:**
+  - Keyboard backlight dimming/restoring now uses unprivileged UPower D-Bus (`gdbus`) with sysfs fallback, and saved profile/backlight state is only cleared after restoration succeeds.
+  - Fixed laptops getting stuck in `power-saver` after plugging into AC, deduplicated lid-close and sleep hooks, and properly restored profiles on wake.
+  - Improved `battery calibrate` to handle TDP-limited multi-core laptops without under-attributing everyday apps, and smoothed the RAPL low-CPU transition.
+- **🗄️ Database & TUI Reliability:**
+  - Fixed SQLite `incremental_vacuum` and added `WAL` truncation on prune, cut redundant 5-second metadata writes, prevented idle sleep-monitor connections from holding WAL files open, and preserved worst-case confidence on live overlays.
+  - Added safe terminal cleanup on startup errors, moved TUI `[x] Stop` off the UI thread to prevent freezes, excluded charging power from `Avg:` Watts, fixed config error banners not resurfacing, and fixed tab mouse click targets.
 
 <details>
-<summary><b>Previous Releases (v0.1.0 – v0.13.1)</b></summary>
+<summary><b>Previous Releases (v0.1.0 – v0.14.0)</b></summary>
+
+- **Version 0.14.0:**
+  - Clearer confidence labels showing whether app power is hardware-backed, modelled, or estimated, along with multi-package CPU energy support, idle power floor calibration, tighter idle bounds, and live telemetry trace recording/replay.
+  - Restricted all local history, configuration, state, and exported report files to owner-only permissions, improved freeze guards (fail-safe audio, MPRIS, desktop idle-inhibitor), and added per-app hourly budgets, typo warnings, custom app matching rules, CSV/Prometheus exports, `charge-limit`, and shell completions.
 
 - **Version 0.13.1:**
   - Restored full graceful shutdown timeouts when stopping apps, moved critical-battery cleanup off the main background tick loop, and unified tracking of frozen apps so every paused app resumes reliably.

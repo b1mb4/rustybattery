@@ -8,19 +8,19 @@ use crate::battery::{read_battery_snapshot, BatterySnapshot, BatteryStatus};
 use crate::db::{AppSummaryRow, BatteryHistoryPoint, Database, PeriodDrainStats};
 use crate::optimize::{
     execute_optimizations, scan_optimization_targets, set_app_frozen, stop_or_kill_app,
-    OptimizationTarget,
+    OptimizationReport, OptimizationTarget,
 };
 use crate::service::{
     install_signal_handlers, install_systemd_service, is_daemon_active, is_service_file_installed,
     is_stop_requested,
 };
-use crate::statusbar::send_status_notification;
+use crate::statusbar::{read_cached_status, send_status_notification};
 use anyhow::Result;
 use chrono::{Local, TimeZone};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -233,15 +233,17 @@ pub struct AppUi {
     pub optimizer_modal: Option<(Vec<OptimizationTarget>, usize)>,
     pub autopilot_modal: Option<usize>,
     pub confirm_stop_app: Option<String>,
+    pub pending_optimization: Option<std::sync::mpsc::Receiver<OptimizationReport>>,
+    pub pending_stop: Option<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
 }
 
 impl AppUi {
     pub fn new(db: Database) -> Result<Self> {
         let battery = read_battery_snapshot()?;
-        db.ensure_initial_seed(&battery)?;
-        db.record_battery_snapshot(&battery)?;
-
-        if !is_daemon_active(&db) {
+        let daemon_running = is_daemon_active(&db);
+        if !daemon_running {
+            db.ensure_initial_seed(&battery)?;
+            db.record_battery_snapshot(&battery)?;
             let _ = crate::autopilot::thaw_persisted_frozen_apps(&db);
         }
 
@@ -272,7 +274,7 @@ impl AppUi {
             filter_area: Rect::default(),
             table_area: Rect::default(),
             table_state: TableState::default(),
-            daemon_running: false,
+            daemon_running,
             service_installed: is_service_file_installed(),
             autopilot_enabled,
             autopilot_config,
@@ -284,6 +286,8 @@ impl AppUi {
             optimizer_modal: None,
             autopilot_modal: None,
             confirm_stop_app: None,
+            pending_optimization: None,
+            pending_stop: None,
         };
         ui.table_state.select(Some(0));
         ui.refresh_data(false)?;
@@ -309,6 +313,13 @@ impl AppUi {
         self.service_installed = is_service_file_installed();
         self.autopilot_enabled = is_autopilot_enabled(&self.db);
         self.autopilot_config = load_autopilot_config();
+        if self
+            .status_message
+            .as_ref()
+            .is_some_and(|(_, ts)| ts.elapsed() >= Duration::from_secs(6))
+        {
+            self.status_message = None;
+        }
         if let Some(cfg_err) = last_config_error().filter(|_| self.status_message.is_none()) {
             self.status_message = Some((
                 format!("⚠ config.toml error (safe mode): {cfg_err}"),
@@ -325,18 +336,28 @@ impl AppUi {
         }
 
         if sample_live_tick {
-            let (deltas, _) = self.tracker.sample_delta(
-                self.battery.power_w,
-                self.battery.energy_full_wh,
-                self.battery.status.is_discharging(),
-            );
-            // If the background daemon is NOT currently active, the TUI itself persists samples & evaluates Autopilot!
-            if !self.daemon_running {
+            if self.daemon_running {
+                if let Some((_cached_bat, cached_deltas)) = read_cached_status(12) {
+                    self.live_deltas = cached_deltas;
+                } else {
+                    let (deltas, _) = self.tracker.sample_delta(
+                        self.battery.power_w,
+                        self.battery.energy_full_wh,
+                        self.battery.status.is_discharging(),
+                    );
+                    self.live_deltas = deltas;
+                }
+            } else {
+                let (deltas, _) = self.tracker.sample_delta(
+                    self.battery.power_w,
+                    self.battery.energy_full_wh,
+                    self.battery.status.is_discharging(),
+                );
                 let _ = self.db.record_battery_snapshot(&self.battery);
                 let _ = self.db.record_app_deltas(&deltas);
                 self.autopilot.evaluate(&self.db, &self.battery, &deltas);
+                self.live_deltas = deltas;
             }
-            self.live_deltas = deltas;
         }
 
         self.last_full_charge_ts = self.db.get_last_full_charge_ts();
@@ -431,18 +452,53 @@ impl AppUi {
     }
 }
 
+fn cleanup_terminal_input() {
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        let _ = event::read();
+    }
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+        let _ = disable_raw_mode();
+        cleanup_terminal_input();
+    }
+}
+
 pub fn run_tui(db: Database) -> Result<()> {
     install_signal_handlers();
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        cleanup_terminal_input();
         orig_hook(panic_info);
     }));
 
     enable_raw_mode()?;
+    let _term_guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Disable Any-Event (?1003) and Button-Motion (?1002) tracking while keeping clicks & scroll (?1000+?1006).
+    let _ = io::Write::write_all(&mut stdout, b"\x1b[?1003l\x1b[?1002l");
+    let _ = io::Write::flush(&mut stdout);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -452,13 +508,8 @@ pub fn run_tui(db: Database) -> Result<()> {
         app.autopilot.thaw_all(&app.db);
     }
 
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let _ = terminal.show_cursor();
+    drop(terminal);
+    drop(_term_guard);
 
     res
 }
@@ -474,28 +525,105 @@ fn run_tui_loop(
         if is_stop_requested() {
             return Ok(());
         }
+
+        if let Some(rx) = &app.pending_optimization {
+            match rx.try_recv() {
+                Ok(report) => {
+                    app.pending_optimization = None;
+                    app.refresh_data(true)?;
+                    if !report.actions_taken.is_empty() {
+                        app.status_message = Some((
+                            format!(
+                                "⚡ Optimized {} target(s): freed {:.0} MB RAM, stopped {} threads (~{:.1} W saved)",
+                                report.actions_taken.len(),
+                                report.freed_memory_mb,
+                                report.stopped_pids,
+                                report.estimated_watts_saved
+                            ),
+                            Instant::now(),
+                        ));
+                    } else if let Some(err) = report.failed_actions.first() {
+                        app.status_message = Some((err.clone(), Instant::now()));
+                    } else {
+                        app.status_message = Some((
+                            "No optimization targets were selected.".to_string(),
+                            Instant::now(),
+                        ));
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.pending_optimization = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        if let Some(rx) = &app.pending_stop {
+            match rx.try_recv() {
+                Ok(Ok(msg)) => {
+                    app.pending_stop = None;
+                    app.refresh_data(true)?;
+                    app.status_message = Some((msg, Instant::now()));
+                }
+                Ok(Err(err)) => {
+                    app.pending_stop = None;
+                    app.status_message = Some((format!("Stop error: {err}"), Instant::now()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.pending_stop = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
         terminal.draw(|f| draw_ui(f, app))?;
 
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or(Duration::ZERO);
+        let timeout = if app.pending_optimization.is_some() || app.pending_stop.is_some() {
+            Duration::from_millis(150)
+        } else {
+            tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or(Duration::ZERO)
+        };
 
-        if event::poll(timeout)? {
+        let mut drained = 0usize;
+        while drained < 64
+            && event::poll(if drained == 0 {
+                timeout
+            } else {
+                Duration::ZERO
+            })?
+        {
+            drained += 1;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c' | 'C'))
+                    {
+                        return Ok(());
+                    }
                     if let Some(target_app) = app.confirm_stop_app.clone() {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 app.confirm_stop_app = None;
-                                match stop_or_kill_app(&target_app) {
-                                    Ok(msg) => {
-                                        app.refresh_data(true)?;
-                                        app.status_message = Some((msg, Instant::now()));
-                                    }
-                                    Err(e) => {
-                                        app.status_message =
-                                            Some((format!("Stop error: {e}"), Instant::now()));
-                                    }
+                                if app.pending_stop.is_some() {
+                                    app.status_message = Some((
+                                        "⏳ Another stop request is already in progress..."
+                                            .to_string(),
+                                        Instant::now(),
+                                    ));
+                                } else {
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    app.pending_stop = Some(rx);
+                                    app.status_message = Some((
+                                        format!("⏳ Stopping {target_app} gracefully..."),
+                                        Instant::now(),
+                                    ));
+                                    std::thread::spawn(move || {
+                                        let res =
+                                            stop_or_kill_app(&target_app).map_err(|e| e.to_string());
+                                        let _ = tx.send(res);
+                                    });
                                 }
                             }
                             _ => {
@@ -536,27 +664,16 @@ fn run_tui_loop(
                             KeyCode::Enter | KeyCode::Char('o') => {
                                 let chosen = targets.clone();
                                 app.optimizer_modal = None;
-                                let report = execute_optimizations(&chosen);
-                                app.refresh_data(true)?;
-                                if !report.actions_taken.is_empty() {
-                                    app.status_message = Some((
-                                        format!(
-                                            "⚡ Optimized {} target(s): freed {:.0} MB RAM, stopped {} threads (~{:.1} W saved)",
-                                            report.actions_taken.len(),
-                                            report.freed_memory_mb,
-                                            report.stopped_pids,
-                                            report.estimated_watts_saved
-                                        ),
-                                        Instant::now(),
-                                    ));
-                                } else if let Some(err) = report.failed_actions.first() {
-                                    app.status_message = Some((err.clone(), Instant::now()));
-                                } else {
-                                    app.status_message = Some((
-                                        "No optimization targets were selected.".to_string(),
-                                        Instant::now(),
-                                    ));
-                                }
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                app.pending_optimization = Some(rx);
+                                app.status_message = Some((
+                                    "⏳ Optimizing selected targets in background...".to_string(),
+                                    Instant::now(),
+                                ));
+                                std::thread::spawn(move || {
+                                    let report = execute_optimizations(&chosen);
+                                    let _ = tx.send(report);
+                                });
                             }
                             _ => {}
                         }
@@ -582,11 +699,13 @@ fn run_tui_loop(
                             | KeyCode::Enter => {
                                 let inc = !matches!(key.code, KeyCode::Left | KeyCode::Char('h'));
                                 let cfg = &mut app.autopilot_config;
+                                let mut already_saved = false;
                                 match *sel_idx {
                                     0 => {
                                         cfg.enabled = !cfg.enabled;
                                         app.autopilot_enabled = cfg.enabled;
                                         let _ = set_autopilot_enabled(&app.db, cfg.enabled);
+                                        already_saved = true;
                                     }
                                     1 => cfg.auto_switch_power_profile = !cfg.auto_switch_power_profile,
                                     2 => cfg.auto_freeze_enabled = !cfg.auto_freeze_enabled,
@@ -603,7 +722,7 @@ fn run_tui_loop(
                                                 ((cfg.idle_power_threshold_w + 0.1).min(5.0) * 10.0).round() / 10.0;
                                         } else {
                                             cfg.idle_power_threshold_w =
-                                                ((cfg.idle_power_threshold_w - 0.1).max(0.1) * 10.0).round() / 10.0;
+                                                ((cfg.idle_power_threshold_w - 0.1).max(0.2) * 10.0).round() / 10.0;
                                         }
                                     }
                                     5 => {
@@ -628,7 +747,9 @@ fn run_tui_loop(
                                     9 => cfg.notifications_enabled = !cfg.notifications_enabled,
                                     _ => {}
                                 }
-                                let _ = save_autopilot_config(cfg);
+                                if !already_saved {
+                                    let _ = save_autopilot_config(cfg);
+                                }
                                 app.status_message = Some((
                                     format!("Saved Smart Saver rules to {}", config_file_path().display()),
                                     Instant::now(),
@@ -752,8 +873,16 @@ fn run_tui_loop(
                             }
                         }
                         KeyCode::Char('o') => {
-                            let targets = scan_optimization_targets(app.battery.power_w);
-                            app.optimizer_modal = Some((targets, 0));
+                            if app.pending_optimization.is_some() {
+                                app.status_message = Some((
+                                    "⏳ Optimization is already running in background..."
+                                        .to_string(),
+                                    Instant::now(),
+                                ));
+                            } else {
+                                let targets = scan_optimization_targets(app.battery.power_w);
+                                app.optimizer_modal = Some((targets, 0));
+                            }
                         }
                         KeyCode::Char(c @ ('z' | 'x' | 'w')) => {
                             app.handle_selected_app_action(c)?;
@@ -763,7 +892,6 @@ fn run_tui_loop(
                             if let Ok(msg) = set_autopilot_enabled(&app.db, next_state) {
                                 app.autopilot_enabled = next_state;
                                 app.autopilot_config.enabled = next_state;
-                                let _ = save_autopilot_config(&app.autopilot_config);
                                 app.status_message = Some((format!("🤖 {msg}"), Instant::now()));
                             }
                         }
@@ -799,6 +927,9 @@ fn run_tui_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
+                    if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
+                        continue;
+                    }
                     let col = mouse.column;
                     let row = mouse.row;
                     let in_rect = |r: Rect| -> bool {
@@ -852,11 +983,29 @@ fn run_tui_loop(
                         MouseEventKind::ScrollUp => app.move_selection(-1),
                         MouseEventKind::Down(MouseButton::Left) => {
                             if in_rect(app.tabs_area) && app.tabs_area.width >= 4 {
-                                let rel_x = col.saturating_sub(app.tabs_area.x);
-                                let seg = ((rel_x as usize * 4) / (app.tabs_area.width as usize))
-                                    .min(3);
-                                app.window = TimeWindow::all()[seg];
-                                app.refresh_data(false)?;
+                                let term_w = terminal.size().map(|s| s.width).unwrap_or(120);
+                                let is_compact = term_w < 115;
+                                let rel_x = col.saturating_sub(app.tabs_area.x.saturating_add(1)) as usize;
+                                let mut cursor_x = 0usize;
+                                let mut hit = None;
+                                for &win in TimeWindow::all() {
+                                    let label = if is_compact {
+                                        win.short_title()
+                                    } else {
+                                        win.title()
+                                    };
+                                    // Ratatui Tabs renders `" "` + title + `" "` followed by divider `"│"`
+                                    let tab_w = label.chars().count() + 2;
+                                    if (cursor_x..cursor_x + tab_w).contains(&rel_x) {
+                                        hit = Some(win);
+                                        break;
+                                    }
+                                    cursor_x += tab_w + 1;
+                                }
+                                if let Some(win) = hit {
+                                    app.window = win;
+                                    app.refresh_data(false)?;
+                                }
                             } else if in_rect(app.filter_area) {
                                 app.filter = app.filter.next();
                                 app.apply_filter_and_sort();
@@ -1319,16 +1468,22 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
         let discharging: Vec<f64> = app
             .history
             .iter()
-            .filter(|p| p.power_w > 0.5)
+            .filter(|p| p.status == "Discharging" && p.power_w > 0.5)
             .map(|p| p.power_w)
             .collect();
         if discharging.is_empty() {
-            app.battery.power_w
+            if app.battery.status.is_discharging() {
+                app.battery.power_w
+            } else {
+                0.0
+            }
         } else {
             discharging.iter().sum::<f64>() / (discharging.len() as f64)
         }
-    } else {
+    } else if app.battery.status.is_discharging() {
         app.battery.power_w
+    } else {
+        0.0
     };
 
     let sot_secs = if app.drain_stats.sot_secs > 0 {
@@ -1337,25 +1492,38 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
         app.drain_stats.awake_total_secs
     };
     let sot_label = format_duration_short(sot_secs as f64);
-    let sleep_label = if app.drain_stats.sleep_secs >= 60 {
-        format!(
-            "{:.1}%/h ({})",
-            app.drain_stats.sleep_drain_pct_per_hr,
-            format_duration_short(app.drain_stats.sleep_secs as f64)
-        )
+    let has_sleep = app.drain_stats.sleep_secs >= 60;
+    let sleep_label = if has_sleep {
+        if cols[1].width >= 88 {
+            format!(
+                "{:.1}% ({:.1}%/h · {})",
+                app.drain_stats.sleep_drain_pct,
+                app.drain_stats.sleep_drain_pct_per_hr,
+                format_duration_short(app.drain_stats.sleep_secs as f64)
+            )
+        } else {
+            format!(
+                "{:.1}%/h ({})",
+                app.drain_stats.sleep_drain_pct_per_hr,
+                format_duration_short(app.drain_stats.sleep_secs as f64)
+            )
+        }
     } else {
         "0m".to_string()
     };
 
-    let filter_text = if cols[1].width >= 88 {
+    let filter_text = if cols[1].width >= 96 {
         app.filter.label()
     } else {
         app.filter.short_label()
     };
 
+    let drain_prefix = if has_sleep { " Active: " } else { " Drain: " };
+    let compact_drain_prefix = if has_sleep { " Act:" } else { " Drain:" };
+
     let kpi_line = if is_compact || cols[1].width < 68 {
         Line::from(vec![
-            Span::styled(" Drain:", Style::default().fg(Color::Gray)),
+            Span::styled(compact_drain_prefix, Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{:.1}%", total_app_pct),
                 Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
@@ -1367,7 +1535,7 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
             ),
             Span::styled(" │ Sleep:", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if app.drain_stats.sleep_secs >= 60 {
+                if has_sleep {
                     format!("{:.1}%/h", app.drain_stats.sleep_drain_pct_per_hr)
                 } else {
                     "0m".to_string()
@@ -1382,7 +1550,7 @@ fn draw_tabs_and_kpis(f: &mut Frame, app: &mut AppUi, area: Rect) {
         ])
     } else {
         Line::from(vec![
-            Span::styled(" Drain: ", Style::default().fg(Color::Gray)),
+            Span::styled(drain_prefix, Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{:.1}%", total_app_pct),
                 Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
@@ -1513,11 +1681,9 @@ fn draw_charts(f: &mut Frame, app: &AppUi, area: Rect) {
     }
 
     // 2. Right Chart: Power Discharge Rate (Watts) Curve
-    let mut watt_points: Vec<(f64, f64)> = app
-        .history
-        .iter()
-        .map(|p| (p.timestamp as f64, p.power_w))
-        .collect();
+    // Across sleep / power-off gaps (>5 min without samples), drop the curve to the
+    // actual average sleep power draw instead of drawing a misleading flat ~10 W line.
+    let mut watt_points = build_watt_chart_points(&app.history, app.battery.energy_full_wh);
 
     if watt_points.is_empty() {
         watt_points.push((app.battery.timestamp as f64 - 60.0, app.battery.power_w));
@@ -1565,6 +1731,40 @@ fn draw_charts(f: &mut Frame, app: &AppUi, area: Rect) {
         );
 
     f.render_widget(watt_chart, cols[1]);
+}
+
+/// Converts battery history buckets into `(timestamp, watts)` chart coordinates.
+/// Whenever two adjacent points are separated by more than 5 minutes (sleep / hibernate / off),
+/// inserts boundary anchor points at the gap's true average discharge wattage so the chart
+/// drops to ~0.1–0.8 W during sleep instead of linearly connecting awake ~10 W readings.
+fn build_watt_chart_points(history: &[BatteryHistoryPoint], energy_full_wh: f64) -> Vec<(f64, f64)> {
+    const SLEEP_GAP_SECS: i64 = 300;
+    let mut out = Vec::with_capacity(history.len());
+    for pair in history.windows(2) {
+        let prev = &pair[0];
+        let curr = &pair[1];
+        if out.is_empty() {
+            out.push((prev.timestamp as f64, prev.power_w));
+        }
+        let dt = curr.timestamp - prev.timestamp;
+        if dt > SLEEP_GAP_SECS {
+            let delta_pct = (prev.capacity_pct - curr.capacity_pct).max(0.0);
+            let gap_w = if energy_full_wh > 0.0 && delta_pct > 0.0 {
+                let dwh = (delta_pct / 100.0) * energy_full_wh;
+                (dwh / (dt as f64 / 3600.0)).clamp(0.0, 5.0)
+            } else {
+                0.0
+            };
+            out.push(((prev.timestamp + 1) as f64, gap_w));
+            out.push(((curr.timestamp - 1) as f64, gap_w));
+        }
+        out.push((curr.timestamp as f64, curr.power_w));
+    }
+    if history.len() == 1 {
+        let p = &history[0];
+        out.push((p.timestamp as f64, p.power_w));
+    }
+    out
 }
 
 fn category_icon_and_color(category: &str) -> (&'static str, Color) {
@@ -2451,7 +2651,7 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
         (
             "Auto-Freeze Idle Apps",
             if cfg.auto_freeze_enabled { "ON".to_string() } else { "OFF".to_string() },
-            "Send SIGSTOP to unfocused background hogs",
+            "Freeze unfocused background hogs (cgroup v2 / SIGSTOP)",
         ),
         (
             "Idle Freeze Timeout",
@@ -2471,7 +2671,7 @@ fn draw_autopilot_modal(f: &mut Frame, app: &AppUi, area: Rect) {
         (
             "Critical Battery Threshold",
             format!("{:.0}%", cfg.critical_battery_pct),
-            "Aggressive freeze threshold on critical charge",
+            "Auto-stop unused background services on critical charge",
         ),
         (
             "Dim Keyboard on Low Battery",
@@ -2699,5 +2899,36 @@ mod tests {
         assert!(CategoryFilter::SystemAndDesktop.matches("System"));
         assert!(CategoryFilter::SystemAndDesktop.matches("Desktop UI"));
         assert!(!CategoryFilter::SystemAndDesktop.matches("Browser"));
+    }
+
+    #[test]
+    fn watt_chart_drops_to_actual_sleep_power_across_sleep_gaps() {
+        let history = vec![
+            BatteryHistoryPoint {
+                timestamp: 1_700_000_000,
+                capacity_pct: 96.5,
+                status: "Discharging".to_string(),
+                power_w: 8.5,
+            },
+            BatteryHistoryPoint {
+                timestamp: 1_700_000_060,
+                capacity_pct: 96.4,
+                status: "Discharging".to_string(),
+                power_w: 8.1,
+            },
+            // 11.4 hours later after overnight sleep (-14.2% on 60.7 Wh ≈ 0.76 W)
+            BatteryHistoryPoint {
+                timestamp: 1_700_041_100,
+                capacity_pct: 82.2,
+                status: "Discharging".to_string(),
+                power_w: 10.2,
+            },
+        ];
+        let pts = build_watt_chart_points(&history, 60.7);
+        assert_eq!(pts.len(), 5);
+        assert!((pts[1].1 - 8.1).abs() < 1e-6);
+        assert!(pts[2].1 > 0.5 && pts[2].1 < 1.0, "sleep draw should be ~0.76 W, got {}", pts[2].1);
+        assert!((pts[2].1 - pts[3].1).abs() < 1e-6);
+        assert!((pts[4].1 - 10.2).abs() < 1e-6);
     }
 }
